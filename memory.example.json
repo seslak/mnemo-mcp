@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "memories": [
+    {
+      "id": "mem_seed_001",
+      "kind": "invariant",
+      "text": "Keep durable project memory small, explicit, and tied to decisions, commands, paths, or test outcomes.",
+      "source": "seed",
+      "tags": ["memory", "context"],
+      "pinned": false,
+      "references": [],
+      "created_at": "2026-05-09T00:00:00Z",
+      "updated_at": null,
+      "deleted_at": null,
+      "deletion_reason": null,
+      "superseded_by": null
+    },
+    {
+      "id": "mem_seed_002",
+      "kind": "decision",
+      "text": "Mnemo uses only Python standard library code and stores project memory in local JSON files.",
+      "source": "seed",
+      "tags": ["mcp", "local", "stdlib"],
+      "pinned": false,
+      "references": [],
+      "created_at": "2026-05-09T00:00:00Z",
+      "updated_at": null,
+      "deleted_at": null,
+      "deletion_reason": null,
+      "superseded_by": null
+    },
+    {
+      "id": "mem_seed_003",
+      "kind": "failed_approach",
+      "text": "Do not treat hidden chat history as durable project memory; record lasting decisions explicitly.",
+      "source": "seed",
+      "tags": ["memory", "agent"],
+      "pinned": false,
+      "references": [],
+      "created_at": "2026-05-09T00:00:00Z",
+      "updated_at": null,
+      "deleted_at": null,
+      "deletion_reason": null,
+      "superseded_by": null
+    },
+    {
+      "id": "mem_seed_004",
+      "kind": "command",
+      "text": "Run python smoke_test.py and python -m unittest test_server.py -v after changing this folder.",
+      "source": "seed",
+      "tags": ["test", "validation"],
+      "pinned": false,
+      "references": [],
+      "created_at": "2026-05-09T00:00:00Z",
+      "updated_at": null,
+      "deleted_at": null,
+      "deletion_reason": null,
+      "superseded_by": null
+    }
+  ]
+}

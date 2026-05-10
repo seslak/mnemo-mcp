@@ -1,0 +1,15 @@
+{
+  "servers": {
+    "mnemo": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/mnemo/server.py"
+      ],
+      "env": {
+        "MNEMO_FILE": "${workspaceFolder}/mnemo/memory.json",
+        "MNEMO_WORKSPACE_ROOT": "${workspaceFolder}"
+      }
+    }
+  }
+}

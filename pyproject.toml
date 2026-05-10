@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mnemo-mcp"
+version = "0.7.0"
+description = "Local-first project memory MCP server for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Sinisa Seslak" }
+]
+keywords = ["mcp", "model-context-protocol", "ai-agents", "coding-agents", "memory", "local-first"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/seslak/mnemo-mcp"
+Repository = "https://github.com/seslak/mnemo-mcp"
+Issues = "https://github.com/seslak/mnemo-mcp/issues"
+
+[project.scripts]
+mnemo-mcp = "server:main"
+
+[tool.setuptools]
+py-modules = ["server", "salience_loader"]

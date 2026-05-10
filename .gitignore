@@ -1,0 +1,23 @@
+# Personal/local memory is ignored by default.
+memory.json
+memory.json.tmp
+queries.jsonl
+queries.1.jsonl
+queries.archive.jsonl
+events.jsonl
+events.1.jsonl
+events.archive.jsonl
+memory.archive.jsonl
+*.lock
+__pycache__/
+
+# Commit shared seed memories in memory.example.json.
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.DS_Store

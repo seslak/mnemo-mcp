@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "mnemo": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "mnemo/server.py"
+      ],
+      "env": {
+        "MNEMO_FILE": "mnemo/memory.json",
+        "MNEMO_WORKSPACE_ROOT": "."
+      },
+      "tools": [
+        "memory_search",
+        "memory_recent",
+        "memory_compact_context",
+        "lookup_symbol"
+      ]
+    }
+  }
+}
