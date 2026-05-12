@@ -1,5 +1,112 @@
 # Changelog
 
+## 0.10.0
+
+### Added
+
+- SQLite primary local store using stdlib `sqlite3`.
+- Automatic import from legacy `memory.json`.
+- Bootstrap from `memory.example.json` in SQLite mode.
+- Legacy `events.jsonl` / `queries.jsonl` ingestion into SQLite `events` table.
+- JSONL and Markdown exports via `mnemo_export`.
+- `mnemo_get` for full single-memory retrieval by id.
+- Extended `mnemo_doctor` health diagnostics.
+- Output caps for search/recall.
+- SQLite-backed `compact_logs` maintenance.
+- Optional FTS5 detection with lexical fallback search.
+
+### Changed
+
+- SQLite is the default backend (`MNEMO_STORE=sqlite`).
+- `memory.json` is a compatibility/import/export format in SQLite mode.
+- SQLite `events` table is authoritative for new lifecycle/query events in SQLite mode.
+- Recall/search return bounded previews by default; full bodies are loaded with `mnemo_get`.
+- `mnemo_maintenance` remains the maintenance surface for compaction/import.
+
+### Compatibility
+
+- Existing `memory.json` files remain importable.
+- Existing `memory.example.json` first-run bootstrap is preserved.
+- Existing JSONL logs are imported and left on disk as legacy artifacts.
+- No external dependencies added.
+- Hippocampus entries remain in the same store as other memories.
+
+## 0.9.4
+
+- Extended `mnemo_doctor` diagnostic payload: returns memory file path, size, memory count, per-kind breakdown, last write timestamp and id, events log status, archive status, drift scalar with interpretation, salience loader status, and active warnings. Agents no longer need shell checks to verify Mnemo state.
+- Further tool surface consolidation from 16 to 13 tools.
+  - Removed `mnemo_drift`; drift is reported by `mnemo_doctor`.
+  - Removed `mnemo_history` and `mnemo_related`; consolidated into `mnemo_inspect(id, mode='history'|'related'|'both')`.
+  - Removed `mnemo_compact_interaction_logs` and `mnemo_consolidate`; consolidated into `mnemo_maintenance(action='compact_logs'|'consolidate', dry_run=...)`.
+- All v0.7.0/v0.8.0/v0.9.x features remain intact.
+- Memory schema and storage formats unchanged.
+
+## 0.9.3
+
+- Added stricter Copilot-safe schema compatibility checks for `tools/list` export (forbidden keyword removal, supported-key-only subset, and no nullable type arrays in exported schemas).
+- Added `MNEMO_MCP_PROFILE=core|full` tool exposure profiles (`full` default) to reduce Copilot inventory pressure in constrained environments.
+- Kept runtime validation/default/clamping behavior in Python handlers; storage format and memory schema remain unchanged.
+
+## 0.9.2
+
+- Consolidated tool surface from 21 to 16 tools for GitHub Copilot MCP client inventory cap compatibility.
+  - Removed `mnemo_record_interaction_log`, `mnemo_record_context_block`, `mnemo_record_hippocampus_entry`, and `mnemo_record_agent_feedback`.
+    Use `mnemo_record(kind=...)` instead. Aliases `summary`/`body`/`title`/`evidence_ids`/`feedback_type` are accepted by
+    the generic tool and routed to the appropriate underlying fields per kind.
+  - Removed `mnemo_recall_startup_context` and `mnemo_recall_agent_context`.
+    Use `mnemo_recall(mode='startup' or 'agent', ...)` instead.
+- All memory data formats unchanged; existing `memory.json` files remain readable.
+- All v0.7.0/v0.8.0 features (resonance gating, decay, references, events log, archive, salience integration, structured memory layers) remain intact.
+
+## 0.9.1
+
+- Stripped JSON Schema keywords (`minimum`, `maximum`, `default`, `minItems`, `maxItems`, `minLength`, `maxLength`, `pattern`) from tool `inputSchema` responses for GitHub Copilot MCP client compatibility.
+  Constraints are documented in description fields and enforced at runtime in handlers. Other MCP clients are unaffected.
+
+## 0.9.0
+
+### Changed
+
+- Renamed public MCP tool surface from `memory_*` to `mnemo_*` to avoid confusion with native editor/assistant memory tools.
+- Mnemo project memory is now clearly separated from Copilot native memory.
+- Updated prompts/docs to use Mnemo-branded tool names.
+
+### Added
+
+- `mnemo_doctor` diagnostic tool.
+
+### Compatibility
+
+- Existing memory files remain readable.
+- Storage schema is unchanged.
+- Public MCP tool names changed intentionally before external release.
+
+## 0.8.0
+
+### Added
+
+- Structured memory layers:
+  - interaction logs
+  - context blocks
+  - hippocampus entries
+  - agent feedback
+- Startup context recall for coordinator/front-facing agents.
+- Agent/specialist context recall.
+- Memory linking support.
+- Interaction-log compaction support.
+- New filters for structured memory recall.
+
+### Changed
+
+- Extended memory schema with optional metadata fields such as role, agent_id, domain, scope, authority, retention, confidence, linked_ids, parent_id, and source_run_id.
+- Improved Mnemo documentation around reusable agent roles and memory layers.
+
+### Compatibility
+
+- Existing memory records remain readable.
+- Existing MCP tools remain backward-compatible.
+- No hardcoded personal agent names are introduced.
+
 ## 0.7.0
 
 - Added optional local Agent Salience integration via `AGENT_SALIENCE_HOME`.

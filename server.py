@@ -2,17 +2,19 @@
 """Mnemo: dependency-free local MCP memory server.
 
 Transport: newline-delimited JSON-RPC on stdin/stdout.
-Storage: a JSON memory file plus optional append-only query logs.
+Storage: SQLite primary store (default) with optional JSON compatibility mode.
 
 Environment variables:
-- MNEMO_FILE: path to memory.json. Defaults to memory.json next to server.py.
+- MNEMO_STORE: sqlite|json. Defaults to sqlite.
+- MNEMO_FILE: compatibility/import/export path for memory.json.
+- MNEMO_SQLITE_FILE: sqlite db path. Defaults to <workspace>/state/mnemo/mnemo.sqlite.
 - MNEMO_MAX_MEMORIES: total memory cap including retired entries. Defaults to 5000.
-- MNEMO_LOG_QUERIES: set to 0 to disable queries.jsonl. Defaults to 1.
+- MNEMO_LOG_QUERIES: set to 0 to disable query event logging. Defaults to 1.
 - MNEMO_WORKSPACE_ROOT: root for lookup_symbol. Defaults to the parent of
-  the memory file's directory.
+  the current working directory.
 - MNEMO_SYMBOL_TTL_SECONDS: symbol-index walk TTL. Defaults to 5.
 - MNEMO_DECAY: set to 0 to disable time-decay scoring. Defaults to 1.
-- MNEMO_LOG_EVENTS: set to 0 to disable events.jsonl. Defaults to 1.
+- MNEMO_LOG_EVENTS: set to 0 to disable lifecycle event logging. Defaults to 1.
 - MNEMO_LOG_ARCHIVE: set to 0 to disable permanent log archives. Defaults to 1.
 - MNEMO_CONSOLIDATE_THRESHOLD: near-duplicate consolidation threshold. Defaults to 0.7.
 - MNEMO_MAX_SEARCH_RESULTS: server-side cap for memory_search results. Defaults to 20.
@@ -20,6 +22,8 @@ Environment variables:
 - MNEMO_MAX_FILES_SCANNED: max files scanned by lookup_symbol. Defaults to 5000.
 - MNEMO_MAX_TOTAL_BYTES: max total bytes scanned by lookup_symbol. Defaults to 52428800.
 - MNEMO_MAX_FILE_BYTES: max single file bytes read by lookup_symbol. Defaults to 1048576.
+- MNEMO_MAX_CHARS_PER_ITEM: per-item preview cap for recall/search bundles. Defaults to 1200.
+- MNEMO_MAX_TOTAL_CHARS: total preview cap for recall/search bundles. Defaults to 12000.
 - AGENT_SALIENCE_HOME: optional path to local agent-salience checkout for diagnostics when not installed.
 """
 
@@ -30,8 +34,10 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -42,7 +48,7 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.10.0"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
@@ -55,10 +61,18 @@ MEMORY_KINDS = (
     "command",
     "path",
     "note",
+    "interaction_log",
+    "context_block",
+    "hippocampus_entry",
+    "agent_feedback",
 )
 ORDERED_KINDS = (
     "invariant",
     "decision",
+    "hippocampus_entry",
+    "agent_feedback",
+    "context_block",
+    "interaction_log",
     "failed_approach",
     "test_result",
     "command",
@@ -73,7 +87,14 @@ HALF_LIVES_DAYS: dict[str, float] = {
     "failed_approach": 60.0,
     "test_result": 30.0,
     "note": 30.0,
+    "interaction_log": 14.0,
+    "context_block": 120.0,
+    "hippocampus_entry": 365.0,
+    "agent_feedback": 180.0,
 }
+AUTHORITY_VALUES = ("low", "medium", "high", "pinned")
+RETENTION_VALUES = ("ephemeral", "compressible", "durable", "pinned")
+CONFIDENCE_VALUES = ("low", "medium", "high")
 PHASES = ("exploration", "implementation", "debugging", "none")
 PHASE_KEYWORDS: dict[str, set[str]] = {
     "debugging": {
@@ -112,6 +133,8 @@ PHASE_KIND_BIAS: dict[str, dict[str, float]] = {
 LOCK_TIMEOUT_SECONDS = 5.0
 QUERY_LOG_MAX_BYTES = 10 * 1024 * 1024
 EVENT_LOG_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_MAX_CHARS_PER_ITEM = 1200
+DEFAULT_MAX_TOTAL_CHARS = 12000
 SKIP_DIRS = {
     "node_modules",
     ".git",
@@ -124,25 +147,233 @@ SKIP_DIRS = {
 }
 _SHOULD_EXIT = False
 _SYMBOL_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
+_SQLITE_BOOTSTRAPPED: set[str] = set()
+_SQLITE_FTS_CANDIDATE_LIMIT = 500
 SALIENCE_UNAVAILABLE_MESSAGE = (
     "Configure AGENT_SALIENCE_HOME or install agent-salience to use salience diagnostics."
 )
+_NULLABLE_NOTE = "Optional; omit this field instead of sending null."
+SUPPORTED_SCHEMA_KEYS = {
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "enum",
+    "description",
+}
+FORBIDDEN_SCHEMA_KEYS = {
+    "minimum",
+    "maximum",
+    "default",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "not",
+    "const",
+    "format",
+    "examples",
+    "nullable",
+    "$ref",
+    "$schema",
+}
 
 
 class LockTimeout(RuntimeError):
     """Raised when the memory write lock cannot be acquired in time."""
 
 
-def memory_path() -> Path:
-    configured = os.environ.get("MNEMO_FILE", "").strip()
-    return Path(configured).expanduser() if configured else DEFAULT_MEMORY_FILE
+def _append_description_note(schema: dict[str, Any], note: str) -> None:
+    existing = str(schema.get("description", "")).strip()
+    if note in existing:
+        return
+    if existing:
+        schema["description"] = f"{existing} {note}"
+    else:
+        schema["description"] = note
+
+
+def _coerce_copilot_type(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+    non_null = [item for item in value if item != "null"]
+    if len(non_null) == 1:
+        return non_null[0]
+    if len(non_null) > 1:
+        # Copilot client can reject multi-type arrays; fall back to string as safest generic scalar.
+        return "string"
+    return "string"
+
+
+def make_copilot_safe_schema(schema: object) -> object:
+    """Return a Copilot-safe inputSchema subset copy.
+
+    Keeps only:
+    type, properties, required, additionalProperties, items, enum, description.
+    """
+
+    def _sanitize(value: object, *, in_schema: bool, parent_key: str | None = None) -> object:
+        if isinstance(value, dict):
+            if not in_schema:
+                return {
+                    key: _sanitize(item, in_schema=True, parent_key=key)
+                    for key, item in value.items()
+                    if isinstance(key, str)
+                }
+
+            out: dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    continue
+                if key in FORBIDDEN_SCHEMA_KEYS:
+                    continue
+                if key not in SUPPORTED_SCHEMA_KEYS:
+                    continue
+                if key == "properties" and isinstance(item, dict):
+                    out[key] = {
+                        str(prop_name): _sanitize(prop_schema, in_schema=True, parent_key="properties")
+                        for prop_name, prop_schema in item.items()
+                    }
+                    continue
+                if key == "type":
+                    out[key] = _coerce_copilot_type(item)
+                    if isinstance(item, list) and "null" in item:
+                        _append_description_note(out, _NULLABLE_NOTE)
+                    continue
+                if key == "enum" and isinstance(item, list):
+                    out[key] = [entry for entry in item if entry is not None]
+                    if len(out[key]) != len(item):
+                        _append_description_note(out, _NULLABLE_NOTE)
+                    continue
+                if key == "required" and isinstance(item, list):
+                    out[key] = [str(entry) for entry in item if str(entry).strip()]
+                    continue
+                if key == "items":
+                    out[key] = _sanitize(item, in_schema=True, parent_key="items")
+                    continue
+                out[key] = _sanitize(item, in_schema=True, parent_key=key)
+            return out
+        if isinstance(value, list):
+            if parent_key == "required":
+                return [str(entry) for entry in value if str(entry).strip()]
+            if parent_key == "enum":
+                return [entry for entry in value if entry is not None]
+            return [_sanitize(item, in_schema=False, parent_key=parent_key) for item in value]
+        return value
+
+    sanitized = _sanitize(schema, in_schema=True)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _simplify_copilot_nullable_schema(schema: Any) -> Any:
+    """Simplify nullable schema unions for Copilot-facing inputSchema."""
+    if isinstance(schema, dict):
+        out: dict[str, Any] = {key: _simplify_copilot_nullable_schema(value) for key, value in schema.items()}
+        schema_type = out.get("type")
+        if isinstance(schema_type, list):
+            non_null = [item for item in schema_type if item != "null"]
+            if non_null:
+                out["type"] = non_null[0]
+                _append_description_note(out, _NULLABLE_NOTE)
+            elif schema_type:
+                out["type"] = schema_type[0]
+        enum_values = out.get("enum")
+        if isinstance(enum_values, list) and any(item is None for item in enum_values):
+            out["enum"] = [item for item in enum_values if item is not None]
+            _append_description_note(out, _NULLABLE_NOTE)
+        return out
+    if isinstance(schema, list):
+        return [_simplify_copilot_nullable_schema(item) for item in schema]
+    return schema
+
+
+def copilot_safe_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    stripped = make_copilot_safe_schema(schema)
+    simplified = _simplify_copilot_nullable_schema(stripped)
+    return simplified if isinstance(simplified, dict) else {}
+
+
+CORE_TOOL_NAMES = (
+    "mnemo_doctor",
+    "mnemo_search",
+    "mnemo_record",
+    "mnemo_recall",
+    "mnemo_get",
+    "mnemo_link",
+    "mnemo_export",
+    "mnemo_compact_context",
+    "mnemo_lookup_symbol",
+)
+
+
+def mcp_profile() -> str:
+    value = str(os.environ.get("MNEMO_MCP_PROFILE", "full")).strip().lower()
+    return value if value in {"core", "full"} else "full"
+
+
+def exposed_tools(profile: str | None = None) -> list[dict[str, Any]]:
+    active = profile or mcp_profile()
+    if active == "core":
+        allowed = set(CORE_TOOL_NAMES)
+        return [tool for tool in TOOLS if str(tool.get("name", "")) in allowed]
+    return list(TOOLS)
+
+
+def copilot_safe_tools(profile: str | None = None) -> list[dict[str, Any]]:
+    base_tools = exposed_tools(profile)
+    tools: list[dict[str, Any]] = []
+    for tool in base_tools:
+        entry = dict(tool)
+        raw_schema = tool.get("inputSchema", {})
+        entry["inputSchema"] = copilot_safe_input_schema(raw_schema if isinstance(raw_schema, dict) else {})
+        tools.append(entry)
+    return tools
+
+
+def store_backend() -> str:
+    value = str(os.environ.get("MNEMO_STORE", "sqlite")).strip().lower()
+    return value if value in {"sqlite", "json"} else "sqlite"
 
 
 def workspace_root() -> Path:
     configured = os.environ.get("MNEMO_WORKSPACE_ROOT", "").strip()
     if configured:
         return Path(configured).expanduser()
-    return memory_path().parent.parent
+    return Path.cwd()
+
+
+def state_dir() -> Path:
+    configured_memory = os.environ.get("MNEMO_FILE", "").strip()
+    if configured_memory:
+        return Path(configured_memory).expanduser().parent
+    return workspace_root() / "state" / "mnemo"
+
+
+def memory_path() -> Path:
+    configured = os.environ.get("MNEMO_FILE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return state_dir() / "memory.json"
+
+
+def sqlite_path() -> Path:
+    configured = os.environ.get("MNEMO_SQLITE_FILE", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return state_dir() / "mnemo.sqlite"
+
+
+def max_chars_per_item() -> int:
+    return positive_int_env("MNEMO_MAX_CHARS_PER_ITEM", DEFAULT_MAX_CHARS_PER_ITEM)
+
+
+def max_total_chars() -> int:
+    return positive_int_env("MNEMO_MAX_TOTAL_CHARS", DEFAULT_MAX_TOTAL_CHARS)
 
 
 def max_memories() -> int:
@@ -299,6 +530,11 @@ def validate_kind(kind: str) -> str:
     return kind
 
 
+def normalize_memory_kind(kind: Any, default: str = "note") -> str:
+    value = str(kind or default).strip().lower()
+    return value if value in MEMORY_KINDS else default
+
+
 def normalize_tags(raw_tags: Any) -> list[str]:
     if raw_tags is None:
         return []
@@ -317,6 +553,59 @@ def normalize_references(raw_references: Any) -> list[str]:
     return list(raw_references)
 
 
+def normalize_linked_ids(raw_linked_ids: Any) -> list[str]:
+    if raw_linked_ids is None:
+        return []
+    if not isinstance(raw_linked_ids, list):
+        raise ValueError("linked_ids must be an array of strings")
+    if not all(isinstance(linked_id, str) for linked_id in raw_linked_ids):
+        raise ValueError("linked_ids must be an array of strings")
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for linked_id in raw_linked_ids:
+        value = linked_id.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def normalize_optional_string(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    return value if value else None
+
+
+def normalize_choice(
+    raw: Any,
+    field: str,
+    allowed: tuple[str, ...],
+    default: str | None = None,
+    *,
+    strict: bool = True,
+) -> str | None:
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if not value:
+        return default
+    if value not in allowed:
+        if strict:
+            raise ValueError(f"{field} must be one of: {', '.join(allowed)}")
+        return default
+    return value
+
+
+def normalize_metadata(raw_metadata: Any) -> dict[str, Any]:
+    if raw_metadata is None:
+        return {}
+    if not isinstance(raw_metadata, dict):
+        raise ValueError("metadata must be an object")
+    return {str(key): value for key, value in raw_metadata.items()}
+
+
 def new_memory(
     memory_id: str,
     kind: str,
@@ -325,7 +614,25 @@ def new_memory(
     tags: list[str],
     references: list[str] | None = None,
     pinned: bool = False,
+    *,
+    agent_id: str | None = None,
+    role: str | None = None,
+    scope: str | None = None,
+    domain: str | None = None,
+    authority: str | None = None,
+    retention: str | None = None,
+    confidence: str | None = None,
+    linked_ids: list[str] | None = None,
+    parent_id: str | None = None,
+    source_run_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    normalized_references = normalize_references(references or [])
+    normalized_linked = normalize_linked_ids(linked_ids if linked_ids is not None else normalized_references)
+    if not normalized_references:
+        normalized_references = list(normalized_linked)
+    elif not normalized_linked:
+        normalized_linked = list(normalized_references)
     return {
         "id": memory_id,
         "kind": kind,
@@ -333,7 +640,18 @@ def new_memory(
         "source": source,
         "tags": tags,
         "pinned": pinned,
-        "references": references or [],
+        "references": normalized_references,
+        "linked_ids": normalized_linked,
+        "agent_id": agent_id,
+        "role": role,
+        "scope": scope,
+        "domain": domain,
+        "authority": authority,
+        "retention": retention,
+        "confidence": confidence,
+        "parent_id": parent_id,
+        "source_run_id": source_run_id,
+        "metadata": metadata or {},
         "created_at": now_iso(),
         "updated_at": None,
         "deleted_at": None,
@@ -342,27 +660,636 @@ def new_memory(
     }
 
 
+def merge_link_fields(memory: dict[str, Any]) -> None:
+    references = normalize_references(memory.get("references", []))
+    linked_ids = normalize_linked_ids(memory.get("linked_ids", references))
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in list(references) + list(linked_ids):
+        if value in seen:
+            continue
+        seen.add(value)
+        merged.append(value)
+    memory["references"] = merged
+    memory["linked_ids"] = list(merged)
+
+
+def apply_structured_fields(memory: dict[str, Any], args: dict[str, Any]) -> None:
+    memory["agent_id"] = normalize_optional_string(args.get("agent_id"))
+    memory["role"] = normalize_optional_string(args.get("role"))
+    memory["scope"] = normalize_optional_string(args.get("scope"))
+    memory["domain"] = normalize_optional_string(args.get("domain"))
+    memory["authority"] = normalize_choice(
+        args.get("authority"),
+        "authority",
+        AUTHORITY_VALUES,
+        default=memory.get("authority"),
+    )
+    memory["retention"] = normalize_choice(
+        args.get("retention"),
+        "retention",
+        RETENTION_VALUES,
+        default=memory.get("retention"),
+    )
+    memory["confidence"] = normalize_choice(
+        args.get("confidence"),
+        "confidence",
+        CONFIDENCE_VALUES,
+        default=memory.get("confidence"),
+    )
+    memory["parent_id"] = normalize_optional_string(args.get("parent_id"))
+    memory["source_run_id"] = normalize_optional_string(args.get("source_run_id"))
+    memory["metadata"] = normalize_metadata(args.get("metadata"))
+
+
 def migrate_memory(memory: dict[str, Any]) -> dict[str, Any]:
     migrated = dict(memory)
     text = str(migrated.get("text", ""))
     migrated["id"] = str(migrated.get("id") or make_id(text))
-    migrated["kind"] = str(migrated.get("kind") or "note")
+    migrated["kind"] = normalize_memory_kind(migrated.get("kind"), "note")
     migrated["text"] = text
     migrated["source"] = str(migrated.get("source", ""))
     tags = migrated.get("tags", [])
     migrated["tags"] = tags if isinstance(tags, list) else []
     migrated["pinned"] = bool(migrated.get("pinned", False))
     references = migrated.get("references", [])
-    migrated["references"] = [reference for reference in references if isinstance(reference, str)] if isinstance(references, list) else []
+    linked_ids = migrated.get("linked_ids", references)
+    migrated["references"] = (
+        [reference for reference in references if isinstance(reference, str)] if isinstance(references, list) else []
+    )
+    migrated["linked_ids"] = (
+        [linked_id for linked_id in linked_ids if isinstance(linked_id, str)] if isinstance(linked_ids, list) else []
+    )
+    migrated["agent_id"] = normalize_optional_string(migrated.get("agent_id"))
+    migrated["role"] = normalize_optional_string(migrated.get("role"))
+    migrated["scope"] = normalize_optional_string(migrated.get("scope"))
+    migrated["domain"] = normalize_optional_string(migrated.get("domain"))
+    migrated["authority"] = normalize_choice(
+        migrated.get("authority"),
+        "authority",
+        AUTHORITY_VALUES,
+        default=None,
+        strict=False,
+    )
+    migrated["retention"] = normalize_choice(
+        migrated.get("retention"),
+        "retention",
+        RETENTION_VALUES,
+        default=None,
+        strict=False,
+    )
+    migrated["confidence"] = normalize_choice(
+        migrated.get("confidence"),
+        "confidence",
+        CONFIDENCE_VALUES,
+        default=None,
+        strict=False,
+    )
+    migrated["parent_id"] = normalize_optional_string(migrated.get("parent_id"))
+    migrated["source_run_id"] = normalize_optional_string(migrated.get("source_run_id"))
+    migrated["metadata"] = normalize_metadata(migrated.get("metadata"))
     migrated["created_at"] = str(migrated.get("created_at") or now_iso())
     migrated.setdefault("updated_at", None)
     migrated.setdefault("deleted_at", None)
     migrated.setdefault("deletion_reason", None)
     migrated.setdefault("superseded_by", None)
+    merge_link_fields(migrated)
     return migrated
 
 
-def load_store() -> dict[str, Any]:
+def memory_content_hash(memory: dict[str, Any]) -> str:
+    metadata = normalize_metadata(memory.get("metadata"))
+    title = normalize_optional_string(metadata.get("title")) or ""
+    normalized = {
+        "kind": normalize_memory_kind(memory.get("kind"), "note"),
+        "text": normalize_text(str(memory.get("text", ""))),
+        "title": normalize_text(title),
+        "agent_id": normalize_optional_string(memory.get("agent_id")) or "",
+        "role": normalize_optional_string(memory.get("role")) or "",
+        "domain": normalize_optional_string(memory.get("domain")) or "",
+        "scope": normalize_optional_string(memory.get("scope")) or "",
+    }
+    return hashlib.sha1(json.dumps(normalized, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _sqlite_connect() -> sqlite3.Connection:
+    path = sqlite_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+@contextmanager
+def _sqlite_session() -> Any:
+    conn = _sqlite_connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _sqlite_set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def _sqlite_get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return None
+    value = row[0]
+    return str(value) if value is not None else None
+
+
+def _sqlite_fts_available(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, text, title, tags)"
+        )
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def _sqlite_has_fts_table(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+    ).fetchone()
+    return row is not None
+
+
+def _sqlite_tags_text(tags_json: Any) -> str:
+    if tags_json is None:
+        return ""
+    if isinstance(tags_json, str):
+        try:
+            parsed = json.loads(tags_json)
+        except Exception:
+            parsed = None
+    else:
+        parsed = tags_json
+    if not isinstance(parsed, list):
+        return ""
+    return " ".join(str(item).strip() for item in parsed if str(item).strip())
+
+
+def _sqlite_sync_fts_for_memory_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
+    if not _sqlite_has_fts_table(conn) and not _sqlite_fts_available(conn):
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO memories_fts(id, text, title, tags) VALUES(?, ?, ?, ?)",
+        (
+            str(row.get("id", "")),
+            str(row.get("text", "")),
+            str(row.get("title") or ""),
+            _sqlite_tags_text(row.get("tags_json")),
+        ),
+    )
+
+
+def _sqlite_rebuild_fts_index(conn: sqlite3.Connection) -> bool:
+    if not _sqlite_has_fts_table(conn) and not _sqlite_fts_available(conn):
+        return False
+    conn.execute("DELETE FROM memories_fts")
+    rows = conn.execute("SELECT id, text, title, tags_json FROM memories").fetchall()
+    for row in rows:
+        conn.execute(
+            "INSERT OR REPLACE INTO memories_fts(id, text, title, tags) VALUES(?, ?, ?, ?)",
+            (
+                str(row["id"] or ""),
+                str(row["text"] or ""),
+                str(row["title"] or ""),
+                _sqlite_tags_text(row["tags_json"]),
+            ),
+        )
+    _sqlite_set_meta(conn, "fts_index_built_at", now_iso())
+    return True
+
+
+def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            text TEXT NOT NULL,
+            title TEXT,
+            preview TEXT,
+            source TEXT,
+            tags_json TEXT,
+            linked_ids_json TEXT,
+            agent_id TEXT,
+            role TEXT,
+            scope TEXT,
+            domain TEXT,
+            authority TEXT,
+            retention TEXT,
+            confidence TEXT,
+            parent_id TEXT,
+            source_run_id TEXT,
+            metadata_json TEXT,
+            pinned INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0,
+            superseded_by TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            token_estimate INTEGER,
+            content_hash TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS links (
+            source_id TEXT,
+            target_id TEXT,
+            relation TEXT,
+            created_at TEXT,
+            PRIMARY KEY (source_id, target_id, relation)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS events (
+            id TEXT PRIMARY KEY,
+            memory_id TEXT,
+            event_type TEXT,
+            data_json TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories(agent_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_role ON memories(role)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_authority ON memories(authority)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_retention ON memories(retention)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_source_run_id ON memories(source_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_deleted ON memories(deleted)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_content_hash ON memories(content_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_links_source_id ON links(source_id)",
+        "CREATE INDEX IF NOT EXISTS idx_links_target_id ON links(target_id)",
+        "CREATE INDEX IF NOT EXISTS idx_events_memory_id ON events(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
+        "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
+    ):
+        conn.execute(statement)
+    _sqlite_set_meta(conn, "schema_version", "1")
+    if _sqlite_get_meta(conn, "created_at") is None:
+        _sqlite_set_meta(conn, "created_at", now_iso())
+
+
+def _memory_to_sqlite_row(memory: dict[str, Any]) -> dict[str, Any]:
+    migrated = migrate_memory(memory)
+    metadata = normalize_metadata(migrated.get("metadata"))
+    title = normalize_optional_string(metadata.get("title"))
+    text_value = str(migrated.get("text", ""))
+    return {
+        "id": str(migrated.get("id", "")),
+        "kind": str(migrated.get("kind", "note")),
+        "text": text_value,
+        "title": title,
+        "preview": memory_preview(migrated, max_chars=240),
+        "source": str(migrated.get("source", "")),
+        "tags_json": json.dumps(normalize_tags(migrated.get("tags", [])), ensure_ascii=False),
+        "linked_ids_json": json.dumps(
+            normalize_linked_ids(migrated.get("linked_ids", migrated.get("references", []))),
+            ensure_ascii=False,
+        ),
+        "agent_id": normalize_optional_string(migrated.get("agent_id")),
+        "role": normalize_optional_string(migrated.get("role")),
+        "scope": normalize_optional_string(migrated.get("scope")),
+        "domain": normalize_optional_string(migrated.get("domain")),
+        "authority": normalize_choice(
+            migrated.get("authority"),
+            "authority",
+            AUTHORITY_VALUES,
+            default=None,
+            strict=False,
+        ),
+        "retention": normalize_choice(
+            migrated.get("retention"),
+            "retention",
+            RETENTION_VALUES,
+            default=None,
+            strict=False,
+        ),
+        "confidence": normalize_choice(
+            migrated.get("confidence"),
+            "confidence",
+            CONFIDENCE_VALUES,
+            default=None,
+            strict=False,
+        ),
+        "parent_id": normalize_optional_string(migrated.get("parent_id")),
+        "source_run_id": normalize_optional_string(migrated.get("source_run_id")),
+        "metadata_json": json.dumps(metadata, ensure_ascii=False),
+        "pinned": 1 if bool(migrated.get("pinned")) else 0,
+        "deleted": 1 if bool(migrated.get("deleted_at")) else 0,
+        "superseded_by": normalize_optional_string(migrated.get("superseded_by")),
+        "created_at": str(migrated.get("created_at") or now_iso()),
+        "updated_at": normalize_optional_string(migrated.get("updated_at")),
+        "token_estimate": int(estimate_tokens(text_value)),
+        "content_hash": memory_content_hash(migrated),
+        "deletion_reason": normalize_optional_string(migrated.get("deletion_reason")),
+    }
+
+
+def _sqlite_row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
+    tags = json.loads(str(row["tags_json"] or "[]"))
+    linked_ids = json.loads(str(row["linked_ids_json"] or "[]"))
+    metadata = json.loads(str(row["metadata_json"] or "{}"))
+    deleted_at = None
+    deletion_reason = None
+    if int(row["deleted"] or 0):
+        deletion_reason = normalize_optional_string(metadata.get("_deletion_reason"))
+        deleted_at = normalize_optional_string(metadata.get("_deleted_at")) or normalize_optional_string(row["updated_at"]) or now_iso()
+    memory = {
+        "id": str(row["id"]),
+        "kind": str(row["kind"]),
+        "text": str(row["text"]),
+        "source": str(row["source"] or ""),
+        "tags": tags if isinstance(tags, list) else [],
+        "pinned": bool(int(row["pinned"] or 0)),
+        "references": linked_ids if isinstance(linked_ids, list) else [],
+        "linked_ids": linked_ids if isinstance(linked_ids, list) else [],
+        "agent_id": row["agent_id"],
+        "role": row["role"],
+        "scope": row["scope"],
+        "domain": row["domain"],
+        "authority": row["authority"],
+        "retention": row["retention"],
+        "confidence": row["confidence"],
+        "parent_id": row["parent_id"],
+        "source_run_id": row["source_run_id"],
+        "metadata": metadata if isinstance(metadata, dict) else {},
+        "created_at": str(row["created_at"] or now_iso()),
+        "updated_at": row["updated_at"],
+        "deleted_at": deleted_at,
+        "deletion_reason": deletion_reason,
+        "superseded_by": row["superseded_by"],
+    }
+    return migrate_memory(memory)
+
+
+def _sqlite_insert_event(
+    conn: sqlite3.Connection,
+    memory_id: str | None,
+    event_type: str,
+    data: dict[str, Any],
+    created_at: str | None = None,
+    event_id: str | None = None,
+) -> None:
+    created = created_at or now_iso()
+    payload = data if isinstance(data, dict) else {"value": data}
+    if not event_id:
+        digest = hashlib.sha1(
+            f"{created}:{event_type}:{memory_id or ''}:{json.dumps(payload, sort_keys=True, ensure_ascii=False)}".encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
+        event_id = f"evt_{digest}"
+    conn.execute(
+        "INSERT OR IGNORE INTO events(id, memory_id, event_type, data_json, created_at) VALUES(?, ?, ?, ?, ?)",
+        (
+            event_id,
+            memory_id or None,
+            event_type,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            created,
+        ),
+    )
+
+
+def _sqlite_sync_links_for_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> None:
+    source_id = str(memory.get("id", "")).strip()
+    if not source_id:
+        return
+    linked_ids = normalize_linked_ids(memory.get("linked_ids", memory.get("references", [])))
+    metadata = normalize_metadata(memory.get("metadata"))
+    relations_raw = metadata.get("link_relations", {})
+    relations = relations_raw if isinstance(relations_raw, dict) else {}
+    conn.execute("DELETE FROM links WHERE source_id = ?", (source_id,))
+    for target_id in linked_ids:
+        relation = normalize_optional_string(relations.get(target_id)) or ""
+        conn.execute(
+            "INSERT OR REPLACE INTO links(source_id, target_id, relation, created_at) VALUES(?, ?, ?, ?)",
+            (source_id, target_id, relation, now_iso()),
+        )
+
+
+def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> None:
+    row = _memory_to_sqlite_row(memory)
+    metadata = normalize_metadata(memory.get("metadata"))
+    if row["deleted"]:
+        metadata["_deleted_at"] = memory.get("deleted_at")
+        metadata["_deletion_reason"] = memory.get("deletion_reason")
+        row["metadata_json"] = json.dumps(metadata, ensure_ascii=False)
+    conn.execute(
+        """
+        INSERT INTO memories(
+            id, kind, text, title, preview, source, tags_json, linked_ids_json,
+            agent_id, role, scope, domain, authority, retention, confidence,
+            parent_id, source_run_id, metadata_json, pinned, deleted, superseded_by,
+            created_at, updated_at, token_estimate, content_hash
+        ) VALUES(
+            :id, :kind, :text, :title, :preview, :source, :tags_json, :linked_ids_json,
+            :agent_id, :role, :scope, :domain, :authority, :retention, :confidence,
+            :parent_id, :source_run_id, :metadata_json, :pinned, :deleted, :superseded_by,
+            :created_at, :updated_at, :token_estimate, :content_hash
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            kind=excluded.kind,
+            text=excluded.text,
+            title=excluded.title,
+            preview=excluded.preview,
+            source=excluded.source,
+            tags_json=excluded.tags_json,
+            linked_ids_json=excluded.linked_ids_json,
+            agent_id=excluded.agent_id,
+            role=excluded.role,
+            scope=excluded.scope,
+            domain=excluded.domain,
+            authority=excluded.authority,
+            retention=excluded.retention,
+            confidence=excluded.confidence,
+            parent_id=excluded.parent_id,
+            source_run_id=excluded.source_run_id,
+            metadata_json=excluded.metadata_json,
+            pinned=excluded.pinned,
+            deleted=excluded.deleted,
+            superseded_by=excluded.superseded_by,
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at,
+            token_estimate=excluded.token_estimate,
+            content_hash=excluded.content_hash
+        """,
+        row,
+    )
+    _sqlite_sync_links_for_memory(conn, memory)
+    _sqlite_sync_fts_for_memory_row(conn, row)
+
+
+def _sqlite_load_store(conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute("SELECT * FROM memories ORDER BY created_at ASC, id ASC").fetchall()
+    memories = [_sqlite_row_to_memory(row) for row in rows]
+    return {"version": 1, "memories": memories}
+
+
+def _sqlite_import_memory_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    dry_run: bool = False,
+) -> tuple[int, int, list[str]]:
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+    existing_ids = {str(row[0]) for row in conn.execute("SELECT id FROM memories").fetchall()}
+    existing_hashes = {str(row[0]) for row in conn.execute("SELECT content_hash FROM memories WHERE content_hash IS NOT NULL").fetchall()}
+    for row in rows:
+        try:
+            memory = migrate_memory(row)
+            memory_id = str(memory.get("id", "")).strip()
+            digest = memory_content_hash(memory)
+            if not memory_id:
+                skipped += 1
+                continue
+            if memory_id in existing_ids or digest in existing_hashes:
+                skipped += 1
+                continue
+            imported += 1
+            if dry_run:
+                continue
+            _sqlite_upsert_memory(conn, memory)
+            existing_ids.add(memory_id)
+            existing_hashes.add(digest)
+        except Exception as exc:
+            errors.append(str(exc))
+    return imported, skipped, errors
+
+
+def _read_json_memories(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        memories = payload.get("memories", [])
+        if isinstance(memories, list):
+            return [memory for memory in memories if isinstance(memory, dict)]
+    if isinstance(payload, list):
+        return [memory for memory in payload if isinstance(memory, dict)]
+    return []
+
+
+def _read_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
+    except OSError:
+        return []
+    return rows
+
+
+def _sqlite_ingest_legacy_events_and_queries(conn: sqlite3.Connection) -> None:
+    legacy_event_paths = [
+        (events_log_path().with_name("events.1.jsonl"), False),
+        (events_log_path(), False),
+        (events_archive_path(), True),
+    ]
+    for path, is_archive in legacy_event_paths:
+        for row in _read_jsonl_rows(path):
+            event_type = str(row.get("event", "")).strip() or "event"
+            created_at = str(row.get("ts", "")).strip() or now_iso()
+            memory_id = normalize_optional_string(row.get("id"))
+            details = row.get("details")
+            data = details if isinstance(details, dict) else {"details": details}
+            data["_legacy_archive"] = bool(is_archive)
+            _sqlite_insert_event(conn, memory_id, event_type, data, created_at)
+
+    legacy_query_paths = [
+        (query_log_path().with_name("queries.1.jsonl"), False),
+        (query_log_path(), False),
+        (query_archive_path(), True),
+    ]
+    for path, is_archive in legacy_query_paths:
+        for row in _read_jsonl_rows(path):
+            created_at = str(row.get("ts", "")).strip() or now_iso()
+            payload = dict(row)
+            payload["_legacy_archive"] = bool(is_archive)
+            _sqlite_insert_event(conn, None, "query", payload, created_at)
+
+
+def _sqlite_bootstrap_if_needed(conn: sqlite3.Connection) -> None:
+    db_key = str(sqlite_path().resolve())
+    if db_key in _SQLITE_BOOTSTRAPPED:
+        return
+    count_row = conn.execute("SELECT COUNT(*) FROM memories").fetchone()
+    memory_count = int(count_row[0]) if count_row else 0
+    if memory_count == 0:
+        mem_path = memory_path()
+        source_rows = _read_json_memories(mem_path)
+        if not source_rows:
+            source_rows = _read_json_memories(mem_path.with_name("memory.example.json"))
+        archive_rows = _read_jsonl_rows(archived_path())
+        merged_rows: list[dict[str, Any]] = list(source_rows)
+        for row in archive_rows:
+            if isinstance(row, dict):
+                metadata = normalize_metadata(row.get("metadata"))
+                metadata["legacy_archive"] = True
+                row["metadata"] = metadata
+                merged_rows.append(row)
+        _sqlite_import_memory_rows(conn, merged_rows, dry_run=False)
+        _sqlite_ingest_legacy_events_and_queries(conn)
+        _sqlite_set_meta(conn, "last_import_at", now_iso())
+    _sqlite_set_meta(conn, "legacy_bootstrap_done", now_iso())
+    fts_available = _sqlite_fts_available(conn)
+    _sqlite_set_meta(conn, "fts_available", "1" if fts_available else "0")
+    if fts_available and _sqlite_get_meta(conn, "fts_index_built_at") is None:
+        _sqlite_rebuild_fts_index(conn)
+    _SQLITE_BOOTSTRAPPED.add(db_key)
+
+
+def _json_load_store() -> dict[str, Any]:
     path = memory_path()
     if not path.exists():
         bootstrap_store_from_example(path)
@@ -378,6 +1305,15 @@ def load_store() -> dict[str, Any]:
         raw_memories = []
     data["memories"] = [migrate_memory(m) for m in raw_memories if isinstance(m, dict)]
     return data
+
+
+def load_store() -> dict[str, Any]:
+    if store_backend() == "json":
+        return _json_load_store()
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        return _sqlite_load_store(conn)
 
 
 def bootstrap_store_from_example(path: Path) -> None:
@@ -401,15 +1337,36 @@ def bootstrap_store_from_example(path: Path) -> None:
 
 
 def save_store(data: dict[str, Any]) -> None:
-    path = memory_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     data["version"] = 1
     data["memories"] = [migrate_memory(m) for m in data.get("memories", []) if isinstance(m, dict)]
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    if store_backend() == "json":
+        path = memory_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+        return
+
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        current_ids = {str(row[0]) for row in conn.execute("SELECT id FROM memories").fetchall()}
+        next_memories = [migrate_memory(m) for m in data.get("memories", []) if isinstance(m, dict)]
+        next_ids = {str(memory.get("id")) for memory in next_memories}
+        delete_ids = sorted(current_ids - next_ids)
+        for memory_id in delete_ids:
+            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.execute("DELETE FROM links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
+            if _sqlite_has_fts_table(conn):
+                conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+        for memory in next_memories:
+            _sqlite_upsert_memory(conn, memory)
+
+
+def store_lock_path() -> Path:
+    return sqlite_path() if store_backend() == "sqlite" else memory_path()
 
 
 def make_id(text: str) -> str:
@@ -724,34 +1681,217 @@ def duplicate_candidates(memories: list[dict[str, Any]], kind: str, skip_id: str
     return same_kind[-200:]
 
 
-def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str, Any]]:
-    query = str(args.get("query", "")).strip()
-    kind_filter = str(args.get("kind", "")).strip().lower()
-    include_deleted = parse_bool(args.get("include_deleted"), default=False)
-    include_superseded = parse_bool(args.get("include_superseded"), default=False)
-    pinned_filter = parse_bool(args.get("pinned"), default=False) if "pinned" in args else None
-    limit = int(args.get("limit", 5))
-    limit = max(1, min(limit, 20, max_search_results()))
-    if kind_filter:
-        validate_kind(kind_filter)
-    if phase is None:
-        _, phase = resolve_phase(args, query)
+def memory_preview(memory: dict[str, Any], max_chars: int = 200) -> str:
+    text = str(memory.get("text", ""))
+    return text if len(text) <= max_chars else text[:max_chars]
 
-    store = load_store()
-    query_tokens = tokenize(query)
-    ranked: list[tuple[float, dict[str, Any]]] = []
-    for memory in store.get("memories", []):
-        if kind_filter and memory.get("kind") != kind_filter:
+
+def get_linked_memories(
+    store: dict[str, Any],
+    memory: dict[str, Any],
+    include_deleted: bool = False,
+    include_superseded: bool = False,
+) -> list[dict[str, Any]]:
+    linked_ids = normalize_linked_ids(memory.get("linked_ids", memory.get("references", [])))
+    if not linked_ids:
+        return []
+    out: list[dict[str, Any]] = []
+    for linked_id in linked_ids:
+        linked = find_memory(store, linked_id)
+        if linked is None:
+            continue
+        if not visible_memory(linked, include_deleted, include_superseded):
+            continue
+        out.append(linked)
+    return out
+
+
+def filter_memories(
+    memories: list[dict[str, Any]],
+    filters: dict[str, Any],
+    *,
+    include_deleted: bool = False,
+    include_superseded: bool = False,
+) -> list[dict[str, Any]]:
+    kind_filter = normalize_optional_string(filters.get("kind"))
+    role_filter = normalize_optional_string(filters.get("role"))
+    agent_id_filter = normalize_optional_string(filters.get("agent_id"))
+    domain_filter = normalize_optional_string(filters.get("domain"))
+    scope_filter = normalize_optional_string(filters.get("scope"))
+    authority_filter = normalize_choice(
+        filters.get("authority"),
+        "authority",
+        AUTHORITY_VALUES,
+        default=None,
+        strict=False,
+    )
+    retention_filter = normalize_choice(
+        filters.get("retention"),
+        "retention",
+        RETENTION_VALUES,
+        default=None,
+        strict=False,
+    )
+    source_run_id_filter = normalize_optional_string(filters.get("source_run_id"))
+    pinned_filter = parse_bool(filters.get("pinned"), default=False) if "pinned" in filters else None
+
+    out: list[dict[str, Any]] = []
+    for memory in memories:
+        if not visible_memory(memory, include_deleted, include_superseded):
+            continue
+        if kind_filter and str(memory.get("kind", "")) != kind_filter:
+            continue
+        if role_filter and str(memory.get("role", "")).strip() != role_filter:
+            continue
+        if agent_id_filter and str(memory.get("agent_id", "")).strip() != agent_id_filter:
+            continue
+        if domain_filter and str(memory.get("domain", "")).strip() != domain_filter:
+            continue
+        if scope_filter and str(memory.get("scope", "")).strip() != scope_filter:
+            continue
+        if authority_filter and str(memory.get("authority", "")).strip().lower() != authority_filter:
+            continue
+        if retention_filter and str(memory.get("retention", "")).strip().lower() != retention_filter:
+            continue
+        if source_run_id_filter and str(memory.get("source_run_id", "")).strip() != source_run_id_filter:
             continue
         if pinned_filter is not None and bool(memory.get("pinned")) != pinned_filter:
             continue
-        if not visible_memory(memory, include_deleted, include_superseded):
-            continue
-        score = score_memory(query_tokens, memory, phase)
-        if score > 0 or not query:
-            ranked.append((score, memory))
+        out.append(memory)
+    return out
 
+
+def rank_memories_for_query(
+    memories: list[dict[str, Any]],
+    query_tokens: set[str],
+    *,
+    phase: str | None = None,
+    query_text: str = "",
+) -> list[tuple[float, dict[str, Any]]]:
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for memory in memories:
+        score = score_memory(query_tokens, memory, phase)
+        if score > 0 or not query_text:
+            ranked.append((score, memory))
     ranked.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
+    return ranked
+
+
+def _sqlite_fts_match_expression(query_tokens: set[str]) -> str:
+    tokens = sorted(token for token in query_tokens if token)
+    if not tokens:
+        return ""
+    limited = tokens[:24]
+    quoted = [f"\"{token.replace('\"', '\"\"')}\"" for token in limited]
+    return " OR ".join(quoted)
+
+
+def _sqlite_fts_candidate_memories(
+    args: dict[str, Any],
+    query: str,
+    *,
+    include_deleted: bool,
+    include_superseded: bool,
+    limit: int,
+) -> list[dict[str, Any]]:
+    query_tokens = tokenize(query)
+    match_expression = _sqlite_fts_match_expression(query_tokens)
+    if not match_expression:
+        return []
+
+    clauses = ["memories_fts MATCH ?"]
+    params: list[Any] = [match_expression]
+    if not include_deleted:
+        clauses.append("m.deleted = 0")
+    if not include_superseded:
+        clauses.append("(m.superseded_by IS NULL OR m.superseded_by = '')")
+
+    for field in ("kind", "role", "agent_id", "domain", "scope", "source_run_id"):
+        value = normalize_optional_string(args.get(field))
+        if value is not None:
+            clauses.append(f"m.{field} = ?")
+            params.append(value)
+    authority_value = normalize_choice(
+        args.get("authority"),
+        "authority",
+        AUTHORITY_VALUES,
+        default=None,
+        strict=False,
+    )
+    if authority_value is not None:
+        clauses.append("m.authority = ?")
+        params.append(authority_value)
+    retention_value = normalize_choice(
+        args.get("retention"),
+        "retention",
+        RETENTION_VALUES,
+        default=None,
+        strict=False,
+    )
+    if retention_value is not None:
+        clauses.append("m.retention = ?")
+        params.append(retention_value)
+    if "pinned" in args:
+        clauses.append("m.pinned = ?")
+        params.append(1 if parse_bool(args.get("pinned"), default=False) else 0)
+
+    candidate_limit = min(_SQLITE_FTS_CANDIDATE_LIMIT, max(limit * 8, 50))
+    sql = (
+        "SELECT m.* "
+        "FROM memories_fts "
+        "JOIN memories m ON m.id = memories_fts.id "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY COALESCE(m.updated_at, m.created_at) DESC, m.created_at DESC, m.id DESC "
+        "LIMIT ?"
+    )
+    params.append(candidate_limit)
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            if not _sqlite_has_fts_table(conn) and not _sqlite_fts_available(conn):
+                return []
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [_sqlite_row_to_memory(row) for row in rows]
+    except Exception:
+        # Keep search deterministic and robust by falling back to lexical ranking.
+        return []
+
+
+def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str, Any]]:
+    query = str(args.get("query", "")).strip()
+    include_deleted = parse_bool(args.get("include_deleted"), default=False)
+    include_superseded = parse_bool(args.get("include_superseded"), default=False)
+    limit = int(args.get("limit", 5))
+    limit = max(1, min(limit, 20, max_search_results()))
+    if "kind" in args and args.get("kind") is not None:
+        validate_kind(str(args.get("kind")))
+    if "authority" in args and args.get("authority") is not None:
+        normalize_choice(args.get("authority"), "authority", AUTHORITY_VALUES)
+    if "retention" in args and args.get("retention") is not None:
+        normalize_choice(args.get("retention"), "retention", RETENTION_VALUES)
+    if phase is None:
+        _, phase = resolve_phase(args, query)
+
+    query_tokens = tokenize(query)
+    candidates: list[dict[str, Any]] = []
+    if store_backend() == "sqlite" and query and _sqlite_fts_flag():
+        candidates = _sqlite_fts_candidate_memories(
+            args,
+            query,
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+            limit=limit,
+        )
+    if not candidates:
+        store = load_store()
+        candidates = filter_memories(
+            [memory for memory in store.get("memories", []) if isinstance(memory, dict)],
+            args,
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+        )
+    ranked = rank_memories_for_query(candidates, query_tokens, phase=phase, query_text=query)
     return [memory_to_match(memory, score) for score, memory in ranked[:limit]]
 
 
@@ -767,14 +1907,30 @@ def match_is_deleted(match: dict[str, Any]) -> bool:
 
 
 def memory_to_match(memory: dict[str, Any], score: float) -> dict[str, Any]:
+    max_chars = max_chars_per_item()
+    text_value = str(memory.get("text", ""))
+    clipped_text = text_value[:max_chars]
     return {
         "id": memory.get("id"),
         "kind": memory.get("kind"),
-        "text": memory.get("text"),
+        "text": clipped_text,
+        "text_full_available": len(text_value) > len(clipped_text),
+        "title": (memory.get("metadata") or {}).get("title") if isinstance(memory.get("metadata"), dict) else None,
         "source": memory.get("source", ""),
         "tags": memory.get("tags", []),
         "pinned": bool(memory.get("pinned", False)),
         "references": memory.get("references", []),
+        "linked_ids": memory.get("linked_ids", memory.get("references", [])),
+        "agent_id": memory.get("agent_id"),
+        "role": memory.get("role"),
+        "scope": memory.get("scope"),
+        "domain": memory.get("domain"),
+        "authority": memory.get("authority"),
+        "retention": memory.get("retention"),
+        "confidence": memory.get("confidence"),
+        "parent_id": memory.get("parent_id"),
+        "source_run_id": memory.get("source_run_id"),
+        "metadata": memory.get("metadata", {}),
         "score": round(float(score), 3),
         "created_at": memory.get("created_at"),
         "updated_at": memory.get("updated_at"),
@@ -782,6 +1938,84 @@ def memory_to_match(memory: dict[str, Any], score: float) -> dict[str, Any]:
         "deletion_reason": memory.get("deletion_reason"),
         "superseded_by": memory.get("superseded_by"),
     }
+
+
+def cap_match_items(matches: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    item_cap = max_chars_per_item()
+    total_cap = max_total_chars()
+    warnings: list[str] = []
+    capped: list[dict[str, Any]] = []
+    used = 0
+    for match in matches:
+        item = dict(match)
+        text_value = str(item.get("text", ""))
+        if len(text_value) > item_cap:
+            text_value = text_value[:item_cap]
+            item["text"] = text_value
+            item["text_full_available"] = True
+        projected = used + len(text_value)
+        if projected > total_cap and capped:
+            warnings.append("match output capped by max_total_chars")
+            break
+        used = min(total_cap, projected)
+        capped.append(item)
+    return capped, warnings
+
+
+def memory_bundle_item(memory: dict[str, Any], max_chars: int = 300, score: float | None = None) -> dict[str, Any]:
+    item = {
+        "id": memory.get("id"),
+        "kind": memory.get("kind"),
+        "text_preview": memory_preview(memory, max_chars=max_chars),
+        "tags": memory.get("tags", []),
+        "agent_id": memory.get("agent_id"),
+        "role": memory.get("role"),
+        "scope": memory.get("scope"),
+        "domain": memory.get("domain"),
+        "authority": memory.get("authority"),
+        "retention": memory.get("retention"),
+        "confidence": memory.get("confidence"),
+        "linked_ids": memory.get("linked_ids", memory.get("references", [])),
+        "parent_id": memory.get("parent_id"),
+        "source_run_id": memory.get("source_run_id"),
+        "pinned": bool(memory.get("pinned", False)),
+        "created_at": memory.get("created_at"),
+        "updated_at": memory.get("updated_at"),
+    }
+    metadata = memory.get("metadata", {})
+    if isinstance(metadata, dict) and metadata:
+        item["metadata"] = metadata
+    if score is not None:
+        item["score"] = round(float(score), 3)
+    return item
+
+
+def rank_against_query(memory: dict[str, Any], query: str, salience_module: Any | None = None) -> float:
+    if not query.strip():
+        return 0.0
+    if salience_module is not None:
+        try:
+            breakdown = salience_module.signal_score(query, str(memory.get("text", "")))
+            return max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+        except Exception:
+            pass
+    tokens = tokenize(query)
+    return max(0.0, float(score_memory(tokens, memory, phase=None)))
+
+
+def select_memories_by_query(
+    memories: list[dict[str, Any]],
+    query: str,
+    limit: int,
+    salience_module: Any | None = None,
+) -> list[tuple[float, dict[str, Any]]]:
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for memory in memories:
+        score = rank_against_query(memory, query, salience_module)
+        if score > 0.0 or not query.strip():
+            scored.append((score, memory))
+    scored.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
+    return scored[:limit]
 
 
 def apply_text_budget(lines: list[str], max_tokens: Any) -> tuple[list[str], bool, int, int]:
@@ -860,44 +2094,33 @@ def append_query_log(
 ) -> None:
     if not query_logging_enabled():
         return
-    path = query_log_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.stat().st_size >= QUERY_LOG_MAX_BYTES:
-            _rotate_query_log(path)
-        top_score = float(matches[0].get("score", 0.0)) if matches else 0.0
-        row = {
-            "ts": now_iso(),
-            "tool": tool,
-            "args": args,
-            "top_ids": [str(match.get("id")) for match in matches if match.get("id")],
-            "top_score": top_score,
-            "n_results": len(matches),
-        }
-        if phase is not None or tool in {"memory_search", "memory_compact_context"}:
-            row["phase"] = phase
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    top_score = float(matches[0].get("score", 0.0)) if matches else 0.0
+    row = {
+        "ts": now_iso(),
+        "tool": tool,
+        "args": args,
+        "top_ids": [str(match.get("id")) for match in matches if match.get("id")],
+        "top_score": top_score,
+        "n_results": len(matches),
+    }
+    if phase is not None or tool in {"mnemo_search", "mnemo_compact_context"}:
+        row["phase"] = phase
 
-
-def append_drift_query_log(args: dict[str, Any], drift: float) -> None:
-    if not query_logging_enabled():
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                _sqlite_insert_event(conn, None, "query", row, str(row["ts"]))
+        except Exception:
+            pass
         return
+
     path = query_log_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size >= QUERY_LOG_MAX_BYTES:
             _rotate_query_log(path)
-        row = {
-            "ts": now_iso(),
-            "tool": "memory_drift",
-            "args": args,
-            "top_ids": [],
-            "top_score": float(drift),
-            "n_results": 0,
-        }
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
     except Exception:
@@ -915,6 +2138,16 @@ def events_archive_path() -> Path:
 def append_event_log(event: str, memory_id: str, details: dict[str, Any]) -> None:
     if not event_logging_enabled() or not memory_id:
         return
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                _sqlite_insert_event(conn, memory_id, event, details, now_iso())
+        except Exception:
+            pass
+        return
+
     path = events_log_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -928,6 +2161,33 @@ def append_event_log(event: str, memory_id: str, details: dict[str, Any]) -> Non
 
 
 def read_event_rows(include_archive: bool = False) -> list[dict[str, Any]]:
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                rows = conn.execute(
+                    "SELECT memory_id, event_type, data_json, created_at FROM events WHERE event_type != 'query' ORDER BY created_at ASC, rowid ASC"
+                ).fetchall()
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                payload = json.loads(str(row["data_json"] or "{}"))
+                details = payload if isinstance(payload, dict) else {"value": payload}
+                is_legacy_archive = bool(details.pop("_legacy_archive", False))
+                if not include_archive and is_legacy_archive:
+                    continue
+                out.append(
+                    {
+                        "ts": str(row["created_at"] or ""),
+                        "event": str(row["event_type"] or ""),
+                        "id": str(row["memory_id"] or ""),
+                        "details": details,
+                    }
+                )
+            return out
+        except Exception:
+            return []
+
     path = events_log_path()
     paths = [path.with_name("events.1.jsonl"), path]
     if include_archive:
@@ -955,9 +2215,10 @@ def search_memories(args: dict[str, Any]) -> dict[str, Any]:
         query = str(args.get("query", "")).strip()
         phase_label, phase = resolve_phase(args, query)
         matches = search_rank(args, phase)
+        matches, cap_warnings = cap_match_items(matches)
     except Exception as exc:
         return tool_error(str(exc))
-    append_query_log("memory_search", args, matches, phase_label)
+    append_query_log("mnemo_search", args, matches, phase_label)
     if not matches:
         rendered, truncated, est_tokens, _ = apply_text_budget(
             ["No matching project memories found."],
@@ -970,6 +2231,7 @@ def search_memories(args: dict[str, Any]) -> dict[str, Any]:
                 "inferred_phase": phase_label,
                 "truncated": truncated,
                 "est_tokens": est_tokens,
+                "warnings": [],
             },
         )
 
@@ -987,6 +2249,7 @@ def search_memories(args: dict[str, Any]) -> dict[str, Any]:
             "inferred_phase": phase_label,
             "truncated": truncated,
             "est_tokens": est_tokens,
+            "warnings": cap_warnings,
         },
     )
 
@@ -1082,13 +2345,38 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def record_memory(args: dict[str, Any]) -> dict[str, Any]:
-    text = str(args.get("text", "")).strip()
-    if not text:
-        return tool_error("text is required")
     try:
         kind = validate_kind(str(args.get("kind", "note")))
+        text = normalize_optional_string(args.get("text"))
+        summary = normalize_optional_string(args.get("summary"))
+        body = normalize_optional_string(args.get("body"))
+        if kind == "interaction_log" and not text and summary:
+            text = summary
+        if kind == "context_block" and not text and body:
+            text = body
+        if not text:
+            text = summary or body
+        if not text:
+            return tool_error("text is required (or use summary/body aliases)")
+
         tags = normalize_tags(args.get("tags", []))
         references = normalize_references(args.get("references", []))
+        linked_ids = normalize_linked_ids(args.get("linked_ids", references))
+        if kind == "hippocampus_entry":
+            evidence_ids = normalize_linked_ids(args.get("evidence_ids", []))
+            for memory_id in evidence_ids:
+                if memory_id not in linked_ids:
+                    linked_ids.append(memory_id)
+        if not references:
+            references = list(linked_ids)
+        elif not linked_ids:
+            linked_ids = list(references)
+        for linked_id in references:
+            if linked_id not in linked_ids:
+                linked_ids.append(linked_id)
+        for linked_id in linked_ids:
+            if linked_id not in references:
+                references.append(linked_id)
         pinned = False
         if "pinned" in args and args.get("pinned") is not None:
             pinned = parse_strict_bool(args.get("pinned"), "pinned")
@@ -1096,11 +2384,45 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
         supersedes_id = str(supersedes).strip() if supersedes is not None else None
         if supersedes_id == "":
             supersedes_id = None
+        agent_id = normalize_optional_string(args.get("agent_id"))
+        role = normalize_optional_string(args.get("role"))
+        scope = normalize_optional_string(args.get("scope"))
+        domain = normalize_optional_string(args.get("domain"))
+        authority = normalize_choice(args.get("authority"), "authority", AUTHORITY_VALUES, default=None)
+        retention = normalize_choice(args.get("retention"), "retention", RETENTION_VALUES, default=None)
+        confidence = normalize_choice(args.get("confidence"), "confidence", CONFIDENCE_VALUES, default=None)
+        parent_id = normalize_optional_string(args.get("parent_id"))
+        source_run_id = normalize_optional_string(args.get("source_run_id"))
+        metadata = normalize_metadata(args.get("metadata"))
+        title = normalize_optional_string(args.get("title"))
+        if title:
+            metadata["title"] = title
+        feedback_type = normalize_optional_string(args.get("feedback_type"))
+        if kind == "agent_feedback" and feedback_type:
+            metadata["feedback_type"] = feedback_type
+        if kind == "agent_feedback" and not any([agent_id, role, domain]):
+            return tool_error("at least one of agent_id, role, or domain is required")
+
+        if kind == "interaction_log":
+            authority = authority or "low"
+            retention = retention or "compressible"
+            if role is None:
+                role = "coordinator"
+        elif kind == "context_block":
+            authority = authority or "medium"
+            retention = retention or "durable"
+        elif kind == "hippocampus_entry":
+            authority = authority or "medium"
+            retention = retention or "durable"
+            confidence = confidence or "medium"
+        elif kind == "agent_feedback":
+            authority = authority or "medium"
+            retention = retention or "durable"
     except ValueError as exc:
         return tool_error(str(exc))
 
     try:
-        with MemoryFileLock(memory_path()):
+        with MemoryFileLock(store_lock_path()):
             store = load_store()
             memories = store.setdefault("memories", [])
             old = find_memory(store, supersedes_id) if supersedes_id else None
@@ -1139,6 +2461,17 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
                 tags,
                 references,
                 pinned,
+                agent_id=agent_id,
+                role=role,
+                scope=scope,
+                domain=domain,
+                authority=authority,
+                retention=retention,
+                confidence=confidence,
+                linked_ids=linked_ids,
+                parent_id=parent_id,
+                source_run_id=source_run_id,
+                metadata=metadata,
             )
             memories.append(memory)
             if old is not None:
@@ -1170,7 +2503,7 @@ def update_memory(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error("id is required")
 
     try:
-        with MemoryFileLock(memory_path()):
+        with MemoryFileLock(store_lock_path()):
             store = load_store()
             memory = find_memory(store, memory_id)
             if memory is None:
@@ -1195,8 +2528,63 @@ def update_memory(args: dict[str, Any]) -> dict[str, Any]:
                 memory["pinned"] = parse_bool(args.get("pinned"), default=False)
                 changed.append("pinned")
             if "references" in args and args.get("references") is not None:
-                memory["references"] = normalize_references(args.get("references"))
+                normalized_refs = normalize_references(args.get("references"))
+                memory["references"] = normalized_refs
+                # Keep link fields mirrored when callers update legacy references only.
+                memory["linked_ids"] = list(normalized_refs)
                 changed.append("references")
+            if "linked_ids" in args and args.get("linked_ids") is not None:
+                normalized_links = normalize_linked_ids(args.get("linked_ids"))
+                memory["linked_ids"] = normalized_links
+                # Keep legacy references aligned for backward-compatible reads.
+                memory["references"] = list(normalized_links)
+                changed.append("linked_ids")
+            if "agent_id" in args:
+                memory["agent_id"] = normalize_optional_string(args.get("agent_id"))
+                changed.append("agent_id")
+            if "role" in args:
+                memory["role"] = normalize_optional_string(args.get("role"))
+                changed.append("role")
+            if "scope" in args:
+                memory["scope"] = normalize_optional_string(args.get("scope"))
+                changed.append("scope")
+            if "domain" in args:
+                memory["domain"] = normalize_optional_string(args.get("domain"))
+                changed.append("domain")
+            if "authority" in args:
+                memory["authority"] = normalize_choice(
+                    args.get("authority"),
+                    "authority",
+                    AUTHORITY_VALUES,
+                    default=None,
+                )
+                changed.append("authority")
+            if "retention" in args:
+                memory["retention"] = normalize_choice(
+                    args.get("retention"),
+                    "retention",
+                    RETENTION_VALUES,
+                    default=None,
+                )
+                changed.append("retention")
+            if "confidence" in args:
+                memory["confidence"] = normalize_choice(
+                    args.get("confidence"),
+                    "confidence",
+                    CONFIDENCE_VALUES,
+                    default=None,
+                )
+                changed.append("confidence")
+            if "parent_id" in args:
+                memory["parent_id"] = normalize_optional_string(args.get("parent_id"))
+                changed.append("parent_id")
+            if "source_run_id" in args:
+                memory["source_run_id"] = normalize_optional_string(args.get("source_run_id"))
+                changed.append("source_run_id")
+            if "metadata" in args and args.get("metadata") is not None:
+                memory["metadata"] = normalize_metadata(args.get("metadata"))
+                changed.append("metadata")
+            merge_link_fields(memory)
             memory["updated_at"] = now_iso()
             save_store(store)
             if changed:
@@ -1214,7 +2602,7 @@ def delete_memory(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error("id is required")
     reason = str(args.get("reason", "")).strip() or None
     try:
-        with MemoryFileLock(memory_path()):
+        with MemoryFileLock(store_lock_path()):
             store = load_store()
             memory = find_memory(store, memory_id)
             if memory is None:
@@ -1228,6 +2616,163 @@ def delete_memory(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error(str(exc))
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
+
+
+def memory_get(args: dict[str, Any]) -> dict[str, Any]:
+    memory_id = str(args.get("id", "")).strip()
+    if not memory_id:
+        return tool_error("id is required")
+    full = parse_bool(args.get("full"), default=False)
+    include_deleted = parse_bool(args.get("include_deleted"), default=True)
+    include_superseded = parse_bool(args.get("include_superseded"), default=True)
+
+    store = load_store()
+    memory = find_memory(store, memory_id)
+    if memory is None:
+        return tool_error(f"memory not found: {memory_id}")
+    if not visible_memory(memory, include_deleted, include_superseded):
+        return tool_error(f"memory {memory_id} is hidden by deleted/superseded filters")
+
+    if full:
+        return text_result(
+            f"Memory {memory_id} ({memory.get('kind')}):\n{memory.get('text', '')}",
+            {"memory": migrate_memory(memory), "full": True},
+        )
+    item = memory_bundle_item(memory, max_chars=max_chars_per_item())
+    text_preview = str(item.get("text_preview", ""))
+    return text_result(
+        f"Memory {memory_id} ({memory.get('kind')} preview):\n{text_preview}",
+        {"memory": item, "full": False},
+    )
+
+
+def export_root() -> Path:
+    root = state_dir() / "exports"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _default_export_path(format_value: str) -> Path:
+    root = export_root()
+    mapping = {
+        "jsonl": root / "memory.jsonl",
+        "json": root / "memory.json",
+        "markdown": root / "memory.md",
+        "hippocampus_markdown": root / "hippocampus.md",
+        "agent_feedback_markdown": root / "agent_feedback.md",
+        "startup_context_markdown": root / "startup_context_latest.md",
+    }
+    return mapping.get(format_value, root / "memory.jsonl")
+
+
+def _export_markdown(memories: list[dict[str, Any]], title: str) -> str:
+    lines = [f"# {title}", ""]
+    for memory in memories:
+        memory_id = str(memory.get("id", ""))
+        kind = str(memory.get("kind", "note"))
+        created = str(memory.get("created_at", ""))
+        text = str(memory.get("text", ""))
+        lines.append(f"## {memory_id} ({kind})")
+        lines.append(f"- created_at: {created}")
+        if memory.get("domain"):
+            lines.append(f"- domain: {memory.get('domain')}")
+        if memory.get("role"):
+            lines.append(f"- role: {memory.get('role')}")
+        if memory.get("agent_id"):
+            lines.append(f"- agent_id: {memory.get('agent_id')}")
+        lines.append("")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def memory_export(args: dict[str, Any]) -> dict[str, Any]:
+    format_value = str(args.get("format", "")).strip().lower()
+    if not format_value:
+        return tool_error("format is required")
+    allowed = {
+        "jsonl",
+        "json",
+        "markdown",
+        "hippocampus_markdown",
+        "agent_feedback_markdown",
+        "startup_context_markdown",
+    }
+    if format_value not in allowed:
+        return tool_error("format must be one of: jsonl, json, markdown, hippocampus_markdown, agent_feedback_markdown, startup_context_markdown")
+
+    path_arg = normalize_optional_string(args.get("path"))
+    output_path = Path(path_arg).expanduser() if path_arg else _default_export_path(format_value)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    include_deleted = parse_bool(args.get("include_deleted"), default=False)
+    max_records = max(1, min(int(args.get("max_records", 500)), 5000))
+
+    store = load_store()
+    memories = [memory for memory in store.get("memories", []) if isinstance(memory, dict)]
+    memories = filter_memories(
+        memories,
+        {
+            "kind": args.get("kind"),
+            "domain": args.get("domain"),
+            "agent_id": args.get("agent_id"),
+            "role": args.get("role"),
+        },
+        include_deleted=include_deleted,
+        include_superseded=False,
+    )
+    memories.sort(key=lambda memory: (str(memory.get("created_at", "")), str(memory.get("id", ""))))
+    memories = memories[:max_records]
+
+    if format_value == "hippocampus_markdown" and not args.get("kind"):
+        memories = [memory for memory in memories if str(memory.get("kind")) == "hippocampus_entry"]
+    if format_value == "agent_feedback_markdown" and not args.get("kind"):
+        memories = [memory for memory in memories if str(memory.get("kind")) == "agent_feedback"]
+    if format_value == "startup_context_markdown":
+        startup = memory_recall({"mode": "startup"})
+        structured = startup.get("structuredContent", {})
+        lines = [
+            "# Startup Context",
+            "",
+            f"- summary: {structured.get('summary', '')}",
+            "",
+            "## Recent Logs",
+        ]
+        for item in structured.get("recent_logs", []):
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('id')}: {item.get('text_preview')}")
+        lines.append("")
+        lines.append("## Context Blocks")
+        for item in structured.get("context_blocks", []):
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('id')}: {item.get('text_preview')}")
+        payload = "\n".join(lines).strip() + "\n"
+    elif format_value == "jsonl":
+        payload = "".join(
+            json.dumps(migrate_memory(memory), separators=(",", ":"), ensure_ascii=False) + "\n"
+            for memory in memories
+        )
+    elif format_value == "json":
+        payload = json.dumps({"version": 1, "memories": [migrate_memory(memory) for memory in memories]}, indent=2, ensure_ascii=False) + "\n"
+    elif format_value in {"markdown", "hippocampus_markdown", "agent_feedback_markdown"}:
+        title = {
+            "markdown": "Mnemo Memory Export",
+            "hippocampus_markdown": "Mnemo Hippocampus Entries",
+            "agent_feedback_markdown": "Mnemo Agent Feedback",
+        }[format_value]
+        payload = _export_markdown(memories, title)
+    else:
+        payload = ""
+
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write(payload)
+    return text_result(
+        f"Exported {len(memories)} memories to {output_path}.",
+        {
+            "format": format_value,
+            "path": str(output_path),
+            "records": len(memories),
+        },
+    )
 
 
 def recent_memories(args: dict[str, Any]) -> dict[str, Any]:
@@ -1245,7 +2790,7 @@ def recent_memories(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return tool_error(str(exc))
 
-    append_query_log("memory_recent", args, recent)
+    append_query_log("mnemo_recent", args, recent)
     if not recent:
         return text_result("No project memories recorded yet.", {"memories": []})
 
@@ -1271,7 +2816,7 @@ def compact_context(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return tool_error(str(exc))
 
-    append_query_log("memory_compact_context", args, matches, phase_label)
+    append_query_log("mnemo_compact_context", args, matches, phase_label)
     if not matches:
         rendered, truncated, est_tokens, _ = apply_text_budget(
             ["[Project Memory]", "No relevant memories found."],
@@ -1339,41 +2884,34 @@ def render_history_event(row: dict[str, Any]) -> str:
     return f"- {ts} {event}"
 
 
-def memory_history(args: dict[str, Any]) -> dict[str, Any]:
-    memory_id = str(args.get("id", "")).strip()
-    if not memory_id:
-        return tool_error("id is required")
-    limit = int(args.get("limit", 50))
-    limit = max(1, min(limit, 200))
-    include_archive = parse_bool(args.get("include_archive"), default=False)
-    path = events_log_path()
-    if (
-        not path.exists()
-        and not path.with_name("events.1.jsonl").exists()
-        and (not include_archive or not events_archive_path().exists())
-    ):
-        return text_result(
-            "No event log available; set MNEMO_LOG_EVENTS=1 to enable.",
-            {"events": []},
-        )
+def _compute_history(memory_id: str, limit: int, include_archive: bool) -> tuple[str, dict[str, Any]]:
+    if not event_logging_enabled():
+        return "No event log available; set MNEMO_LOG_EVENTS=1 to enable.", {"events": []}
+
+    if store_backend() == "json":
+        path = events_log_path()
+        if (
+            not path.exists()
+            and not path.with_name("events.1.jsonl").exists()
+            and (not include_archive or not events_archive_path().exists())
+        ):
+            return "No event log available; set MNEMO_LOG_EVENTS=1 to enable.", {"events": []}
     events = [row for row in read_event_rows(include_archive) if row.get("id") == memory_id]
     events.sort(key=lambda row: str(row.get("ts", "")))
     events = events[-limit:]
     if not events:
-        return text_result(f"History for {memory_id}:\nNo events found.", {"events": []})
+        return f"History for {memory_id}:\nNo events found.", {"events": []}
     lines = [f"History for {memory_id}:"]
     lines.extend(render_history_event(row) for row in events)
-    return text_result("\n".join(lines), {"events": events})
+    return "\n".join(lines), {"events": events}
 
 
-def memory_related(args: dict[str, Any]) -> dict[str, Any]:
-    root_id = str(args.get("id", "")).strip()
-    if not root_id:
-        return tool_error("id is required")
-    depth = int(args.get("depth", 1))
-    depth = max(1, min(depth, 3))
-    include_deleted = parse_bool(args.get("include_deleted"), default=False)
-    include_superseded = parse_bool(args.get("include_superseded"), default=False)
+def _compute_related(
+    root_id: str,
+    depth: int,
+    include_deleted: bool,
+    include_superseded: bool,
+) -> tuple[str, dict[str, Any]]:
     store = load_store()
     memories = [memory for memory in store.get("memories", []) if isinstance(memory, dict)]
     by_id = {str(memory.get("id")): memory for memory in memories}
@@ -1418,14 +2956,44 @@ def memory_related(args: dict[str, Any]) -> dict[str, Any]:
 
     related.sort(key=lambda item: (int(item["distance"]), str(item["direction"]), str(item["id"])))
     if not related:
-        return text_result(f"No related memories found for {root_id}.", {"related": []})
+        return f"No related memories found for {root_id}.", {"related": []}
     lines = [f"Related memories for {root_id}:"]
     for item in related:
         memory = item["memory"]
         lines.append(
             f"- {item['id']} ({item['direction']}, distance {item['distance']}): {memory.get('text')}"
         )
-    return text_result("\n".join(lines), {"related": related})
+    return "\n".join(lines), {"related": related}
+
+
+def memory_inspect(args: dict[str, Any]) -> dict[str, Any]:
+    memory_id = str(args.get("id", "")).strip()
+    if not memory_id:
+        return tool_error("id is required")
+    mode = str(args.get("mode", "both")).strip().lower() or "both"
+    if mode not in {"history", "related", "both"}:
+        return tool_error("mode must be one of: history, related, both")
+
+    limit = int(args.get("limit", 50))
+    limit = max(1, min(limit, 200))
+    depth = int(args.get("depth", 1))
+    depth = max(1, min(depth, 3))
+    include_deleted = parse_bool(args.get("include_deleted"), default=False)
+    include_superseded = parse_bool(args.get("include_superseded"), default=False)
+    include_archive = parse_bool(args.get("include_archive"), default=False)
+
+    sections: list[str] = []
+    structured: dict[str, Any] = {"id": memory_id, "mode": mode}
+    if mode in {"history", "both"}:
+        history_text, history_structured = _compute_history(memory_id, limit, include_archive)
+        sections.append(history_text)
+        structured["events"] = history_structured.get("events", [])
+    if mode in {"related", "both"}:
+        related_text, related_structured = _compute_related(memory_id, depth, include_deleted, include_superseded)
+        sections.append(related_text)
+        structured["related"] = related_structured.get("related", [])
+
+    return text_result("\n\n".join(section for section in sections if section), structured)
 
 
 def group_tokens(memories: list[dict[str, Any]]) -> set[str]:
@@ -1443,31 +3011,34 @@ def drift_interpretation(drift: float) -> str:
     return "high"
 
 
-def memory_drift(args: dict[str, Any]) -> dict[str, Any]:
-    recent_count = int(args.get("recent_count", 50))
-    older_count = int(args.get("older_count", 50))
-    recent_count = max(2, min(recent_count, 200))
-    older_count = max(2, min(older_count, 200))
+def memory_drift_compute(
+    recent_count: int = 50,
+    older_count: int = 50,
+    store: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    recent_count = max(2, min(int(recent_count), 200))
+    older_count = max(2, min(int(older_count), 200))
+    local_store = store
+    if local_store is None:
+        try:
+            local_store = load_store()
+        except Exception:
+            local_store = {"version": 1, "memories": []}
     memories = [
         memory
-        for memory in load_store().get("memories", [])
+        for memory in local_store.get("memories", [])
         if is_active(memory)
         and not memory.get("pinned")
         and str(memory.get("kind", "")) != "invariant"
     ]
     memories.sort(key=lambda memory: str(memory.get("created_at", "")))
     if len(memories) < 4:
-        drift = 0.0
-        append_drift_query_log(args, drift)
-        return text_result(
-            "Memory drift: 0.0 (low)\ninsufficient history (need \u2265 4 active non-pinned memories)",
-            {
-                "drift": drift,
-                "recent_count": 0,
-                "older_count": 0,
-                "interpretation": "low",
-            },
-        )
+        return {
+            "value": 0.0,
+            "recent_count": recent_count,
+            "older_count": older_count,
+            "interpretation": "insufficient_history",
+        }
 
     half = len(memories) // 2
     recent_n = min(recent_count, half)
@@ -1477,24 +3048,13 @@ def memory_drift(args: dict[str, Any]) -> dict[str, Any]:
     drift = 1.0 - jaccard(group_tokens(recent), group_tokens(older))
     drift = max(0.0, min(1.0, drift))
     drift = round(drift, 3)
-    interpretation = drift_interpretation(drift)
     structured = {
-        "drift": drift,
+        "value": drift,
         "recent_count": len(recent),
         "older_count": len(older),
-        "interpretation": interpretation,
+        "interpretation": drift_interpretation(drift),
     }
-    append_drift_query_log(args, drift)
-    return text_result(
-        "\n".join(
-            [
-                f"Memory drift: {drift} ({interpretation})",
-                f"Recent group: {len(recent)} memories",
-                f"Older group: {len(older)} memories",
-            ]
-        ),
-        structured,
-    )
+    return structured
 
 
 def timestamp_key(memory: dict[str, Any]) -> str:
@@ -1573,18 +3133,17 @@ def render_consolidation_text(clusters: list[dict[str, Any]], threshold: float, 
     return "\n".join(lines)
 
 
-def memory_consolidate(args: dict[str, Any]) -> dict[str, Any]:
+def _consolidate_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     threshold = consolidate_threshold(args.get("threshold") if "threshold" in args else None)
-    dry_run = parse_bool(args.get("dry_run"), default=True)
 
     if dry_run:
         clusters = build_consolidation_clusters(load_store(), threshold)
-        structured = {"applied": False, "threshold": threshold, "clusters": clusters}
+        structured = {"action": "consolidate", "applied": False, "threshold": threshold, "clusters": clusters}
         return text_result(render_consolidation_text(clusters, threshold, False, 0), structured)
 
     retired = 0
     try:
-        with MemoryFileLock(memory_path()):
+        with MemoryFileLock(store_lock_path()):
             store = load_store()
             clusters = build_consolidation_clusters(store, threshold)
             by_id = {str(memory.get("id")): memory for memory in store.get("memories", [])}
@@ -1604,8 +3163,558 @@ def memory_consolidate(args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
-    structured = {"applied": True, "threshold": threshold, "clusters": clusters}
+    structured = {"action": "consolidate", "applied": True, "threshold": threshold, "clusters": clusters}
     return text_result(render_consolidation_text(clusters, threshold, True, retired), structured)
+
+
+def _import_json_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    path_arg = normalize_optional_string(args.get("path"))
+    source_path = Path(path_arg).expanduser() if path_arg else memory_path()
+    rows = _read_json_memories(source_path)
+    if not rows:
+        return text_result(
+            f"No importable memories found in {source_path}.",
+            {"action": "import_json", "path": str(source_path), "imported_count": 0, "skipped_count": 0, "errors": []},
+        )
+
+    errors: list[str] = []
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                imported, skipped, errors = _sqlite_import_memory_rows(conn, rows, dry_run=dry_run)
+                if imported and not dry_run:
+                    _sqlite_set_meta(conn, "last_import_at", now_iso())
+        except Exception as exc:
+            return tool_error(f"{type(exc).__name__}: {exc}")
+    else:
+        try:
+            with MemoryFileLock(store_lock_path()):
+                store = load_store()
+                existing = [memory for memory in store.get("memories", []) if isinstance(memory, dict)]
+                existing_ids = {str(memory.get("id", "")) for memory in existing}
+                existing_hashes = {memory_content_hash(memory) for memory in existing}
+                imported = 0
+                skipped = 0
+                for row in rows:
+                    try:
+                        memory = migrate_memory(row)
+                        memory_id = str(memory.get("id", "")).strip()
+                        digest = memory_content_hash(memory)
+                        if not memory_id or memory_id in existing_ids or digest in existing_hashes:
+                            skipped += 1
+                            continue
+                        imported += 1
+                        if not dry_run:
+                            existing.append(memory)
+                            existing_ids.add(memory_id)
+                            existing_hashes.add(digest)
+                    except Exception as exc:
+                        errors.append(str(exc))
+                if imported and not dry_run:
+                    store["memories"] = existing
+                    save_store(store)
+        except Exception as exc:
+            return tool_error(f"{type(exc).__name__}: {exc}")
+
+    return text_result(
+        f"Import complete from {source_path}: imported={imported}, skipped={skipped}.",
+        {
+            "action": "import_json",
+            "path": str(source_path),
+            "dry_run": dry_run,
+            "imported_count": imported,
+            "skipped_count": skipped,
+            "errors": errors,
+        },
+    )
+
+
+def memory_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    action = str(args.get("action", "")).strip().lower()
+    if action not in {"compact_logs", "consolidate", "import_json"}:
+        return tool_error("action must be one of: compact_logs, consolidate, import_json")
+    dry_run = parse_bool(args.get("dry_run"), default=True)
+    if action == "compact_logs":
+        return _compact_logs_maintenance(args, dry_run)
+    if action == "import_json":
+        return _import_json_maintenance(args, dry_run)
+    return _consolidate_maintenance(args, dry_run)
+
+
+def memory_link(args: dict[str, Any]) -> dict[str, Any]:
+    source_id = str(args.get("source_id", "")).strip()
+    target_id = str(args.get("target_id", "")).strip()
+    relation = normalize_optional_string(args.get("relation"))
+    bidirectional = parse_bool(args.get("bidirectional"), default=False)
+    if not source_id or not target_id:
+        return tool_error("source_id and target_id are required")
+    if source_id == target_id:
+        return tool_error("source_id and target_id must be different")
+
+    try:
+        with MemoryFileLock(store_lock_path()):
+            store = load_store()
+            source = find_memory(store, source_id)
+            target = find_memory(store, target_id)
+            if source is None:
+                return tool_error(f"memory not found: {source_id}")
+            if target is None:
+                return tool_error(f"memory not found: {target_id}")
+
+            source_links = normalize_linked_ids(source.get("linked_ids", source.get("references", [])))
+            if target_id not in source_links:
+                source_links.append(target_id)
+            source["linked_ids"] = source_links
+            source["references"] = list(source_links)
+            source["updated_at"] = now_iso()
+            if relation:
+                source_meta = normalize_metadata(source.get("metadata"))
+                relations = source_meta.get("link_relations", {})
+                if not isinstance(relations, dict):
+                    relations = {}
+                relations[str(target_id)] = relation
+                source_meta["link_relations"] = relations
+                source["metadata"] = source_meta
+
+            target_links: list[str] = normalize_linked_ids(target.get("linked_ids", target.get("references", [])))
+            if bidirectional:
+                if source_id not in target_links:
+                    target_links.append(source_id)
+                target["linked_ids"] = target_links
+                target["references"] = list(target_links)
+                target["updated_at"] = now_iso()
+                if relation:
+                    target_meta = normalize_metadata(target.get("metadata"))
+                    reverse_relations = target_meta.get("link_relations", {})
+                    if not isinstance(reverse_relations, dict):
+                        reverse_relations = {}
+                    reverse_relations[str(source_id)] = relation
+                    target_meta["link_relations"] = reverse_relations
+                    target["metadata"] = target_meta
+
+            save_store(store)
+            append_event_log(
+                "link",
+                source_id,
+                {"target_id": target_id, "relation": relation, "bidirectional": bidirectional},
+            )
+            if bidirectional:
+                append_event_log(
+                    "link",
+                    target_id,
+                    {"target_id": source_id, "relation": relation, "bidirectional": True},
+                )
+    except LockTimeout as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    return text_result(
+        f"Linked {source_id} -> {target_id}.",
+        {
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": relation,
+            "bidirectional": bidirectional,
+            "source_links": source.get("linked_ids", source.get("references", [])),  # type: ignore[name-defined]
+            "target_links": target.get("linked_ids", target.get("references", [])),  # type: ignore[name-defined]
+        },
+    )
+
+
+def _build_recall_bundle(
+    store: dict[str, Any],
+    *,
+    mode: str,
+    agent_id: str | None,
+    role: str | None,
+    domain: str | None,
+    task: str,
+    query: str,
+    recent_logs_limit: int,
+    max_blocks: int,
+    max_hippocampus: int,
+    max_feedback: int,
+    include_pinned: bool,
+    include_recent_logs: bool,
+    salience_module: Any | None,
+) -> tuple[str, dict[str, Any]]:
+    visible = [
+        memory
+        for memory in store.get("memories", [])
+        if isinstance(memory, dict) and visible_memory(memory, False, False)
+    ]
+
+    if mode == "startup":
+        startup_role = role or "coordinator"
+        logs = [
+            memory
+            for memory in visible
+            if str(memory.get("kind", "")) == "interaction_log"
+            and (agent_id is None or str(memory.get("agent_id", "")).strip() == agent_id)
+            and (startup_role is None or str(memory.get("role", "")).strip() == startup_role)
+        ]
+        logs.sort(key=lambda memory: str(memory.get("created_at", "")), reverse=True)
+        recent_logs = logs[:recent_logs_limit]
+
+        linked_ids: list[str] = []
+        for memory in recent_logs:
+            for linked_id in normalize_linked_ids(memory.get("linked_ids", memory.get("references", []))):
+                if linked_id not in linked_ids:
+                    linked_ids.append(linked_id)
+        linked_blocks = [
+            memory
+            for memory_id in linked_ids
+            for memory in [find_memory(store, memory_id)]
+            if memory is not None and str(memory.get("kind", "")) == "context_block" and visible_memory(memory, False, False)
+        ]
+
+        block_candidates = [memory for memory in visible if str(memory.get("kind", "")) == "context_block"]
+        scored_blocks = select_memories_by_query(block_candidates, query, max_blocks * 2, salience_module)
+        blocks_by_id: dict[str, dict[str, Any]] = {}
+        for memory in linked_blocks:
+            blocks_by_id[str(memory.get("id"))] = memory
+        for _, memory in scored_blocks:
+            if len(blocks_by_id) >= max_blocks:
+                break
+            blocks_by_id.setdefault(str(memory.get("id")), memory)
+        context_blocks = list(blocks_by_id.values())[:max_blocks]
+
+        hippocampus = [memory for memory in visible if str(memory.get("kind", "")) == "hippocampus_entry"]
+        scored_hippocampus = select_memories_by_query(hippocampus, query, max_hippocampus, salience_module)
+        hippocampus_entries = [memory for _, memory in scored_hippocampus]
+
+        feedback = [
+            memory
+            for memory in visible
+            if str(memory.get("kind", "")) == "agent_feedback"
+            and (
+                (agent_id is not None and str(memory.get("agent_id", "")).strip() == agent_id)
+                or (startup_role and str(memory.get("role", "")).strip() == startup_role)
+                or (
+                    query
+                    and str(memory.get("domain", "")).strip()
+                    and str(memory.get("domain", "")).strip().lower() in query.lower()
+                )
+            )
+        ]
+        feedback.sort(key=lambda memory: str(memory.get("created_at", "")), reverse=True)
+        feedback = feedback[:max_feedback]
+
+        pinned: list[dict[str, Any]] = []
+        if include_pinned:
+            pinned = [
+                memory
+                for memory in visible
+                if bool(memory.get("pinned"))
+                or str(memory.get("authority", "")).strip().lower() in {"high", "pinned"}
+                or str(memory.get("retention", "")).strip().lower() == "pinned"
+                or str(memory.get("kind", "")) == "invariant"
+            ][:20]
+
+        warnings: list[str] = []
+        if not recent_logs:
+            warnings.append("No interaction logs matched the startup context filters.")
+        if not context_blocks:
+            warnings.append("No context blocks selected for startup context.")
+        if not hippocampus_entries:
+            warnings.append("No hippocampus entries selected for startup context.")
+
+        summary = (
+            f"startup bundle: {len(recent_logs)} logs, {len(context_blocks)} blocks, "
+            f"{len(hippocampus_entries)} hippocampus entries, {len(feedback)} feedback items."
+        )
+        return summary, {
+            "mode": "startup",
+            "role": startup_role,
+            "agent_id": agent_id,
+            "recent_logs": [memory_bundle_item(memory, max_chars=500) for memory in recent_logs],
+            "context_blocks": [memory_bundle_item(memory, max_chars=1200) for memory in context_blocks],
+            "hippocampus_entries": [memory_bundle_item(memory, max_chars=900) for memory in hippocampus_entries],
+            "agent_feedback": [memory_bundle_item(memory, max_chars=600) for memory in feedback],
+            "pinned": [memory_bundle_item(memory, max_chars=700) for memory in pinned],
+            "summary": summary,
+            "warnings": warnings,
+        }
+
+    feedback_candidates = [memory for memory in visible if str(memory.get("kind", "")) == "agent_feedback"]
+    scored_feedback: list[tuple[float, dict[str, Any]]] = []
+    for memory in feedback_candidates:
+        score = 0.0
+        if agent_id and str(memory.get("agent_id", "")).strip() == agent_id:
+            score += 3.0
+        if role and str(memory.get("role", "")).strip() == role:
+            score += 2.0
+        if domain and str(memory.get("domain", "")).strip() == domain:
+            score += 2.0
+        score += rank_against_query(memory, task, salience_module) if task else 0.0
+        if score > 0:
+            scored_feedback.append((score, memory))
+    scored_feedback.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
+    feedback = [memory for _, memory in scored_feedback[:max_feedback]]
+
+    hippocampus_candidates = [
+        memory
+        for memory in visible
+        if str(memory.get("kind", "")) == "hippocampus_entry"
+        and (
+            not domain
+            or str(memory.get("domain", "")).strip() == domain
+            or str(memory.get("domain", "")).strip() == ""
+        )
+    ]
+    scored_hippocampus = select_memories_by_query(hippocampus_candidates, task, max_hippocampus, salience_module)
+    hippocampus_entries = [memory for _, memory in scored_hippocampus]
+
+    block_candidates = [memory for memory in visible if str(memory.get("kind", "")) == "context_block"]
+    if domain:
+        block_candidates = [memory for memory in block_candidates if str(memory.get("domain", "")).strip() in {"", domain}]
+    scored_blocks = select_memories_by_query(block_candidates, task, max_blocks, salience_module)
+    context_blocks = [memory for _, memory in scored_blocks]
+
+    recent_logs: list[dict[str, Any]] = []
+    if include_recent_logs:
+        recent_logs = [
+            memory
+            for memory in visible
+            if str(memory.get("kind", "")) == "interaction_log"
+            and (
+                (agent_id and str(memory.get("agent_id", "")).strip() == agent_id)
+                or (role and str(memory.get("role", "")).strip() == role)
+            )
+        ]
+        recent_logs.sort(key=lambda memory: str(memory.get("created_at", "")), reverse=True)
+        recent_logs = recent_logs[:recent_logs_limit]
+
+    warnings = []
+    if not feedback:
+        warnings.append("No scoped agent feedback matched the provided filters.")
+    summary = (
+        f"agent context: {len(feedback)} feedback, {len(hippocampus_entries)} hippocampus entries, "
+        f"{len(context_blocks)} context blocks."
+    )
+    return summary, {
+        "mode": "agent",
+        "agent_id": agent_id,
+        "role": role,
+        "domain": domain,
+        "task": task,
+        "agent_feedback": [memory_bundle_item(memory, max_chars=600) for memory in feedback],
+        "hippocampus_entries": [memory_bundle_item(memory, max_chars=900) for memory in hippocampus_entries],
+        "context_blocks": [memory_bundle_item(memory, max_chars=1200) for memory in context_blocks],
+        "recent_logs": [memory_bundle_item(memory, max_chars=500) for memory in recent_logs],
+        "warnings": warnings,
+    }
+
+
+def _apply_recall_output_caps(structured: dict[str, Any]) -> dict[str, Any]:
+    total_cap = max_total_chars()
+    used = 0
+    warnings: list[str] = list(structured.get("warnings", [])) if isinstance(structured.get("warnings"), list) else []
+    ordered_keys = ("recent_logs", "context_blocks", "hippocampus_entries", "agent_feedback", "pinned")
+    for key in ordered_keys:
+        section = structured.get(key)
+        if not isinstance(section, list):
+            continue
+        kept: list[dict[str, Any]] = []
+        for item in section:
+            if not isinstance(item, dict):
+                continue
+            preview = str(item.get("text_preview", ""))
+            if used + len(preview) > total_cap and kept:
+                warnings.append("recall output capped by max_total_chars")
+                break
+            if used + len(preview) > total_cap and not kept:
+                truncated = preview[: max(0, total_cap - used)]
+                item = dict(item)
+                item["text_preview"] = truncated
+                item["truncated"] = len(preview) > len(truncated)
+                kept.append(item)
+                used = total_cap
+                warnings.append("recall output capped by max_total_chars")
+                break
+            kept.append(item)
+            used += len(preview)
+        structured[key] = kept
+        if used >= total_cap:
+            break
+    structured["warnings"] = warnings
+    return structured
+
+
+def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
+    mode = normalize_optional_string(args.get("mode")) or "startup"
+    if mode not in {"startup", "agent"}:
+        return tool_error("mode must be one of: startup, agent")
+
+    agent_id = normalize_optional_string(args.get("agent_id"))
+    role = normalize_optional_string(args.get("role"))
+    domain = normalize_optional_string(args.get("domain"))
+    task = str(args.get("task", "")).strip()
+    query = str(args.get("query", "")).strip()
+
+    if mode == "startup":
+        role = role or "coordinator"
+        recent_logs_limit = max(1, min(int(args.get("recent_logs", 20)), 100))
+        max_blocks = max(1, min(int(args.get("max_blocks", 5)), 20))
+        max_hippocampus = max(1, min(int(args.get("max_hippocampus", 8)), 20))
+        max_feedback = max(1, min(int(args.get("max_feedback", 5)), 30))
+        include_pinned = parse_bool(args.get("include_pinned"), default=True)
+        include_recent_logs = False
+    else:
+        recent_logs_limit = max(1, min(int(args.get("recent_logs", 20)), 100))
+        max_blocks = max(1, min(int(args.get("max_context_blocks", 5)), 20))
+        max_hippocampus = max(1, min(int(args.get("max_hippocampus", 8)), 20))
+        max_feedback = max(1, min(int(args.get("max_feedback", 10)), 30))
+        include_pinned = False
+        include_recent_logs = parse_bool(args.get("include_recent_logs"), default=False)
+        if not query:
+            query = task
+
+    salience, _ = load_optional_agent_salience()
+    summary, structured = _build_recall_bundle(
+        load_store(),
+        mode=mode,
+        agent_id=agent_id,
+        role=role,
+        domain=domain,
+        task=task,
+        query=query,
+        recent_logs_limit=recent_logs_limit,
+        max_blocks=max_blocks,
+        max_hippocampus=max_hippocampus,
+        max_feedback=max_feedback,
+        include_pinned=include_pinned,
+        include_recent_logs=include_recent_logs,
+        salience_module=salience,
+    )
+    structured = _apply_recall_output_caps(structured)
+    return text_result(summary, structured)
+
+
+def _compact_logs_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    older_than_count = max(1, min(int(args.get("older_than_count", 20)), 500))
+    agent_id = normalize_optional_string(args.get("agent_id"))
+    role = normalize_optional_string(args.get("role"))
+    max_logs = max(1, min(int(args.get("max_logs", 50)), 200))
+
+    store = load_store()
+    candidates = [
+        memory
+        for memory in store.get("memories", [])
+        if isinstance(memory, dict)
+        and str(memory.get("kind", "")) == "interaction_log"
+        and visible_memory(memory, False, False)
+        and (agent_id is None or str(memory.get("agent_id", "")).strip() == agent_id)
+        and (role is None or str(memory.get("role", "")).strip() == role)
+    ]
+    candidates.sort(key=lambda memory: str(memory.get("created_at", "")), reverse=True)
+    older = candidates[older_than_count:]
+    selected = older[:max_logs]
+    selected = sorted(selected, key=lambda memory: str(memory.get("created_at", "")))
+
+    if not selected:
+        return text_result(
+            "No interaction logs eligible for compaction.",
+            {
+                "action": "compact_logs",
+                "dry_run": dry_run,
+                "selected_count": 0,
+                "older_than_count": older_than_count,
+                "candidate": None,
+            },
+        )
+
+    linked_ids = [str(memory.get("id")) for memory in selected if memory.get("id")]
+    lines = ["Compacted interaction log summary:"]
+    for memory in selected[:20]:
+        stamp = str(memory.get("created_at", ""))
+        preview = memory_preview(memory, max_chars=220)
+        lines.append(f"- {stamp}: {preview}")
+    if len(selected) > 20:
+        lines.append(f"- ... {len(selected) - 20} additional logs omitted")
+    candidate_text = "\n".join(lines)
+    candidate_metadata = {
+        "title": f"Compacted interaction logs ({len(selected)})",
+        "compacted_count": len(selected),
+        "older_than_count": older_than_count,
+    }
+    candidate = {
+        "kind": "context_block",
+        "text": candidate_text,
+        "linked_ids": linked_ids,
+        "agent_id": agent_id,
+        "role": role,
+        "retention": "durable",
+        "authority": "medium",
+        "metadata": candidate_metadata,
+    }
+    if dry_run:
+        return text_result(
+            "Generated compaction candidate (dry_run=true).",
+            {
+                "action": "compact_logs",
+                "dry_run": True,
+                "selected_count": len(selected),
+                "candidate": candidate,
+            },
+        )
+
+    payload = {
+        "body": candidate_text,
+        "linked_ids": linked_ids,
+        "agent_id": agent_id,
+        "role": role,
+        "metadata": candidate_metadata,
+    }
+    recorded = record_memory(
+        {
+            "kind": "context_block",
+            "body": payload["body"],
+            "linked_ids": payload["linked_ids"],
+            "agent_id": payload["agent_id"],
+            "role": payload["role"],
+            "metadata": payload["metadata"],
+        }
+    )
+    if recorded.get("isError"):
+        return recorded
+    structured = recorded.get("structuredContent", {})
+    block_id = str(
+        structured.get("id")
+        or (structured.get("memory", {}) if isinstance(structured.get("memory"), dict) else {}).get("id")
+        or ""
+    )
+
+    try:
+        with MemoryFileLock(store_lock_path()):
+            writable_store = load_store()
+            for memory in writable_store.get("memories", []):
+                if str(memory.get("id")) not in linked_ids:
+                    continue
+                metadata = normalize_metadata(memory.get("metadata"))
+                metadata["compacted"] = True
+                metadata["compacted_into"] = block_id
+                memory["metadata"] = metadata
+                memory["updated_at"] = now_iso()
+            save_store(writable_store)
+    except LockTimeout as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    return text_result(
+        f"Compacted {len(selected)} interaction logs into context block {block_id}.",
+        {
+            "action": "compact_logs",
+            "dry_run": False,
+            "selected_count": len(selected),
+            "block_id": block_id,
+            "candidate": candidate,
+        },
+    )
 
 
 DEFINITION_PATTERNS: dict[str, list[tuple[str, re.Pattern[str]]]] = {
@@ -1883,9 +3992,370 @@ def lookup_symbol(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _iso_from_epoch(timestamp: float | int | None) -> str | None:
+    if timestamp is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(timestamp), timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _latest_memory_id(memories: list[dict[str, Any]]) -> str | None:
+    if not memories:
+        return None
+    latest_index = max(range(len(memories)), key=lambda index: (timestamp_key(memories[index]), index))
+    latest = memories[latest_index]
+    memory_id = str(latest.get("id", "")).strip()
+    return memory_id or None
+
+
+def _kind_counts(memories: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for memory in memories:
+        kind = str(memory.get("kind", "")).strip() or "note"
+        counts[kind] = counts.get(kind, 0) + 1
+    return {kind: counts[kind] for kind in sorted(counts)}
+
+
+def _count_by_field(memories: list[dict[str, Any]], field: str, *, default_label: str = "unset") -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for memory in memories:
+        raw = normalize_optional_string(memory.get(field))
+        key = raw if raw else default_label
+        counts[key] = counts.get(key, 0) + 1
+    return {name: counts[name] for name in sorted(counts)}
+
+
+def _oldest_newest(memories: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not memories:
+        return None, None
+    ordered = sorted(memories, key=lambda memory: (timestamp_key(memory), str(memory.get("id", ""))))
+    oldest_raw = ordered[0]
+    newest_raw = ordered[-1]
+
+    def _summary(memory: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": str(memory.get("id", "")),
+            "kind": str(memory.get("kind", "")),
+            "created_at": str(memory.get("created_at", "")),
+            "updated_at": normalize_optional_string(memory.get("updated_at")),
+        }
+
+    return _summary(oldest_raw), _summary(newest_raw)
+
+
+def _compaction_counts(memories: list[dict[str, Any]]) -> tuple[int, int]:
+    compacted = 0
+    uncompacted = 0
+    for memory in memories:
+        if str(memory.get("kind", "")) != "interaction_log":
+            continue
+        if not is_active(memory):
+            continue
+        metadata = normalize_metadata(memory.get("metadata"))
+        if metadata.get("compacted") or metadata.get("compacted_into"):
+            compacted += 1
+        else:
+            uncompacted += 1
+    return compacted, uncompacted
+
+
+def _list_export_files() -> dict[str, dict[str, Any]]:
+    files = {
+        "memory_jsonl": export_root() / "memory.jsonl",
+        "memory_json": export_root() / "memory.json",
+        "hippocampus_markdown": export_root() / "hippocampus.md",
+        "agent_feedback_markdown": export_root() / "agent_feedback.md",
+        "startup_context_markdown": export_root() / "startup_context_latest.md",
+    }
+    payload: dict[str, dict[str, Any]] = {}
+    for name, path in files.items():
+        exists = path.exists()
+        size = 0
+        if exists:
+            try:
+                size = int(path.stat().st_size)
+            except OSError:
+                size = 0
+        payload[name] = {
+            "path": str(path.resolve()),
+            "exists": exists,
+            "size_bytes": size,
+        }
+    return payload
+
+
+def _sqlite_fts_flag() -> bool:
+    if store_backend() != "sqlite":
+        return False
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            meta_value = _sqlite_get_meta(conn, "fts_available")
+            if meta_value is not None:
+                return str(meta_value).strip() == "1"
+            available = _sqlite_fts_available(conn)
+            _sqlite_set_meta(conn, "fts_available", "1" if available else "0")
+            return available
+    except Exception:
+        return False
+
+
+def _salience_source(module: Any) -> str | None:
+    module_file = str(getattr(module, "__file__", "") or "")
+    if not module_file:
+        return None
+    home_raw = os.environ.get("AGENT_SALIENCE_HOME", "").strip()
+    if not home_raw:
+        return "sys.path"
+    try:
+        home = Path(home_raw).expanduser().resolve()
+        module_path = Path(module_file).resolve()
+    except Exception:
+        return "sys.path"
+    try:
+        module_path.relative_to(home)
+        return "AGENT_SALIENCE_HOME"
+    except ValueError:
+        return "sys.path"
+
+
+def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
+    del args
+    backend = store_backend()
+    sqlite_file = sqlite_path().resolve()
+    mem_file = memory_path().resolve()
+    events_file = events_log_path().resolve()
+    memory_archive = archived_path().resolve()
+    queries_archive = query_archive_path().resolve()
+    events_archive = events_archive_path().resolve()
+    warnings: list[str] = []
+
+    try:
+        store = load_store()
+    except Exception:
+        store = {"version": 1, "memories": []}
+        warnings.append("memory store is unreadable; check local state files")
+
+    memories = [memory for memory in store.get("memories", []) if isinstance(memory, dict)]
+    memory_count = len(memories)
+    count_by_kind = _kind_counts(memories)
+    latest_id = _latest_memory_id(memories)
+
+    mem_exists = mem_file.exists()
+    mem_size = 0
+    mem_mtime_iso: str | None = None
+    if mem_exists:
+        try:
+            stat = mem_file.stat()
+            mem_size = int(stat.st_size)
+            mem_mtime_iso = _iso_from_epoch(stat.st_mtime)
+        except OSError:
+            mem_size = 0
+
+    sqlite_exists = sqlite_file.exists()
+    sqlite_size = 0
+    if sqlite_exists:
+        try:
+            sqlite_size = int(sqlite_file.stat().st_size)
+        except OSError:
+            sqlite_size = 0
+
+    if backend == "json" and mem_exists and mem_size < 100:
+        warnings.append("memory file < 100 bytes; possibly empty")
+    if backend == "json" and mem_mtime_iso is None:
+        warnings.append("memory file timestamp unavailable")
+    elif backend == "json":
+        try:
+            mtime_dt = datetime.fromisoformat(mem_mtime_iso.replace("Z", "+00:00"))
+            age_hours = (datetime.now(timezone.utc) - mtime_dt).total_seconds() / 3600.0
+            if age_hours > 24:
+                warnings.append("no writes detected in the last 24 hours")
+        except ValueError:
+            pass
+
+    events_exists = events_file.exists()
+    events_size = 0
+    if events_exists:
+        try:
+            events_size = int(events_file.stat().st_size)
+        except OSError:
+            events_size = 0
+    rows = read_event_rows(include_archive=False) if event_logging_enabled() else []
+    rows.sort(key=lambda row: (str(row.get("ts", "")), str(row.get("id", ""))))
+    last_event = rows[-1] if rows else {}
+    last_event_iso = str(last_event.get("ts", "")).strip() or None
+    last_event_kind = str(last_event.get("event", "")).strip() or None
+
+    if not event_logging_enabled():
+        warnings.append("MNEMO_LOG_EVENTS=0; event history is not being recorded")
+    elif backend == "json" and not events_exists:
+        warnings.append("events log file not found yet; no events recorded")
+
+    drift = memory_drift_compute(store=store)
+    if float(drift.get("value", 0.0)) >= 0.7:
+        warnings.append("high memory drift detected; review durable/pinned guidance")
+
+    salience_module, _reason = load_optional_agent_salience()
+    salience_loaded = salience_module is not None
+    if not salience_loaded:
+        warnings.append("agent-salience not loaded; salience checks unavailable")
+    salience_payload = {
+        "loaded": salience_loaded,
+        "version": str(getattr(salience_module, "__version__", "")) if salience_loaded else None,
+        "source": _salience_source(salience_module) if salience_loaded else None,
+    }
+
+    profile = mcp_profile()
+    visible = exposed_tools(profile)
+    expected_core_tools = list(CORE_TOOL_NAMES)
+    available = {str(tool.get("name", "")) for tool in visible}
+    structured_available = all(name in available for name in expected_core_tools)
+
+    count_by_authority = _count_by_field(memories, "authority")
+    count_by_retention = _count_by_field(memories, "retention")
+    deleted_count = sum(1 for memory in memories if not is_active(memory))
+    compacted_logs_count, uncompacted_logs_count = _compaction_counts(memories)
+    oldest_memory, newest_memory = _oldest_newest(memories)
+    export_files = _list_export_files()
+    fts_available = _sqlite_fts_flag() if backend == "sqlite" else False
+    search_backend = (
+        "sqlite_fts5"
+        if backend == "sqlite" and fts_available
+        else ("sqlite_lexical" if backend == "sqlite" else "json_lexical")
+    )
+
+    if backend == "sqlite" and not sqlite_exists:
+        warnings.append("sqlite database file does not exist yet")
+    if backend == "sqlite" and not fts_available:
+        warnings.append("FTS unavailable, using simple search")
+    if uncompacted_logs_count >= 40:
+        warnings.append("many uncompacted interaction logs; consider compact_logs maintenance")
+    if not any(info.get("exists") for info in export_files.values()):
+        warnings.append("no export files found under state/mnemo/exports")
+    if backend == "sqlite" and sqlite_size > 5_000_000 and not any(info.get("exists") for info in export_files.values()):
+        warnings.append("SQLite file is large but no recent exports were found")
+    if backend == "sqlite" and (
+        events_file.exists() or query_log_path().exists() or events_archive.exists() or queries_archive.exists()
+    ):
+        warnings.append("legacy JSONL logs exist; SQLite events table is authoritative in sqlite mode")
+
+    recommendations: list[str] = []
+    if uncompacted_logs_count >= 40:
+        recommendations.append(
+            "Run mnemo_maintenance with action='compact_logs' dry_run=true, then dry_run=false if the candidate looks correct."
+        )
+    if not any(info.get("exists") for info in export_files.values()):
+        recommendations.append(
+            "Run mnemo_export with format='jsonl' and format='hippocampus_markdown' to produce portable readable exports."
+        )
+    if memory_count == 0:
+        recommendations.append("Record a starter memory with mnemo_record to seed project context.")
+    if backend == "sqlite" and not fts_available:
+        recommendations.append("SQLite FTS5 is unavailable; lexical search is active.")
+
+    memory_file_payload = {
+        "path": str(mem_file),
+        "exists": mem_exists,
+        "size_bytes": mem_size,
+        "memory_count": memory_count,
+        "kinds": count_by_kind,
+        "last_write_iso": mem_mtime_iso,
+        "last_memory_id": latest_id,
+    }
+    events_payload = {
+        "path": str(events_file),
+        "exists": events_exists,
+        "size_bytes": events_size,
+        "last_event_iso": last_event_iso,
+        "last_event_kind": last_event_kind,
+    }
+    archive_payload = {
+        "memory_archive_path": str(memory_archive),
+        "memory_archive_exists": memory_archive.exists(),
+        "queries_archive_exists": queries_archive.exists(),
+        "events_archive_exists": events_archive.exists(),
+    }
+
+    kind_summary = ", ".join(f"{count} {kind}" for kind, count in memory_file_payload["kinds"].items())
+    if not kind_summary:
+        kind_summary = "none"
+    warning_summary = "none" if not warnings else "; ".join(warnings)
+    drift_value = float(drift.get("value", 0.0))
+    drift_interp = str(drift.get("interpretation", "low"))
+    salience_text = (
+        f"loaded (agent-salience {salience_payload['version']})"
+        if salience_loaded
+        else "not loaded"
+    )
+    backend_exists = sqlite_exists if backend == "sqlite" else mem_exists
+    backend_file_name = "mnemo.sqlite" if backend == "sqlite" else "memory.json"
+    backend_size = sqlite_size if backend == "sqlite" else memory_file_payload["size_bytes"]
+    summary_lines = [
+        f"Mnemo {SERVER_VERSION} - {backend_file_name} {'exists' if backend_exists else 'missing'} ({backend_size} bytes, {memory_file_payload['memory_count']} memories)",
+        f"Last write: {memory_file_payload['last_write_iso']}  Last id: {memory_file_payload['last_memory_id']}",
+        f"Kinds: {kind_summary}",
+        f"Drift: {drift_value:.2f} ({drift_interp})  Salience: {salience_text}  Search: {search_backend}",
+        f"Warnings: {warning_summary}",
+    ]
+
+    payload = {
+        "server_name": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "package_file": str(Path(__file__).resolve()),
+        "python": sys.version,
+        "executable": sys.executable,
+        "workspace_root": str(workspace_root().resolve()),
+        "public_tool_prefix": "mnemo",
+        "mcp_profile": profile,
+        "exposed_tool_count": len(visible),
+        "expected_core_tools": expected_core_tools,
+        "structured_memory_tools_available": structured_available,
+        "backend": backend,
+        "sqlite_file": str(sqlite_file),
+        "sqlite_file_exists": sqlite_exists,
+        "sqlite_size_bytes": sqlite_size,
+        "memory_json_exists": mem_exists,
+        "memory_count": memory_count,
+        "count_by_kind": count_by_kind,
+        "count_by_authority": count_by_authority,
+        "count_by_retention": count_by_retention,
+        "deleted_count": deleted_count,
+        "compacted_logs_count": compacted_logs_count,
+        "uncompacted_interaction_logs_count": uncompacted_logs_count,
+        "oldest_memory": oldest_memory,
+        "newest_memory": newest_memory,
+        "export_files": export_files,
+        "fts_available": fts_available,
+        "search_backend": search_backend,
+        "memory_file": memory_file_payload,
+        "events_log": events_payload,
+        "archive": archive_payload,
+        "drift": drift,
+        "salience": salience_payload,
+        "warnings": warnings,
+        "recommendations": recommendations,
+    }
+    return text_result("\n".join(summary_lines), payload)
+
+
 TOOLS = [
     {
-        "name": "memory_search",
+        "name": "mnemo_doctor",
+        "title": "Mnemo Doctor",
+        "description": "Return Mnemo server and memory-file diagnostics.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "mnemo_search",
         "title": "Search Project Memory",
         "description": "Search project memories relevant to a task, bug, file, command, or decision.",
         "inputSchema": {
@@ -1893,28 +4363,35 @@ TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "Search query or current task."},
                 "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
-                "include_deleted": {"type": "boolean", "default": False},
-                "include_superseded": {"type": "boolean", "default": False},
+                "limit": {"type": "integer"},
+                "include_deleted": {"type": "boolean"},
+                "include_superseded": {"type": "boolean"},
                 "pinned": {"type": "boolean"},
+                "role": {"type": "string"},
+                "agent_id": {"type": "string"},
+                "domain": {"type": "string"},
+                "scope": {"type": "string"},
+                "authority": {"type": "string", "enum": list(AUTHORITY_VALUES)},
+                "retention": {"type": "string", "enum": list(RETENTION_VALUES)},
+                "source_run_id": {"type": "string"},
                 "phase": {"type": "string", "enum": list(PHASES)},
-                "max_tokens": {"type": "integer", "minimum": 1, "maximum": 100000},
+                "max_tokens": {"type": "integer"},
             },
             "required": ["query"],
         },
         "annotations": {"readOnlyHint": True},
     },
     {
-        "name": "memory_salience_check",
+        "name": "mnemo_salience_check",
         "title": "Memory Salience Check",
         "description": "Optional salience diagnostics for related or duplicate-like memory matches.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
-                "include_deleted": {"type": "boolean", "default": False},
-                "include_superseded": {"type": "boolean", "default": False},
+                "limit": {"type": "integer"},
+                "include_deleted": {"type": "boolean"},
+                "include_superseded": {"type": "boolean"},
                 "threshold": {"type": ["number", "null"]},
             },
             "required": ["text"],
@@ -1922,25 +4399,134 @@ TOOLS = [
         "annotations": {"readOnlyHint": True},
     },
     {
-        "name": "memory_record",
+        "name": "mnemo_record",
         "title": "Record Project Memory",
-        "description": "Record a durable project memory.",
+        "description": (
+            "Record a project memory of any kind. Kind-specific aliases are accepted: "
+            "summary (interaction_log), body (context_block), title (any), evidence_ids "
+            "(hippocampus_entry), feedback_type (agent_feedback)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": list(MEMORY_KINDS), "default": "note"},
-                "text": {"type": "string"},
+                "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
+                "text": {"type": "string", "description": "Primary memory text. Use summary/body aliases when convenient."},
+                "summary": {"type": "string", "description": "Alias for text when kind=interaction_log."},
+                "body": {"type": "string", "description": "Alias for text when kind=context_block."},
+                "title": {"type": ["string", "null"], "description": "Optional title stored under metadata.title."},
                 "source": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}, "default": []},
+                "tags": {"type": "array", "items": {"type": "string"}},
                 "supersedes": {"type": ["string", "null"]},
-                "references": {"type": "array", "items": {"type": "string"}, "default": []},
-                "pinned": {"type": "boolean", "default": False},
+                "references": {"type": "array", "items": {"type": "string"}},
+                "linked_ids": {"type": "array", "items": {"type": "string"}},
+                "evidence_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Merged into linked_ids for kind=hippocampus_entry.",
+                },
+                "pinned": {"type": "boolean"},
+                "agent_id": {"type": ["string", "null"]},
+                "role": {"type": ["string", "null"]},
+                "scope": {"type": ["string", "null"]},
+                "domain": {"type": ["string", "null"]},
+                "authority": {"type": ["string", "null"], "enum": [None, *AUTHORITY_VALUES]},
+                "retention": {"type": ["string", "null"], "enum": [None, *RETENTION_VALUES]},
+                "confidence": {"type": ["string", "null"], "enum": [None, *CONFIDENCE_VALUES]},
+                "parent_id": {"type": ["string", "null"]},
+                "source_run_id": {"type": ["string", "null"]},
+                "feedback_type": {
+                    "type": ["string", "null"],
+                    "description": "Stored under metadata.feedback_type for kind=agent_feedback.",
+                },
+                "metadata": {"type": "object"},
             },
-            "required": ["text"],
         },
     },
     {
-        "name": "memory_update",
+        "name": "mnemo_link",
+        "title": "Link Memory Records",
+        "description": "Link one memory to another with an optional relation label.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_id": {"type": "string"},
+                "target_id": {"type": "string"},
+                "relation": {"type": ["string", "null"]},
+                "bidirectional": {"type": "boolean"},
+            },
+            "required": ["source_id", "target_id"],
+        },
+    },
+    {
+        "name": "mnemo_recall",
+        "title": "Recall Memory Bundle",
+        "description": (
+            "Return a recall bundle for the current session. mode='startup' returns the coordinator/front-facing "
+            "bundle; mode='agent' returns the specialist bundle scoped by agent_id/role/domain/task."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["startup", "agent"], "description": "When omitted, startup is used."},
+                "agent_id": {"type": ["string", "null"]},
+                "role": {"type": ["string", "null"], "description": "When omitted in startup mode, coordinator is used."},
+                "domain": {"type": ["string", "null"]},
+                "task": {"type": ["string", "null"]},
+                "query": {"type": ["string", "null"]},
+                "recent_logs": {"type": "integer"},
+                "max_blocks": {"type": "integer"},
+                "max_context_blocks": {"type": "integer"},
+                "max_hippocampus": {"type": "integer"},
+                "max_feedback": {
+                    "type": "integer",
+                    "description": "When omitted: 5 in startup mode, 10 in agent mode.",
+                },
+                "include_pinned": {"type": "boolean"},
+                "include_recent_logs": {"type": "boolean"},
+            },
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "mnemo_get",
+        "title": "Get Memory By Id",
+        "description": "Retrieve one memory by id. full=true returns complete text and metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "full": {"type": "boolean"},
+                "include_deleted": {"type": "boolean"},
+                "include_superseded": {"type": "boolean"},
+            },
+            "required": ["id"],
+        },
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "mnemo_export",
+        "title": "Export Memories",
+        "description": (
+            "Export memories to local files. format accepts: jsonl, json, markdown, "
+            "hippocampus_markdown, agent_feedback_markdown, startup_context_markdown."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "format": {"type": "string", "description": "Required export format string."},
+                "path": {"type": "string", "description": "Optional output path. Default path depends on format."},
+                "kind": {"type": "string", "description": "Optional kind filter."},
+                "domain": {"type": "string", "description": "Optional domain filter."},
+                "agent_id": {"type": "string", "description": "Optional agent filter."},
+                "role": {"type": "string", "description": "Optional role filter."},
+                "include_deleted": {"type": "boolean", "description": "Optional. Include deleted records when true."},
+                "max_records": {"type": "integer", "description": "Optional. Range 1-5000, default 500."},
+            },
+            "required": ["format"],
+        },
+    },
+    {
+        "name": "mnemo_update",
         "title": "Update Project Memory",
         "description": "Patch text, kind, source, or tags on an existing memory.",
         "inputSchema": {
@@ -1953,12 +4539,23 @@ TOOLS = [
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "pinned": {"type": "boolean"},
                 "references": {"type": "array", "items": {"type": "string"}},
+                "linked_ids": {"type": "array", "items": {"type": "string"}},
+                "agent_id": {"type": ["string", "null"]},
+                "role": {"type": ["string", "null"]},
+                "scope": {"type": ["string", "null"]},
+                "domain": {"type": ["string", "null"]},
+                "authority": {"type": ["string", "null"], "enum": [None, *AUTHORITY_VALUES]},
+                "retention": {"type": ["string", "null"], "enum": [None, *RETENTION_VALUES]},
+                "confidence": {"type": ["string", "null"], "enum": [None, *CONFIDENCE_VALUES]},
+                "parent_id": {"type": ["string", "null"]},
+                "source_run_id": {"type": ["string", "null"]},
+                "metadata": {"type": "object"},
             },
             "required": ["id"],
         },
     },
     {
-        "name": "memory_delete",
+        "name": "mnemo_delete",
         "title": "Delete Project Memory",
         "description": "Soft-delete an existing memory.",
         "inputSchema": {
@@ -1971,109 +4568,199 @@ TOOLS = [
         },
     },
     {
-        "name": "memory_recent",
+        "name": "mnemo_recent",
         "title": "Recent Project Memories",
         "description": "Return the most recently recorded project memories.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                "include_deleted": {"type": "boolean", "default": False},
-                "include_superseded": {"type": "boolean", "default": False},
+                "limit": {"type": "integer"},
+                "include_deleted": {"type": "boolean"},
+                "include_superseded": {"type": "boolean"},
             },
         },
         "annotations": {"readOnlyHint": True},
     },
     {
-        "name": "memory_compact_context",
+        "name": "mnemo_compact_context",
         "title": "Build Compact Project Context",
         "description": "Return a prompt-ready context block grouped by memory kind.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
-                "include_deleted": {"type": "boolean", "default": False},
-                "include_superseded": {"type": "boolean", "default": False},
+                "limit": {"type": "integer"},
+                "include_deleted": {"type": "boolean"},
+                "include_superseded": {"type": "boolean"},
                 "phase": {"type": "string", "enum": list(PHASES)},
-                "max_tokens": {"type": "integer", "minimum": 1, "maximum": 100000},
+                "max_tokens": {"type": "integer"},
             },
             "required": ["query"],
         },
         "annotations": {"readOnlyHint": True},
     },
     {
-        "name": "memory_history",
-        "title": "Memory History",
-        "description": "Return the lifecycle events for a single memory.",
+        "name": "mnemo_inspect",
+        "title": "Inspect Memory",
+        "description": (
+            "Inspect a memory by id. mode='history' returns lifecycle events. "
+            "mode='related' walks the reference graph. mode='both' returns both in one call."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
-                "include_archive": {"type": "boolean", "default": False},
+                "mode": {"type": "string", "enum": ["history", "related", "both"]},
+                "limit": {"type": "integer"},
+                "depth": {"type": "integer"},
+                "include_deleted": {"type": "boolean"},
+                "include_superseded": {"type": "boolean"},
+                "include_archive": {"type": "boolean"},
             },
             "required": ["id"],
         },
         "annotations": {"readOnlyHint": True},
     },
     {
-        "name": "memory_related",
-        "title": "Related Memories",
-        "description": "Walk the reference graph from a starting memory.",
+        "name": "mnemo_maintenance",
+        "title": "Memory Maintenance",
+        "description": (
+            "Perform memory maintenance actions. action='compact_logs' builds a context_block from older "
+            "interaction_log entries. action='consolidate' finds near-duplicate clusters per kind. "
+            "action='import_json' imports legacy JSON records into the active backend."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string"},
-                "depth": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
-                "include_deleted": {"type": "boolean", "default": False},
-                "include_superseded": {"type": "boolean", "default": False},
+                "action": {"type": "string", "enum": ["compact_logs", "consolidate", "import_json"]},
+                "dry_run": {"type": "boolean"},
+                "older_than_count": {"type": "integer"},
+                "agent_id": {"type": "string"},
+                "role": {"type": "string"},
+                "max_logs": {"type": "integer"},
+                "threshold": {"type": "number"},
+                "path": {"type": "string"},
             },
-            "required": ["id"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "memory_drift",
-        "title": "Memory Drift",
-        "description": "Return a scalar measuring vocabulary drift between recent and older memories.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "recent_count": {"type": "integer", "minimum": 2, "maximum": 200, "default": 50},
-                "older_count": {"type": "integer", "minimum": 2, "maximum": 200, "default": 50},
-            },
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "memory_consolidate",
-        "title": "Consolidate Near-Duplicate Memories",
-        "description": "Find clusters of near-duplicate memories within each kind. Optionally retire duplicates by superseding to the newest survivor.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "threshold": {"type": "number", "minimum": 0.5, "maximum": 1.0},
-                "dry_run": {"type": "boolean", "default": True},
-            },
+            "required": ["action"],
         },
     },
     {
-        "name": "lookup_symbol",
+        "name": "mnemo_lookup_symbol",
         "title": "Lookup Symbol",
         "description": "Find likely definition locations for a symbol in the workspace.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "name": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-                "case_sensitive": {"type": "boolean", "default": False},
+                "limit": {"type": "integer"},
+                "case_sensitive": {"type": "boolean"},
             },
             "required": ["name"],
         },
         "annotations": {"readOnlyHint": True},
     },
 ]
+
+
+_TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
+    "mnemo_search": {
+        "limit": "Range 1-20. When omitted, 5 is used.",
+        "include_deleted": "When omitted, false is used.",
+        "include_superseded": "When omitted, false is used.",
+        "max_tokens": "Range 1-100000 when provided.",
+    },
+    "mnemo_salience_check": {
+        "limit": "Range 1-50. When omitted, 5 is used.",
+        "include_deleted": "When omitted, false is used.",
+        "include_superseded": "When omitted, false is used.",
+        "threshold": "When omitted, 0.70 is used. Range 0.0-1.0.",
+    },
+    "mnemo_record": {
+        "kind": "When omitted, note is used.",
+        "tags": "When omitted, an empty list is used.",
+        "references": "When omitted, an empty list is used.",
+        "linked_ids": "When omitted, an empty list is used.",
+        "evidence_ids": "When omitted, an empty list is used.",
+        "pinned": "When omitted, false is used.",
+    },
+    "mnemo_link": {
+        "bidirectional": "When omitted, false is used.",
+    },
+    "mnemo_recall": {
+        "recent_logs": "Range 1-100. When omitted, 20 is used.",
+        "max_blocks": "Range 1-20. When omitted, 5 is used for startup mode.",
+        "max_context_blocks": "Range 1-20. When omitted, 5 is used for agent mode.",
+        "max_hippocampus": "Range 1-20. When omitted, 8 is used.",
+        "max_feedback": "Range 1-30. When omitted: 5 in startup mode, 10 in agent mode.",
+        "include_pinned": "When omitted, true is used in startup mode.",
+        "include_recent_logs": "When omitted, false is used in agent mode.",
+    },
+    "mnemo_recent": {
+        "limit": "Range 1-50. When omitted, 10 is used.",
+        "include_deleted": "When omitted, false is used.",
+        "include_superseded": "When omitted, false is used.",
+    },
+    "mnemo_compact_context": {
+        "limit": "Range 1-20. When omitted, 8 is used.",
+        "include_deleted": "When omitted, false is used.",
+        "include_superseded": "When omitted, false is used.",
+        "max_tokens": "Range 1-100000 when provided.",
+    },
+    "mnemo_inspect": {
+        "mode": "Allowed values: history, related, both. When omitted, both is used.",
+        "limit": "Range 1-200. When omitted, 50 is used.",
+        "depth": "Range 1-3. When omitted, 1 is used.",
+        "include_deleted": "When omitted, false is used.",
+        "include_superseded": "When omitted, false is used.",
+        "include_archive": "When omitted, false is used.",
+    },
+    "mnemo_maintenance": {
+        "action": "Allowed values: compact_logs, consolidate, import_json.",
+        "older_than_count": "compact_logs: range 1-500. When omitted, 20 is used.",
+        "max_logs": "compact_logs: range 1-200. When omitted, 50 is used.",
+        "threshold": "Range 0.5-1.0. When omitted, env fallback 0.7 is used.",
+        "dry_run": "When omitted, true is used.",
+    },
+    "mnemo_export": {
+        "format": "Allowed values: jsonl, json, markdown, hippocampus_markdown, agent_feedback_markdown, startup_context_markdown.",
+        "max_records": "Range 1-5000. When omitted, 500 is used.",
+        "include_deleted": "When omitted, false is used.",
+    },
+    "mnemo_lookup_symbol": {
+        "limit": "Range 1-50. When omitted, 10 is used.",
+        "case_sensitive": "When omitted, false is used.",
+    },
+}
+
+
+def _apply_tool_constraint_notes() -> None:
+    for tool in TOOLS:
+        tool_name = str(tool.get("name", ""))
+        field_notes = _TOOL_FIELD_CONSTRAINT_NOTES.get(tool_name)
+        if not field_notes:
+            continue
+        schema = tool.get("inputSchema")
+        if not isinstance(schema, dict):
+            continue
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        for field_name, note in field_notes.items():
+            field_schema = properties.get(field_name)
+            if isinstance(field_schema, dict):
+                _append_description_note(field_schema, note)
+
+
+_apply_tool_constraint_notes()
+
+
+_TOOL_DESC_PREFIX = (
+    "Mnemo project-memory tool. Use this for portable project memory, not Copilot native memory. "
+)
+for _tool in TOOLS:
+    _desc = str(_tool.get("description", ""))
+    if _desc and not _desc.startswith(_TOOL_DESC_PREFIX):
+        _tool["description"] = _TOOL_DESC_PREFIX + _desc
 
 
 def send(message: dict[str, Any]) -> None:
@@ -2114,11 +4801,12 @@ def handle_request(message: dict[str, Any]) -> None:
                     "version": SERVER_VERSION,
                 },
                 "instructions": (
-                    "Use memory_search before complex repo work, "
-                    "memory_salience_check for optional deterministic salience diagnostics, "
-                    "memory_compact_context when a short project brief is useful, "
-                    "memory_record for durable decisions and outcomes, and "
-                    "lookup_symbol for source locations."
+                    "Use mnemo_doctor for state and health diagnostics (including drift and persistence verification), "
+                    "mnemo_search before complex repo work, mnemo_recall for context bundles, "
+                    "mnemo_record for any memory kind, mnemo_get for full retrieval by id, mnemo_export for readable snapshots, "
+                    "mnemo_link/mnemo_inspect for graph navigation and history, mnemo_compact_context for prompt-ready briefs, "
+                    "mnemo_maintenance for housekeeping, "
+                    "and mnemo_lookup_symbol for source locations."
                 ),
             },
         )
@@ -2130,7 +4818,7 @@ def handle_request(message: dict[str, Any]) -> None:
         return
 
     if method == "tools/list":
-        ok(request_id, {"tools": TOOLS})
+        ok(request_id, {"tools": copilot_safe_tools()})
         return
 
     if method == "tools/call":
@@ -2143,18 +4831,21 @@ def handle_request(message: dict[str, Any]) -> None:
             rpc_error(request_id, -32602, "Tool arguments must be an object")
             return
         handlers = {
-            "memory_search": search_memories,
-            "memory_salience_check": memory_salience_check,
-            "memory_record": record_memory,
-            "memory_update": update_memory,
-            "memory_delete": delete_memory,
-            "memory_recent": recent_memories,
-            "memory_compact_context": compact_context,
-            "memory_history": memory_history,
-            "memory_related": memory_related,
-            "memory_drift": memory_drift,
-            "memory_consolidate": memory_consolidate,
-            "lookup_symbol": lookup_symbol,
+            "mnemo_doctor": mnemo_doctor,
+            "mnemo_search": search_memories,
+            "mnemo_salience_check": memory_salience_check,
+            "mnemo_record": record_memory,
+            "mnemo_link": memory_link,
+            "mnemo_recall": memory_recall,
+            "mnemo_get": memory_get,
+            "mnemo_export": memory_export,
+            "mnemo_update": update_memory,
+            "mnemo_delete": delete_memory,
+            "mnemo_recent": recent_memories,
+            "mnemo_compact_context": compact_context,
+            "mnemo_inspect": memory_inspect,
+            "mnemo_maintenance": memory_maintenance,
+            "mnemo_lookup_symbol": lookup_symbol,
         }
         handler = handlers.get(name)
         if handler is None:
@@ -2198,3 +4889,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

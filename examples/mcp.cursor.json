@@ -4,11 +4,14 @@
       "type": "stdio",
       "command": "python",
       "args": [
-        "mnemo/server.py"
+        "mnemo-mcp/server.py"
       ],
       "env": {
-        "MNEMO_FILE": "mnemo/memory.json",
-        "MNEMO_WORKSPACE_ROOT": "."
+        "MNEMO_STORE": "sqlite",
+        "MNEMO_MCP_PROFILE": "core",
+        "MNEMO_WORKSPACE_ROOT": ".",
+        "MNEMO_FILE": "state/mnemo/memory.json",
+        "MNEMO_SQLITE_FILE": "state/mnemo/mnemo.sqlite"
       }
     }
   }

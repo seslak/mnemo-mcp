@@ -2,9 +2,9 @@
 
 Thanks for considering a contribution.
 
-## Development setup
+Mnemo is intentionally small, local-first, and stdlib-only.
 
-Mnemo is intentionally simple and stdlib-only.
+## Development setup
 
 ```bash
 python -m compileall .
@@ -12,16 +12,35 @@ python smoke_test.py
 python -m unittest discover -s . -p "test*.py"
 ```
 
+No external services or package installs are required for normal development.
+
 ## Guidelines
 
-- Keep the MCP tool names stable.
-- Keep response fields backward-compatible where practical.
-- Prefer additive structured fields over breaking changes.
-- Do not introduce required external dependencies without a strong reason.
 - Preserve local-first behavior.
-- Add tests for new behavior.
-- Do not commit local `memory.json`, query logs, event logs, or archive files.
+- Keep required runtime dependencies at zero unless there is a strong reason.
+- Keep MCP tool schemas compatible with constrained MCP clients.
+- Put validation, defaults, and bounds in Python handlers, not only in JSON Schema.
+- Keep tool names stable once public.
+- Prefer bounded outputs over large context dumps.
+- Add or update tests for user-visible behavior.
+- Update `CHANGELOG.md` for user-visible changes.
+- Do not commit local runtime memory or logs.
 
-## Release notes
+## Storage changes
 
-Update `CHANGELOG.md` for user-visible changes.
+Mnemo uses SQLite by default and JSON as a compatibility/import/export format. Storage changes should preserve:
+
+- importability of existing `memory.json`
+- copy/paste portability
+- readable exports
+- bounded recall/search outputs
+
+## Before opening a PR
+
+Run:
+
+```bash
+python -m compileall .
+python smoke_test.py
+python -m unittest discover -s . -p "test*.py"
+```

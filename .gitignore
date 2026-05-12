@@ -1,6 +1,10 @@
-# Personal/local memory is ignored by default.
+# Mnemo local runtime state
 memory.json
 memory.json.tmp
+mnemo.sqlite
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 queries.jsonl
 queries.1.jsonl
 queries.archive.jsonl
@@ -9,9 +13,16 @@ events.1.jsonl
 events.archive.jsonl
 memory.archive.jsonl
 *.lock
-__pycache__/
+state/mnemo/mnemo.sqlite
+state/mnemo/memory.json
+state/mnemo/exports/
+state/mnemo/*.jsonl
+state/mnemo/*.lock
 
 # Commit shared seed memories in memory.example.json.
+
+# Python/cache/build artifacts
+__pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
@@ -20,4 +31,9 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+
+# Local environment/editor noise
+.venv/
+venv/
+env/
 .DS_Store

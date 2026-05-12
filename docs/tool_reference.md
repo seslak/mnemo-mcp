@@ -1,89 +1,201 @@
 # Mnemo Tool Reference
 
-Mnemo exposes a stdio MCP server with project-memory tools.
+Mnemo exposes a local stdio MCP server with project-memory tools. Tool availability depends on `MNEMO_MCP_PROFILE`.
 
-## memory_record
+## Core profile tools
 
-Records a durable memory.
+### `mnemo_doctor`
 
-Required:
+Returns diagnostics for the active store, profile, tool count, SQLite file, memory counts, export files, search backend, warnings, and recommendations.
 
-- `text`
+Input:
 
-Optional:
+```json
+{}
+```
 
-- `kind`
-- `source`
-- `tags`
-- `references`
-- `supersedes`
-- `pinned`
+### `mnemo_search`
 
-## memory_search
+Search project memories relevant to a task, query, file, command, or decision.
 
-Searches memories relevant to a query.
+Common inputs:
 
-Required:
-
-- `query`
-
-Optional:
-
+- `query` required
 - `kind`
 - `limit`
-- `include_deleted`
-- `include_superseded`
-- `pinned`
+- `role`
+- `agent_id`
+- `domain`
+- `scope`
+- `authority`
+- `retention`
+- `source_run_id`
 - `phase`
 - `max_tokens`
 
-## memory_salience_check
+Example:
 
-Optional read-only diagnostics. Requires Agent Salience to be installed or available through `AGENT_SALIENCE_HOME`.
+```json
+{"query":"validation commands before handoff","limit":5,"domain":"release"}
+```
 
-Required:
+### `mnemo_record`
 
-- `text`
+Record a project memory. Use `kind` to select the memory layer.
 
-Optional:
+Supported kinds include:
 
-- `limit`
-- `include_deleted`
-- `include_superseded`
-- `threshold`
+- `decision`
+- `invariant`
+- `failed_approach`
+- `test_result`
+- `command`
+- `path`
+- `note`
+- `interaction_log`
+- `context_block`
+- `hippocampus_entry`
+- `agent_feedback`
 
-## memory_recent
+Examples:
 
-Returns recent memories.
+```json
+{"kind":"decision","text":"Use SQLite as Mnemo's default store.","tags":["storage"]}
+```
 
-## memory_update
+```json
+{"kind":"interaction_log","summary":"Discussed Mnemo storage migration and SQLite exports.","role":"coordinator"}
+```
 
-Updates an existing memory by id.
+```json
+{"kind":"context_block","title":"Storage migration notes","body":"SQLite is the primary local store; JSONL/Markdown are exports."}
+```
 
-## memory_delete
+```json
+{"kind":"hippocampus_entry","text":"Hippocampus entries are not stored in a separate database; they use kind=hippocampus_entry.","domain":"mnemo/storage","authority":"high"}
+```
 
-Soft-deletes a memory.
+```json
+{"kind":"agent_feedback","text":"Use mnemo_get for full bodies after bounded recall.","role":"coordinator","domain":"memory"}
+```
 
-## memory_compact_context
+### `mnemo_link`
 
-Builds a prompt-ready memory context block.
+Link two memories.
 
-## memory_history
+```json
+{"source_id":"mem_a","target_id":"mem_b","relation":"evidence_for","bidirectional":false}
+```
 
-Reads lifecycle events for a memory.
+### `mnemo_recall`
 
-## memory_related
+Return a bounded recall bundle.
 
-Walks references between memories.
+Startup mode:
 
-## memory_drift
+```json
+{"mode":"startup","role":"coordinator","query":"current Mnemo storage work"}
+```
 
-Compares recent and older memory vocabulary.
+Agent mode:
 
-## memory_consolidate
+```json
+{"mode":"agent","agent_id":"storage-specialist","domain":"mnemo/storage","task":"review export behavior"}
+```
 
-Finds or retires near-duplicate memories.
+### `mnemo_get`
 
-## lookup_symbol
+Retrieve a single memory by id.
 
-Finds likely source definition locations under `MNEMO_WORKSPACE_ROOT`.
+```json
+{"id":"mem_123","full":false}
+```
+
+Use `full=true` only when the complete text is needed.
+
+### `mnemo_export`
+
+Export memories to local readable files.
+
+Common formats:
+
+- `jsonl`
+- `json`
+- `markdown`
+- `hippocampus_markdown`
+- `agent_feedback_markdown`
+- `startup_context_markdown`
+
+Example:
+
+```json
+{"format":"hippocampus_markdown"}
+```
+
+### `mnemo_compact_context`
+
+Build a prompt-ready context brief from memory.
+
+```json
+{"query":"release handoff","limit":8,"max_tokens":2000}
+```
+
+### `mnemo_lookup_symbol`
+
+Find likely source definition locations under `MNEMO_WORKSPACE_ROOT`.
+
+```json
+{"name":"authenticate","limit":10}
+```
+
+## Full profile tools
+
+The full profile adds maintenance and inspection tools.
+
+### `mnemo_salience_check`
+
+Optional salience diagnostics when Agent Salience is available.
+
+### `mnemo_update`
+
+Patch an existing memory by id.
+
+### `mnemo_delete`
+
+Soft-delete an existing memory.
+
+### `mnemo_recent`
+
+Return recent memories.
+
+### `mnemo_inspect`
+
+Inspect lifecycle history and related-memory graph.
+
+```json
+{"id":"mem_123","mode":"both","limit":50,"depth":2}
+```
+
+### `mnemo_maintenance`
+
+Run maintenance actions.
+
+Actions include:
+
+- `compact_logs`
+- `consolidate`
+- `import_json`
+
+Examples:
+
+```json
+{"action":"compact_logs","dry_run":true,"older_than_count":20}
+```
+
+```json
+{"action":"import_json","path":"state/mnemo/memory.json","dry_run":true}
+```
+
+## Copilot-safe schemas
+
+Mnemo intentionally exports conservative input schemas. Defaults, bounds, optional-null handling, and validation are implemented in Python handlers rather than relying on JSON Schema keywords that some MCP clients reject.
