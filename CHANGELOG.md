@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.11.0
+
+### Changed
+
+- Consolidated the public MCP surface to one gateway tool: `mnemo`.
+- All previous Mnemo operations are now available as gateway actions such as `record`, `search`, `recall`, `get`, `export`, `maintenance`, and `lookup_symbol`.
+- Removed profile-based public tool exposure; `MNEMO_MCP_PROFILE` is now ignored for tools/list output.
+- Kept SQLite storage, readable exports, bounded recall, and Copilot-safe schemas.
+
+### Compatibility
+
+- Storage format is unchanged from 0.10.0.
+- Existing memory data remains usable.
+- Public MCP tool names changed intentionally before 1.0.0 to reduce Copilot tool-inventory pressure.
+
 ## 0.10.0
 
 ### Added

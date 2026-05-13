@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemo-mcp"
-version = "0.10.0"
-description = "Local-first project memory MCP server for coding agents"
+version = "0.11.0"
+description = "Local-first SQLite-backed project memory MCP gateway for coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

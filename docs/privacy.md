@@ -1,52 +1,48 @@
 # Privacy and Local Data
 
-Mnemo is local-first. It does not require a cloud service, hosted database, vector database, or network call.
+Mnemo is local-first. It does not require a cloud service, network call, external database, or vector database.
 
 ## Files Mnemo may create
 
-In SQLite mode, Mnemo may create:
+Depending on configuration, Mnemo may create files under `state/mnemo/` or the paths you configure:
 
-- `state/mnemo/mnemo.sqlite`
-- `state/mnemo/memory.json` when exporting or importing legacy memory
-- `state/mnemo/exports/memory.jsonl`
-- `state/mnemo/exports/hippocampus.md`
-- `state/mnemo/exports/agent_feedback.md`
-- `state/mnemo/exports/startup_context_latest.md`
-- temporary lock files
-
-In legacy JSON mode, Mnemo may also create:
-
+- `mnemo.sqlite`
 - `memory.json`
 - `memory.json.tmp`
 - `memory.archive.jsonl`
-- `queries.jsonl`
-- `queries.1.jsonl`
-- `queries.archive.jsonl`
-- `events.jsonl`
-- `events.1.jsonl`
-- `events.archive.jsonl`
+- `queries.jsonl` and rotated/archive variants in legacy JSON mode
+- `events.jsonl` and rotated/archive variants in legacy JSON mode
+- `exports/memory.jsonl`
+- `exports/hippocampus.md`
+- `exports/agent_feedback.md`
+- `exports/startup_context_latest.md`
+- lock files
 
 These are gitignored by default.
 
+## SQLite mode
+
+In SQLite mode, lifecycle and query events are stored in the SQLite database. Legacy JSONL files may still exist from older versions or explicit exports, but SQLite is the primary store.
+
 ## Sensitive content
 
-Memory files and exports may contain:
+Memory and export files may contain:
 
 - project decisions
 - code facts
-- local file paths
-- commands and test outputs
-- agent summaries
+- file paths
+- commands
 - task notes
-- prompts or conversation summaries
-- regulatory or business context entered by users
+- prompts or agent summaries
+- agent feedback
+- project-specific system knowledge
 
-Review local memory before sharing a repository, ZIP, screenshot, or exported Markdown/JSONL file.
+Review local memory and exports before sharing a repository or ZIP.
 
 ## Workspace access
 
-`mnemo_lookup_symbol` reads files under `MNEMO_WORKSPACE_ROOT` and applies file-count and byte-count limits. Keep the workspace root narrow when possible.
+`lookup_symbol` reads files under `MNEMO_WORKSPACE_ROOT` and applies file-count and byte-count limits. Keep the workspace root narrow when possible.
 
-## Optional Agent Salience
+## Network behavior
 
-Agent Salience integration is optional and local. Mnemo remains functional without it.
+Mnemo itself does not need network access. Optional Agent Salience integration is local-only when configured through `AGENT_SALIENCE_HOME` or normal Python imports.

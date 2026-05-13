@@ -38,6 +38,10 @@ def call_tool(proc: subprocess.Popen[str], request_id: int, name: str, arguments
     )
 
 
+def call_mnemo(proc: subprocess.Popen[str], request_id: int, action: str, params: dict | None = None) -> dict:
+    return call_tool(proc, request_id, "mnemo", {"action": action, "params": params or {}})
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -73,10 +77,10 @@ def main() -> int:
                 },
             )
             tools = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            record = call_tool(
+            record = call_mnemo(
                 proc,
                 3,
-                "mnemo_record",
+                "record",
                 {
                     "kind": "decision",
                     "text": "Run validation commands before handoff and capture the exact output for release verification.",
@@ -85,25 +89,25 @@ def main() -> int:
                 },
             )
             memory_id = record["result"]["structuredContent"]["memory"]["id"]
-            search = call_tool(
+            search = call_mnemo(
                 proc,
                 4,
-                "mnemo_search",
+                "search",
                 {"query": "validation handoff", "limit": 3},
             )
-            update = call_tool(
+            update = call_mnemo(
                 proc,
                 5,
-                "mnemo_update",
+                "update",
                 {"id": memory_id, "tags": ["validation", "handoff"]},
             )
-            get_preview = call_tool(proc, 6, "mnemo_get", {"id": memory_id})
-            get_full = call_tool(proc, 7, "mnemo_get", {"id": memory_id, "full": True})
-            symbol = call_tool(proc, 8, "mnemo_lookup_symbol", {"name": "authenticate"})
-            referenced = call_tool(
+            get_preview = call_mnemo(proc, 6, "get", {"id": memory_id})
+            get_full = call_mnemo(proc, 7, "get", {"id": memory_id, "full": True})
+            symbol = call_mnemo(proc, 8, "lookup_symbol", {"name": "authenticate"})
+            referenced = call_mnemo(
                 proc,
                 9,
-                "mnemo_record",
+                "record",
                 {
                     "kind": "note",
                     "text": "Reference smoke memory.",
@@ -111,12 +115,12 @@ def main() -> int:
                 },
             )
             referenced_id = referenced["result"]["structuredContent"]["memory"]["id"]
-            inspect_both = call_tool(proc, 10, "mnemo_inspect", {"id": referenced_id, "mode": "both"})
-            related = call_tool(proc, 11, "mnemo_inspect", {"id": "seed-id", "mode": "related"})
-            export_jsonl = call_tool(proc, 12, "mnemo_export", {"format": "jsonl"})
-            doctor = call_tool(proc, 13, "mnemo_doctor", {})
-            consolidate = call_tool(proc, 14, "mnemo_maintenance", {"action": "consolidate"})
-            capped_search = call_tool(proc, 15, "mnemo_search", {"query": "validation handoff", "max_tokens": 30})
+            inspect_both = call_mnemo(proc, 10, "inspect", {"id": referenced_id, "mode": "both"})
+            related = call_mnemo(proc, 11, "inspect", {"id": "seed-id", "mode": "related"})
+            export_jsonl = call_mnemo(proc, 12, "export", {"format": "jsonl"})
+            doctor = call_mnemo(proc, 13, "doctor", {})
+            consolidate = call_mnemo(proc, 14, "maintenance", {"action": "consolidate"})
+            capped_search = call_mnemo(proc, 15, "search", {"query": "validation handoff", "max_tokens": 30})
             shutdown = rpc(proc, {"jsonrpc": "2.0", "id": 16, "method": "shutdown"})
         finally:
             try:
@@ -126,7 +130,7 @@ def main() -> int:
                 proc.wait(timeout=5)
 
     assert init["result"]["serverInfo"]["name"] == "mnemo"
-    assert any(t["name"] == "mnemo_update" for t in tools["result"]["tools"])
+    assert {t["name"] for t in tools["result"]["tools"]} == {"mnemo"}
     assert record["result"]["isError"] is False
     assert search["result"]["structuredContent"]["matches"]
     assert update["result"]["structuredContent"]["memory"]["updated_at"]

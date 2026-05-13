@@ -1,56 +1,58 @@
-# Mnemo Storage (0.10.0)
+# Mnemo storage
 
-## Backend selection
+Mnemo is local-first and copy/paste friendly.
 
-- `MNEMO_STORE=sqlite` (default): SQLite primary store.
-- `MNEMO_STORE=json`: legacy JSON store.
+## SQLite primary store
 
-SQLite path resolution:
+Default primary store:
 
-- `MNEMO_SQLITE_FILE` when set.
-- otherwise `<workspace>/state/mnemo/mnemo.sqlite`.
+```text
+state/mnemo/mnemo.sqlite
+```
 
-Compatibility JSON path resolution:
+SQLite is used through Python's standard-library `sqlite3` module. No external database is required.
 
-- `MNEMO_FILE` when set.
-- otherwise `<workspace>/state/mnemo/memory.json`.
+## Compatibility files
 
-## SQLite schema
+`memory.json` remains available as a compatibility/import/export format, but it is not the primary store in SQLite mode.
 
-Main tables:
+Readable exports can be written with the gateway export action:
 
-- `memories`
-- `links`
-- `events`
-- `meta`
+```json
+{"action":"export","params":{"format":"jsonl"}}
+```
 
-`hippocampus_entry` remains a memory kind in `memories` (not a separate DB).
+Common exports:
 
-`references` is treated as an API compatibility alias of `linked_ids` in Python logic.
+```text
+state/mnemo/exports/memory.jsonl
+state/mnemo/exports/hippocampus.md
+state/mnemo/exports/agent_feedback.md
+state/mnemo/exports/startup_context_latest.md
+```
 
-## Bootstrap/import behavior
+## Events
 
-On first SQLite startup when the DB has no memories:
+In SQLite mode, lifecycle and query events are stored in the SQLite `events` table. Legacy `events.jsonl` and `queries.jsonl` files can be imported but are no longer authoritative.
 
-1. Import from `memory.json` when present.
-2. If missing, import from sibling `memory.example.json` when present.
-3. Import `memory.archive.jsonl` records (skip duplicate ids/hashes).
-4. Ingest `events*.jsonl` and `queries*.jsonl` rows into SQLite `events`.
+In JSON mode, legacy JSON/JSONL behavior is still supported.
 
-Legacy files are left on disk; they are not deleted.
+## Compaction
 
-## Event/query authority
+Recent interaction logs can stay raw while older logs are compacted into context blocks:
 
-In SQLite mode, new lifecycle/query events are written to SQLite `events`.
-Mnemo no longer writes new `events.jsonl` / `queries.jsonl` in SQLite mode.
+```json
+{"action":"maintenance","params":{"action":"compact_logs","dry_run":true}}
+```
 
-## Exports
+Raw logs are retained. Compaction is deterministic and local.
 
-Use `mnemo_export`:
+## Health checks
 
-- `jsonl` -> `state/mnemo/exports/memory.jsonl`
-- `json` -> `state/mnemo/exports/memory.json`
-- `hippocampus_markdown` -> `state/mnemo/exports/hippocampus.md`
-- `agent_feedback_markdown` -> `state/mnemo/exports/agent_feedback.md`
-- `startup_context_markdown` -> `state/mnemo/exports/startup_context_latest.md`
+Use:
 
+```json
+{"action":"doctor"}
+```
+
+Doctor reports backend, SQLite file, memory counts, export status, FTS availability, warnings, recommendations, and available gateway actions.

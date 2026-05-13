@@ -1,63 +1,58 @@
-# Mnemo Memory Layers
+# Mnemo memory layers
 
-Mnemo provides a neutral structured memory substrate for local agentic workflows.
+Mnemo stores all project memory in one local store. In SQLite mode the primary file is `state/mnemo/mnemo.sqlite`.
+
+The public MCP surface is one gateway tool: `mnemo`. Use `action` plus optional `params`.
 
 ## Layers
 
-- `interaction_log`: short, frequent continuity notes from recent runs.
-- `context_block`: larger linked artifacts that capture reusable context.
+- `interaction_log`: short recent continuity logs.
+- `context_block`: larger linked artifacts that expand one or more logs/findings.
 - `hippocampus_entry`: durable project/system knowledge.
-- `agent_feedback`: scoped lessons for a specific `agent_id`, `role`, or `domain`.
+- `agent_feedback`: feedback scoped to an agent, role, or domain.
 
-## Neutral Metadata
+Hippocampus entries are not stored in a separate database. They are normal memories with `kind="hippocampus_entry"` plus metadata such as `domain`, `scope`, `authority`, and `retention`.
 
-Use metadata fields to model your own team/agent structure:
+## Examples
 
-- `agent_id`
-- `role`
-- `scope`
-- `domain`
-- `authority` (`low|medium|high|pinned`)
-- `retention` (`ephemeral|compressible|durable|pinned`)
-- `confidence` (`low|medium|high`)
-- `linked_ids`
-- `parent_id`
-- `source_run_id`
+Record an interaction log:
 
-Mnemo does not require or hardcode personal agent names.
+```json
+{"action":"record","params":{"kind":"interaction_log","summary":"User decided to keep Mnemo as SQLite-backed project memory.","role":"coordinator"}}
+```
 
-## Recall Bundles
+Record a linked context block:
 
-- `mnemo_recall` with `mode="startup"`: startup bundle for coordinator/front-facing role.
-- `mnemo_recall` with `mode="agent"`: scoped bundle for specialist role/agent/domain/task.
+```json
+{"action":"record","params":{"kind":"context_block","title":"Mnemo storage decision","body":"SQLite is the primary store; JSONL/Markdown are exports.","linked_ids":["mem_log_id"]}}
+```
 
-The recall tool returns bounded structured results and can optionally use salience diagnostics when available.
-Use `mnemo_get` to load a full memory body by id when a recall preview is not enough.
+Record a hippocampus entry:
 
-## Recording Patterns
+```json
+{"action":"record","params":{"kind":"hippocampus_entry","text":"Mnemo uses one SQLite store; hippocampus entries are distinguished by kind and metadata.","domain":"agentic/memory","authority":"high"}}
+```
 
-Use the single `mnemo_record` tool for all kinds:
+Record agent feedback:
 
-- interaction log:
-  - `{"kind":"interaction_log","summary":"...", ...}`
-- context block:
-  - `{"kind":"context_block","body":"...", "title":"...", ...}`
-- hippocampus entry:
-  - `{"kind":"hippocampus_entry","text":"...", "evidence_ids":[...], ...}`
-- agent feedback:
-  - `{"kind":"agent_feedback","text":"...", "feedback_type":"warning", ...}`
+```json
+{"action":"record","params":{"kind":"agent_feedback","text":"When writing project memory, use Mnemo gateway actions, not native assistant memory.","role":"coordinator","domain":"agentic/memory"}}
+```
 
-## Maintenance
+Recall startup context:
 
-Use `mnemo_maintenance` for housekeeping actions.
+```json
+{"action":"recall","params":{"mode":"startup","role":"coordinator","query":"Mnemo storage and gateway design"}}
+```
 
-Compaction mode (`action="compact_logs"`) summarizes older interaction logs into a candidate `context_block`.
+Recall specialist context:
 
-- `dry_run: true`: preview only.
-- `dry_run: false`: write the new context block.
+```json
+{"action":"recall","params":{"mode":"agent","agent_id":"memory-specialist","domain":"agentic/memory","task":"review memory persistence"}}
+```
 
-This version keeps source logs readable (no destructive deletion).
+Load one full memory:
 
-Consolidation mode (`action="consolidate"`) finds near-duplicate clusters and can retire duplicates by superseding to the newest survivor when `dry_run` is false.
-
-Import mode (`action="import_json"`) imports legacy JSON memories into the active backend.
+```json
+{"action":"get","params":{"id":"mem_123","full":true}}
+```

@@ -449,44 +449,30 @@ class StructuredMemoryLayerTests(MnemoTestCase):
 
 
 class ToolSurfaceTests(MnemoTestCase):
-    def test_tools_list_exposes_mnemo_prefixed_surface(self) -> None:
+    def test_tools_list_exposes_single_mnemo_gateway(self) -> None:
         names = {tool["name"] for tool in server.TOOLS}
-        required = {
+        self.assertEqual(names, {"mnemo"})
+        removed = {
+            "memory_record",
+            "memory_search",
             "mnemo_doctor",
             "mnemo_record",
             "mnemo_search",
             "mnemo_recall",
-            "mnemo_link",
-            "mnemo_inspect",
+            "mnemo_get",
+            "mnemo_export",
             "mnemo_maintenance",
             "mnemo_lookup_symbol",
         }
-        self.assertTrue(required.issubset(names))
-        self.assertEqual(len(names), 15)
-        self.assertNotIn("memory_record_interaction_log", names)
-        self.assertNotIn("memory_record_hippocampus_entry", names)
-        self.assertNotIn("memory_record", names)
-        self.assertNotIn("memory_search", names)
-        self.assertNotIn("mnemo_record_interaction_log", names)
-        self.assertNotIn("mnemo_record_context_block", names)
-        self.assertNotIn("mnemo_record_hippocampus_entry", names)
-        self.assertNotIn("mnemo_record_agent_feedback", names)
-        self.assertNotIn("mnemo_recall_startup_context", names)
-        self.assertNotIn("mnemo_recall_agent_context", names)
-        self.assertNotIn("mnemo_history", names)
-        self.assertNotIn("mnemo_related", names)
-        self.assertNotIn("mnemo_drift", names)
-        self.assertNotIn("mnemo_compact_interaction_logs", names)
-        self.assertNotIn("mnemo_consolidate", names)
+        self.assertTrue(removed.isdisjoint(names))
 
-    def test_tools_descriptions_include_project_memory_lane_note(self) -> None:
-        for tool in server.TOOLS:
-            name = str(tool.get("name", ""))
-            if not name.startswith("mnemo_"):
-                continue
-            desc = str(tool.get("description", ""))
-            self.assertIn("Mnemo project-memory tool.", desc)
-            self.assertIn("Copilot native memory", desc)
+    def test_tools_descriptions_include_project_memory_gateway_note(self) -> None:
+        tool = server.TOOLS[0]
+        self.assertEqual(tool["name"], "mnemo")
+        desc = str(tool.get("description", ""))
+        self.assertIn("Mnemo project-memory", desc)
+        self.assertIn("gateway", desc)
+        self.assertIn("Copilot native memory", desc)
 
     def test_mnemo_doctor_returns_expected_fields(self) -> None:
         result = server.mnemo_doctor({})
@@ -517,9 +503,11 @@ class ToolSurfaceTests(MnemoTestCase):
         self.assertIn("workspace_root", payload)
         self.assertTrue(payload["structured_memory_tools_available"])
         self.assertEqual(payload["public_tool_prefix"], "mnemo")
-        self.assertIn(payload["mcp_profile"], {"core", "full"})
-        self.assertGreaterEqual(int(payload["exposed_tool_count"]), 1)
-        self.assertIn("mnemo_record", payload["expected_core_tools"])
+        self.assertTrue(payload["gateway"])
+        self.assertEqual(payload["gateway_tool"], "mnemo")
+        self.assertEqual(payload["public_tool_count"], 1)
+        self.assertIn("record", payload["available_actions"])
+        self.assertIn("search", payload["available_actions"])
 
 
 class DoctorPayloadTests(MnemoTestCase):
@@ -832,22 +820,17 @@ class ProfileExposureTests(MnemoTestCase):
         response = captured[-1]["result"]["tools"]
         return {str(tool["name"]) for tool in response}
 
-    def test_profile_full_exposes_all_tools(self) -> None:
+    def test_gateway_exposure_ignores_legacy_full_profile(self) -> None:
         os.environ["MNEMO_MCP_PROFILE"] = "full"
-        names = self._tools_list_names()
-        self.assertEqual(names, {str(tool["name"]) for tool in server.TOOLS})
-        self.assertEqual(len(names), 15)
+        self.assertEqual(self._tools_list_names(), {"mnemo"})
 
-    def test_profile_core_exposes_expected_subset(self) -> None:
+    def test_gateway_exposure_ignores_legacy_core_profile(self) -> None:
         os.environ["MNEMO_MCP_PROFILE"] = "core"
-        names = self._tools_list_names()
-        self.assertEqual(names, set(server.CORE_TOOL_NAMES))
-        self.assertEqual(len(names), 9)
+        self.assertEqual(self._tools_list_names(), {"mnemo"})
 
-    def test_profile_invalid_value_falls_back_to_full(self) -> None:
+    def test_gateway_exposure_ignores_invalid_profile(self) -> None:
         os.environ["MNEMO_MCP_PROFILE"] = "weird"
-        names = self._tools_list_names()
-        self.assertEqual(names, {str(tool["name"]) for tool in server.TOOLS})
+        self.assertEqual(self._tools_list_names(), {"mnemo"})
 
 
 class ConsolidationCompatibilityTests(MnemoTestCase):
@@ -1743,8 +1726,11 @@ class ConcurrencyTests(MnemoTestCase):
                         "id": i + 2,
                         "method": "tools/call",
                         "params": {
-                            "name": "mnemo_record",
-                            "arguments": {"kind": "note", "text": f"{prefix} concurrent record {i}"},
+                            "name": "mnemo",
+                            "arguments": {
+                                "action": "record",
+                                "params": {"kind": "note", "text": f"{prefix} concurrent record {i}"},
+                            },
                         },
                     },
                 )
@@ -2116,11 +2102,11 @@ class SqliteStoreTests(MnemoTestCase):
         self.assertEqual(got["id"], memory["id"])
         self.assertEqual(got["text"], text)
 
-    def test_profile_counts_sqlite_mode(self) -> None:
+    def test_gateway_tool_count_sqlite_mode(self) -> None:
         os.environ["MNEMO_MCP_PROFILE"] = "core"
-        self.assertEqual(len(server.copilot_safe_tools()), 9)
+        self.assertEqual(len(server.copilot_safe_tools()), 1)
         os.environ["MNEMO_MCP_PROFILE"] = "full"
-        self.assertEqual(len(server.copilot_safe_tools()), 15)
+        self.assertEqual(len(server.copilot_safe_tools()), 1)
 
     def test_doctor_reports_sqlite_backend(self) -> None:
         self.record("doctor sqlite marker", kind="note")

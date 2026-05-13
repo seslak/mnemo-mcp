@@ -48,7 +48,7 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.10.0"
+SERVER_VERSION = "0.11.0"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
@@ -298,29 +298,22 @@ def copilot_safe_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return simplified if isinstance(simplified, dict) else {}
 
 
-CORE_TOOL_NAMES = (
-    "mnemo_doctor",
-    "mnemo_search",
-    "mnemo_record",
-    "mnemo_recall",
-    "mnemo_get",
-    "mnemo_link",
-    "mnemo_export",
-    "mnemo_compact_context",
-    "mnemo_lookup_symbol",
-)
+GATEWAY_TOOL_NAME = "mnemo"
 
 
 def mcp_profile() -> str:
-    value = str(os.environ.get("MNEMO_MCP_PROFILE", "full")).strip().lower()
-    return value if value in {"core", "full"} else "full"
+    """Return a legacy profile value for diagnostics only.
+
+    Since 0.11.0, Mnemo exposes a single public gateway tool regardless of
+    profile. The environment variable is accepted harmlessly for older
+    launch configurations, but it no longer changes tools/list output.
+    """
+    value = str(os.environ.get("MNEMO_MCP_PROFILE", "gateway")).strip().lower()
+    return value if value else "gateway"
 
 
 def exposed_tools(profile: str | None = None) -> list[dict[str, Any]]:
-    active = profile or mcp_profile()
-    if active == "core":
-        allowed = set(CORE_TOOL_NAMES)
-        return [tool for tool in TOOLS if str(tool.get("name", "")) in allowed]
+    del profile
     return list(TOOLS)
 
 
@@ -4211,9 +4204,9 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
 
     profile = mcp_profile()
     visible = exposed_tools(profile)
-    expected_core_tools = list(CORE_TOOL_NAMES)
+    available_actions = sorted(GATEWAY_ACTIONS)
     available = {str(tool.get("name", "")) for tool in visible}
-    structured_available = all(name in available for name in expected_core_tools)
+    structured_available = GATEWAY_TOOL_NAME in available
 
     count_by_authority = _count_by_field(memories, "authority")
     count_by_retention = _count_by_field(memories, "retention")
@@ -4312,7 +4305,11 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "public_tool_prefix": "mnemo",
         "mcp_profile": profile,
         "exposed_tool_count": len(visible),
-        "expected_core_tools": expected_core_tools,
+        "public_tool_count": len(visible),
+        "gateway": True,
+        "gateway_tool": GATEWAY_TOOL_NAME,
+        "available_actions": available_actions,
+        "expected_core_tools": [GATEWAY_TOOL_NAME],
         "structured_memory_tools_available": structured_available,
         "backend": backend,
         "sqlite_file": str(sqlite_file),
@@ -4342,322 +4339,90 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     return text_result("\n".join(summary_lines), payload)
 
 
+GATEWAY_ACTIONS: dict[str, Any] = {
+    "doctor": mnemo_doctor,
+    "search": search_memories,
+    "salience_check": memory_salience_check,
+    "record": record_memory,
+    "link": memory_link,
+    "recall": memory_recall,
+    "get": memory_get,
+    "export": memory_export,
+    "update": update_memory,
+    "delete": delete_memory,
+    "recent": recent_memories,
+    "compact_context": compact_context,
+    "inspect": memory_inspect,
+    "maintenance": memory_maintenance,
+    "lookup_symbol": lookup_symbol,
+}
+
+
+def gateway_error(error: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    structured = {"error": error, "message": message}
+    if details:
+        structured.update(details)
+    return {
+        "content": [{"type": "text", "text": f"Error: {message}"}],
+        "isError": True,
+        "structuredContent": structured,
+    }
+
+
+def mnemo_gateway(args: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch the single public Mnemo MCP tool to an internal action."""
+    action = normalize_optional_string(args.get("action")) if isinstance(args, dict) else None
+    params = args.get("params", {}) if isinstance(args, dict) else {}
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return gateway_error(
+            "invalid_params",
+            "Mnemo gateway params must be an object when provided.",
+            {"available_actions": sorted(GATEWAY_ACTIONS)},
+        )
+    if not action:
+        return gateway_error(
+            "missing_action",
+            "Mnemo gateway requires an action.",
+            {"available_actions": sorted(GATEWAY_ACTIONS)},
+        )
+    handler = GATEWAY_ACTIONS.get(action)
+    if handler is None:
+        return gateway_error(
+            "unknown_action",
+            f"Unknown Mnemo action: {action}",
+            {"action": action, "available_actions": sorted(GATEWAY_ACTIONS)},
+        )
+    return handler(params)
+
+
 TOOLS = [
     {
-        "name": "mnemo_doctor",
-        "title": "Mnemo Doctor",
-        "description": "Return Mnemo server and memory-file diagnostics.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "additionalProperties": False,
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_search",
-        "title": "Search Project Memory",
-        "description": "Search project memories relevant to a task, bug, file, command, or decision.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or current task."},
-                "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
-                "limit": {"type": "integer"},
-                "include_deleted": {"type": "boolean"},
-                "include_superseded": {"type": "boolean"},
-                "pinned": {"type": "boolean"},
-                "role": {"type": "string"},
-                "agent_id": {"type": "string"},
-                "domain": {"type": "string"},
-                "scope": {"type": "string"},
-                "authority": {"type": "string", "enum": list(AUTHORITY_VALUES)},
-                "retention": {"type": "string", "enum": list(RETENTION_VALUES)},
-                "source_run_id": {"type": "string"},
-                "phase": {"type": "string", "enum": list(PHASES)},
-                "max_tokens": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_salience_check",
-        "title": "Memory Salience Check",
-        "description": "Optional salience diagnostics for related or duplicate-like memory matches.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string"},
-                "limit": {"type": "integer"},
-                "include_deleted": {"type": "boolean"},
-                "include_superseded": {"type": "boolean"},
-                "threshold": {"type": ["number", "null"]},
-            },
-            "required": ["text"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_record",
-        "title": "Record Project Memory",
+        "name": GATEWAY_TOOL_NAME,
+        "title": "Mnemo Project Memory Gateway",
         "description": (
-            "Record a project memory of any kind. Kind-specific aliases are accepted: "
-            "summary (interaction_log), body (context_block), title (any), evidence_ids "
-            "(hippocampus_entry), feedback_type (agent_feedback)."
+            "Mnemo project-memory gateway. Use this for portable project memory, startup recall, "
+            "hippocampus entries, agent feedback, exports, maintenance, salience diagnostics, "
+            "and source symbol lookup. This is not Copilot native memory. Supported actions: "
+            + ", ".join(sorted(GATEWAY_ACTIONS))
+            + ". Pass action plus optional params."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
-                "text": {"type": "string", "description": "Primary memory text. Use summary/body aliases when convenient."},
-                "summary": {"type": "string", "description": "Alias for text when kind=interaction_log."},
-                "body": {"type": "string", "description": "Alias for text when kind=context_block."},
-                "title": {"type": ["string", "null"], "description": "Optional title stored under metadata.title."},
-                "source": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "supersedes": {"type": ["string", "null"]},
-                "references": {"type": "array", "items": {"type": "string"}},
-                "linked_ids": {"type": "array", "items": {"type": "string"}},
-                "evidence_ids": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Merged into linked_ids for kind=hippocampus_entry.",
+                "action": {
+                    "type": "string",
+                    "description": "Required action name. Supported actions are listed in the tool description.",
                 },
-                "pinned": {"type": "boolean"},
-                "agent_id": {"type": ["string", "null"]},
-                "role": {"type": ["string", "null"]},
-                "scope": {"type": ["string", "null"]},
-                "domain": {"type": ["string", "null"]},
-                "authority": {"type": ["string", "null"], "enum": [None, *AUTHORITY_VALUES]},
-                "retention": {"type": ["string", "null"], "enum": [None, *RETENTION_VALUES]},
-                "confidence": {"type": ["string", "null"], "enum": [None, *CONFIDENCE_VALUES]},
-                "parent_id": {"type": ["string", "null"]},
-                "source_run_id": {"type": ["string", "null"]},
-                "feedback_type": {
-                    "type": ["string", "null"],
-                    "description": "Stored under metadata.feedback_type for kind=agent_feedback.",
+                "params": {
+                    "type": "object",
+                    "description": "Optional action parameters. Omit when not needed.",
                 },
-                "metadata": {"type": "object"},
-            },
-        },
-    },
-    {
-        "name": "mnemo_link",
-        "title": "Link Memory Records",
-        "description": "Link one memory to another with an optional relation label.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "source_id": {"type": "string"},
-                "target_id": {"type": "string"},
-                "relation": {"type": ["string", "null"]},
-                "bidirectional": {"type": "boolean"},
-            },
-            "required": ["source_id", "target_id"],
-        },
-    },
-    {
-        "name": "mnemo_recall",
-        "title": "Recall Memory Bundle",
-        "description": (
-            "Return a recall bundle for the current session. mode='startup' returns the coordinator/front-facing "
-            "bundle; mode='agent' returns the specialist bundle scoped by agent_id/role/domain/task."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "mode": {"type": "string", "enum": ["startup", "agent"], "description": "When omitted, startup is used."},
-                "agent_id": {"type": ["string", "null"]},
-                "role": {"type": ["string", "null"], "description": "When omitted in startup mode, coordinator is used."},
-                "domain": {"type": ["string", "null"]},
-                "task": {"type": ["string", "null"]},
-                "query": {"type": ["string", "null"]},
-                "recent_logs": {"type": "integer"},
-                "max_blocks": {"type": "integer"},
-                "max_context_blocks": {"type": "integer"},
-                "max_hippocampus": {"type": "integer"},
-                "max_feedback": {
-                    "type": "integer",
-                    "description": "When omitted: 5 in startup mode, 10 in agent mode.",
-                },
-                "include_pinned": {"type": "boolean"},
-                "include_recent_logs": {"type": "boolean"},
-            },
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_get",
-        "title": "Get Memory By Id",
-        "description": "Retrieve one memory by id. full=true returns complete text and metadata.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "full": {"type": "boolean"},
-                "include_deleted": {"type": "boolean"},
-                "include_superseded": {"type": "boolean"},
-            },
-            "required": ["id"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_export",
-        "title": "Export Memories",
-        "description": (
-            "Export memories to local files. format accepts: jsonl, json, markdown, "
-            "hippocampus_markdown, agent_feedback_markdown, startup_context_markdown."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "format": {"type": "string", "description": "Required export format string."},
-                "path": {"type": "string", "description": "Optional output path. Default path depends on format."},
-                "kind": {"type": "string", "description": "Optional kind filter."},
-                "domain": {"type": "string", "description": "Optional domain filter."},
-                "agent_id": {"type": "string", "description": "Optional agent filter."},
-                "role": {"type": "string", "description": "Optional role filter."},
-                "include_deleted": {"type": "boolean", "description": "Optional. Include deleted records when true."},
-                "max_records": {"type": "integer", "description": "Optional. Range 1-5000, default 500."},
-            },
-            "required": ["format"],
-        },
-    },
-    {
-        "name": "mnemo_update",
-        "title": "Update Project Memory",
-        "description": "Patch text, kind, source, or tags on an existing memory.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "text": {"type": "string"},
-                "kind": {"type": "string", "enum": list(MEMORY_KINDS)},
-                "source": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "pinned": {"type": "boolean"},
-                "references": {"type": "array", "items": {"type": "string"}},
-                "linked_ids": {"type": "array", "items": {"type": "string"}},
-                "agent_id": {"type": ["string", "null"]},
-                "role": {"type": ["string", "null"]},
-                "scope": {"type": ["string", "null"]},
-                "domain": {"type": ["string", "null"]},
-                "authority": {"type": ["string", "null"], "enum": [None, *AUTHORITY_VALUES]},
-                "retention": {"type": ["string", "null"], "enum": [None, *RETENTION_VALUES]},
-                "confidence": {"type": ["string", "null"], "enum": [None, *CONFIDENCE_VALUES]},
-                "parent_id": {"type": ["string", "null"]},
-                "source_run_id": {"type": ["string", "null"]},
-                "metadata": {"type": "object"},
-            },
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "mnemo_delete",
-        "title": "Delete Project Memory",
-        "description": "Soft-delete an existing memory.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "reason": {"type": ["string", "null"]},
-            },
-            "required": ["id"],
-        },
-    },
-    {
-        "name": "mnemo_recent",
-        "title": "Recent Project Memories",
-        "description": "Return the most recently recorded project memories.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "limit": {"type": "integer"},
-                "include_deleted": {"type": "boolean"},
-                "include_superseded": {"type": "boolean"},
-            },
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_compact_context",
-        "title": "Build Compact Project Context",
-        "description": "Return a prompt-ready context block grouped by memory kind.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer"},
-                "include_deleted": {"type": "boolean"},
-                "include_superseded": {"type": "boolean"},
-                "phase": {"type": "string", "enum": list(PHASES)},
-                "max_tokens": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_inspect",
-        "title": "Inspect Memory",
-        "description": (
-            "Inspect a memory by id. mode='history' returns lifecycle events. "
-            "mode='related' walks the reference graph. mode='both' returns both in one call."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "mode": {"type": "string", "enum": ["history", "related", "both"]},
-                "limit": {"type": "integer"},
-                "depth": {"type": "integer"},
-                "include_deleted": {"type": "boolean"},
-                "include_superseded": {"type": "boolean"},
-                "include_archive": {"type": "boolean"},
-            },
-            "required": ["id"],
-        },
-        "annotations": {"readOnlyHint": True},
-    },
-    {
-        "name": "mnemo_maintenance",
-        "title": "Memory Maintenance",
-        "description": (
-            "Perform memory maintenance actions. action='compact_logs' builds a context_block from older "
-            "interaction_log entries. action='consolidate' finds near-duplicate clusters per kind. "
-            "action='import_json' imports legacy JSON records into the active backend."
-        ),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["compact_logs", "consolidate", "import_json"]},
-                "dry_run": {"type": "boolean"},
-                "older_than_count": {"type": "integer"},
-                "agent_id": {"type": "string"},
-                "role": {"type": "string"},
-                "max_logs": {"type": "integer"},
-                "threshold": {"type": "number"},
-                "path": {"type": "string"},
             },
             "required": ["action"],
+            "additionalProperties": False,
         },
-    },
-    {
-        "name": "mnemo_lookup_symbol",
-        "title": "Lookup Symbol",
-        "description": "Find likely definition locations for a symbol in the workspace.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "limit": {"type": "integer"},
-                "case_sensitive": {"type": "boolean"},
-            },
-            "required": ["name"],
-        },
-        "annotations": {"readOnlyHint": True},
     },
 ]
 
@@ -4801,12 +4566,11 @@ def handle_request(message: dict[str, Any]) -> None:
                     "version": SERVER_VERSION,
                 },
                 "instructions": (
-                    "Use mnemo_doctor for state and health diagnostics (including drift and persistence verification), "
-                    "mnemo_search before complex repo work, mnemo_recall for context bundles, "
-                    "mnemo_record for any memory kind, mnemo_get for full retrieval by id, mnemo_export for readable snapshots, "
-                    "mnemo_link/mnemo_inspect for graph navigation and history, mnemo_compact_context for prompt-ready briefs, "
-                    "mnemo_maintenance for housekeeping, "
-                    "and mnemo_lookup_symbol for source locations."
+                    "Use the single mnemo gateway tool with action plus optional params. "
+                    "Common actions: doctor, search, record, recall, get, link, export, "
+                    "compact_context, inspect, maintenance, salience_check, update, delete, "
+                    "recent, lookup_symbol. Do not look for individual mnemo_* tools; "
+                    "they are gateway actions now."
                 ),
             },
         )
@@ -4831,21 +4595,7 @@ def handle_request(message: dict[str, Any]) -> None:
             rpc_error(request_id, -32602, "Tool arguments must be an object")
             return
         handlers = {
-            "mnemo_doctor": mnemo_doctor,
-            "mnemo_search": search_memories,
-            "mnemo_salience_check": memory_salience_check,
-            "mnemo_record": record_memory,
-            "mnemo_link": memory_link,
-            "mnemo_recall": memory_recall,
-            "mnemo_get": memory_get,
-            "mnemo_export": memory_export,
-            "mnemo_update": update_memory,
-            "mnemo_delete": delete_memory,
-            "mnemo_recent": recent_memories,
-            "mnemo_compact_context": compact_context,
-            "mnemo_inspect": memory_inspect,
-            "mnemo_maintenance": memory_maintenance,
-            "mnemo_lookup_symbol": lookup_symbol,
+            GATEWAY_TOOL_NAME: mnemo_gateway,
         }
         handler = handlers.get(name)
         if handler is None:

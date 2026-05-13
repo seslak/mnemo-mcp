@@ -2,45 +2,33 @@
 
 Thanks for considering a contribution.
 
-Mnemo is intentionally small, local-first, and stdlib-only.
-
 ## Development setup
+
+Mnemo is intentionally simple and stdlib-only.
 
 ```bash
 python -m compileall .
 python smoke_test.py
 python -m unittest discover -s . -p "test*.py"
 ```
-
-No external services or package installs are required for normal development.
 
 ## Guidelines
 
 - Preserve local-first behavior.
-- Keep required runtime dependencies at zero unless there is a strong reason.
-- Keep MCP tool schemas compatible with constrained MCP clients.
-- Put validation, defaults, and bounds in Python handlers, not only in JSON Schema.
-- Keep tool names stable once public.
-- Prefer bounded outputs over large context dumps.
-- Add or update tests for user-visible behavior.
-- Update `CHANGELOG.md` for user-visible changes.
-- Do not commit local runtime memory or logs.
+- Keep the public MCP surface small: Mnemo exposes one gateway tool, `mnemo`.
+- Add new capabilities as gateway actions when possible, not as new public MCP tools.
+- Keep response fields backward-compatible where practical.
+- Prefer additive structured fields over breaking storage changes.
+- Do not introduce required external dependencies without a strong reason.
+- Keep exported MCP schemas compatible with constrained clients.
+- Put validation, defaults, and bounds in Python handlers.
+- Add tests for new behavior.
+- Do not commit local `memory.json`, SQLite databases, query logs, event logs, archive files, or generated exports.
 
-## Storage changes
+## Storage
 
-Mnemo uses SQLite by default and JSON as a compatibility/import/export format. Storage changes should preserve:
+SQLite is the default backend, but JSON compatibility should remain available unless deliberately changed before 1.0.
 
-- importability of existing `memory.json`
-- copy/paste portability
-- readable exports
-- bounded recall/search outputs
+## Release notes
 
-## Before opening a PR
-
-Run:
-
-```bash
-python -m compileall .
-python smoke_test.py
-python -m unittest discover -s . -p "test*.py"
-```
+Update `CHANGELOG.md` for user-visible changes.

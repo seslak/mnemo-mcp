@@ -4,24 +4,16 @@
       "type": "stdio",
       "command": "python",
       "args": [
-        "mnemo-mcp/server.py"
+        "mnemo/server.py"
       ],
       "env": {
         "MNEMO_STORE": "sqlite",
-        "MNEMO_MCP_PROFILE": "core",
-        "MNEMO_WORKSPACE_ROOT": ".",
         "MNEMO_FILE": "state/mnemo/memory.json",
-        "MNEMO_SQLITE_FILE": "state/mnemo/mnemo.sqlite"
+        "MNEMO_SQLITE_FILE": "state/mnemo/mnemo.sqlite",
+        "MNEMO_WORKSPACE_ROOT": "."
       },
       "tools": [
-        "mnemo_doctor",
-        "mnemo_search",
-        "mnemo_record",
-        "mnemo_recall",
-        "mnemo_get",
-        "mnemo_export",
-        "mnemo_compact_context",
-        "mnemo_lookup_symbol"
+        "mnemo"
       ]
     }
   }

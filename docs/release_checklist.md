@@ -8,35 +8,26 @@ python smoke_test.py
 python -m unittest discover -s . -p "test*.py"
 ```
 
-Verify:
+Then verify:
 
-- `server.py` reports the intended version.
-- `README.md` version matches `server.py`.
-- `CHANGELOG.md` has the release entry.
-- `pyproject.toml` version matches the release.
-- Example MCP configs use `mnemo_*` tools, not legacy `memory_*` tools.
-- No runtime state is included:
-  - `mnemo.sqlite`
-  - `memory.json`
-  - `queries.jsonl`
-  - `events.jsonl`
-  - `*.archive.jsonl`
-  - `*.lock`
-  - generated exports under `state/mnemo/exports/`
-- No Python/cache/build artifacts are included:
-  - `__pycache__/`
-  - `*.pyc`
-  - `.pytest_cache/`
-  - `.mypy_cache/`
-  - `.coverage`
-  - `dist/`
-  - `build/`
-  - `*.egg-info/`
+- `server.py` reports the intended `SERVER_VERSION`
+- `pyproject.toml` version matches `server.py`
+- `README.md` describes the current gateway tool model
+- `CHANGELOG.md` has the release entry
+- example MCP configs still point to `mnemo/server.py`
+- `LICENSE` is present
+- runtime memory files are absent
+- SQLite databases are absent
+- query/event logs are absent unless intentionally included as examples
+- `__pycache__/` and `*.pyc` are absent
+- `.pytest_cache/`, `build/`, `dist/`, and `*.egg-info/` are absent
 
-Optional manual check:
+Files that should not be included in release ZIPs:
 
-```bash
-python server.py
-```
-
-Then send JSON-RPC `initialize`, `tools/list`, and one `mnemo_doctor` call from a client or manual stdin probe.
+- `mnemo.sqlite`
+- `memory.json`
+- `queries.jsonl`
+- `events.jsonl`
+- `*.archive.jsonl`
+- lock files
+- generated exports under `state/mnemo/exports/`
