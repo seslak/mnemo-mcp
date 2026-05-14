@@ -1,19 +1,53 @@
 # Changelog
 
-## 0.11.0
+## 0.12.0
+
+### Added
+
+- Memory signature columns: `content_hash`, `normalized_hash`, `token_count`, `unique_token_count`, `top_terms_json`, `shingle_hashes_json`, `signature_version`, `normalizer_version`, `signature_updated_at` — computed at write time with `hashlib.blake2b`, stored in SQLite.
+- `_jaccard_similarity_fallback` now correctly returns `0.0` for empty-empty inputs (was `1.0`).
+- Record-time duplicate detection: exact `content_hash` → `normalized_hash` short-circuits, then shingle overlap gates full similarity scoring.
+- Candidate-based `maintenance` sub-action `consolidate`: uses exact hashes, bounded candidates, and shingle overlap to gate similarity calls — no all-pairs comparison by default.
+- `maintenance` sub-action / top-level alias `consolidate_full`: explicit O(n²) full-scan requiring `confirm_full_scan: true`.
+- `maintenance` sub-action / top-level alias `backfill_signatures`: batch-updates signature columns for pre-v0.12.0 rows (500 per transaction).
+- `mnemo` action `doctor` warns when `> 10%` of active memories have missing or outdated signatures.
+- `mnemo` action `doctor` reports FTS availability in a structured `fts` dict.
+- Token set cache in `build_consolidation_clusters` avoids re-tokenizing text on each Jaccard similarity call.
+- Shingle preloading pass in `build_consolidation_clusters` avoids JSON re-parsing in the hot inner loop.
+- `MAX_SIGNATURE_TEXT_CHARS = 50_000` cap on text tokenized for signatures (raw text column unaffected).
+- Benchmark script `benchmark_consolidation.py` for 50 k-record performance validation.
 
 ### Changed
 
-- Consolidated the public MCP surface to one gateway tool: `mnemo`.
-- All previous Mnemo operations are now available as gateway actions such as `record`, `search`, `recall`, `get`, `export`, `maintenance`, and `lookup_symbol`.
-- Removed profile-based public tool exposure; `MNEMO_MCP_PROFILE` is now ignored for tools/list output.
-- Kept SQLite storage, readable exports, bounded recall, and Copilot-safe schemas.
+- `jaccard()` renamed internally to `_jaccard_similarity_fallback()`; `jaccard()` is preserved as a compatibility alias.
+- Consolidation now skips memories with fewer than `min_token_count=5` tokens or no shingle hashes (texts too short for reliable near-dup detection).
+- Consolidation results include `duplicate_type` (`content_hash`, `normalized_hash`, `near_duplicate`) and `candidate_source` fields.
+- `build_consolidation_clusters` returns `candidates_examined` and `similarity_calls` counters.
+- `mnemo` action `maintenance` now accepts five sub-actions: `compact_logs`, `consolidate`, `consolidate_full`, `import_json`, `backfill_signatures`.
+
+### Schema migration
+
+- Idempotent `ALTER TABLE ADD COLUMN` migration runs on first use — existing databases gain the eight new signature columns automatically. No manual migration step required.
 
 ### Compatibility
 
-- Storage format is unchanged from 0.10.0.
-- Existing memory data remains usable.
-- Public MCP tool names changed intentionally before 1.0.0 to reduce Copilot tool-inventory pressure.
+- Existing SQLite and JSON stores remain readable without any changes.
+- Memories without stored signatures are handled transparently: signatures are computed on-the-fly during duplicate detection and consolidation.
+- All v0.10.0/v0.11.0 tools and actions remain backward-compatible.
+- No new external dependencies.
+
+## 0.11.0
+
+### Added
+
+- Single gateway tool architecture: all tools dispatched through one `mnemo` gateway tool with `{"action": "...", "params": {...}}` envelope.
+- `mnemo_get` for full single-memory retrieval by id.
+- Extended `mnemo_doctor` with SQLite backend reporting.
+
+### Changed
+
+- Reduced exposed tool count to 1 (single gateway) for maximum MCP client compatibility.
+- All previous multi-tool surface consolidated into the gateway dispatcher.
 
 ## 0.10.0
 

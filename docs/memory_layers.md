@@ -1,58 +1,86 @@
-# Mnemo memory layers
+# Mnemo Memory Layers
 
-Mnemo stores all project memory in one local store. In SQLite mode the primary file is `state/mnemo/mnemo.sqlite`.
+Mnemo uses one public MCP gateway tool:
 
-The public MCP surface is one gateway tool: `mnemo`. Use `action` plus optional `params`.
-
-## Layers
-
-- `interaction_log`: short recent continuity logs.
-- `context_block`: larger linked artifacts that expand one or more logs/findings.
-- `hippocampus_entry`: durable project/system knowledge.
-- `agent_feedback`: feedback scoped to an agent, role, or domain.
-
-Hippocampus entries are not stored in a separate database. They are normal memories with `kind="hippocampus_entry"` plus metadata such as `domain`, `scope`, `authority`, and `retention`.
-
-## Examples
-
-Record an interaction log:
-
-```json
-{"action":"record","params":{"kind":"interaction_log","summary":"User decided to keep Mnemo as SQLite-backed project memory.","role":"coordinator"}}
+```text
+mnemo
 ```
 
-Record a linked context block:
+All operations use `action` plus optional `params`.
+
+## Core memory kinds
+
+- `interaction_log`: short continuity notes from recent work
+- `context_block`: larger linked memory artifacts
+- `hippocampus_entry`: durable project/system knowledge
+- `agent_feedback`: feedback scoped to an `agent_id`, `role`, or `domain`
+
+These are stored in the same SQLite database as all other memories.
+
+## Recall
+
+Startup bundle:
 
 ```json
-{"action":"record","params":{"kind":"context_block","title":"Mnemo storage decision","body":"SQLite is the primary store; JSONL/Markdown are exports.","linked_ids":["mem_log_id"]}}
+{"action":"recall","params":{"mode":"startup","role":"coordinator","recent_logs":20}}
 ```
 
-Record a hippocampus entry:
+Specialist bundle:
 
 ```json
-{"action":"record","params":{"kind":"hippocampus_entry","text":"Mnemo uses one SQLite store; hippocampus entries are distinguished by kind and metadata.","domain":"agentic/memory","authority":"high"}}
+{"action":"recall","params":{"mode":"agent","agent_id":"spec_auth","role":"specialist","domain":"auth","task":"review middleware"}}
 ```
 
-Record agent feedback:
+Use `action="get"` to retrieve full memory bodies by id.
+
+## Recording layer examples
+
+Interaction log:
 
 ```json
-{"action":"record","params":{"kind":"agent_feedback","text":"When writing project memory, use Mnemo gateway actions, not native assistant memory.","role":"coordinator","domain":"agentic/memory"}}
+{"action":"record","params":{"kind":"interaction_log","summary":"Short continuity note.","role":"coordinator"}}
 ```
 
-Recall startup context:
+Context block:
 
 ```json
-{"action":"recall","params":{"mode":"startup","role":"coordinator","query":"Mnemo storage and gateway design"}}
+{"action":"record","params":{"kind":"context_block","title":"Detailed handoff","body":"Longer explanation..."}}
 ```
 
-Recall specialist context:
+Hippocampus entry:
 
 ```json
-{"action":"recall","params":{"mode":"agent","agent_id":"memory-specialist","domain":"agentic/memory","task":"review memory persistence"}}
+{"action":"record","params":{"kind":"hippocampus_entry","text":"Durable project fact.","domain":"release","authority":"medium"}}
 ```
 
-Load one full memory:
+Agent feedback:
 
 ```json
-{"action":"get","params":{"id":"mem_123","full":true}}
+{"action":"record","params":{"kind":"agent_feedback","text":"Prefer bounded file windows.","agent_id":"spec_backend","domain":"backend"}}
+```
+
+## Maintenance
+
+Compact logs:
+
+```json
+{"action":"maintenance","params":{"action":"compact_logs","dry_run":true}}
+```
+
+Backfill signatures:
+
+```json
+{"action":"maintenance","params":{"action":"backfill_signatures","dry_run":false}}
+```
+
+Candidate-based consolidation:
+
+```json
+{"action":"maintenance","params":{"action":"consolidate","dry_run":true}}
+```
+
+Full scan consolidation is gated:
+
+```json
+{"action":"maintenance","params":{"action":"consolidate_full","confirm_full_scan":true,"dry_run":true}}
 ```

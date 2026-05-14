@@ -8,15 +8,16 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.11.0**
+Current version: **0.12.0**
 
 Runtime requirements:
 
 - Python **3.10+**
 - Standard library only
-- Optional: [`agent-salience`](https://github.com/seslak/agent-salience) via `AGENT_SALIENCE_HOME` or normal Python import
+- SQLite-first local storage
+- Optional: local `agent-salience` via `AGENT_SALIENCE_HOME` or normal Python import
 
-Mnemo is local-first. It does not require a cloud service, external database, vector database, or package install.
+Mnemo is local-first. It does not require a cloud service, vector database, external database server, or package install.
 
 ## What Mnemo provides
 
@@ -25,7 +26,9 @@ Mnemo is local-first. It does not require a cloud service, external database, ve
 - JSONL and Markdown exports for human inspection
 - Bounded search and recall so memory growth does not automatically become token growth
 - Structured memory layers for agentic systems
-- Maintenance actions for compaction, consolidation, and import
+- Signature-at-write-time duplicate detection and consolidation support
+- Candidate-based consolidation by default, with full O(n²) scan gated behind explicit confirmation
+- Maintenance actions for log compaction, consolidation, JSON import, and signature backfill
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
 - Lightweight symbol lookup under a configured workspace root
@@ -49,6 +52,7 @@ mnemo-mcp/
 ├── memory.example.json
 ├── smoke_test.py
 ├── test_server.py
+├── benchmark_consolidation.py
 ├── examples/
 ├── docs/
 ├── CHANGELOG.md
@@ -117,8 +121,8 @@ In SQLite mode, lifecycle/query events are stored in the SQLite `events` table. 
 | `MNEMO_SQLITE_FILE` | SQLite path when `MNEMO_STORE=sqlite`. Default: `<workspace>/state/mnemo/mnemo.sqlite`. |
 | `MNEMO_WORKSPACE_ROOT` | Workspace root for `lookup_symbol`. Default: current working directory. |
 | `MNEMO_MAX_MEMORIES` | Total memory cap including retired entries. Default: `5000`. |
-| `MNEMO_MAX_SEARCH_RESULTS` | Server-side cap for search results. Default: `20`. |
-| `MNEMO_MAX_RECENT_RESULTS` | Server-side cap for recent results. Default: `50`. |
+| `MNEMO_MAX_SEARCH_RESULTS` | Server-side cap for `search` results. Default: `20`. |
+| `MNEMO_MAX_RECENT_RESULTS` | Server-side cap for `recent` results. Default: `50`. |
 | `MNEMO_MAX_CHARS_PER_ITEM` | Per-item preview cap for search/recall/get preview mode. Default: `1200`. |
 | `MNEMO_MAX_TOTAL_CHARS` | Total preview cap for bundled search/recall output. Default: `12000`. |
 | `MNEMO_DECAY` | Set to `0` to disable time-decay scoring. Default: `1`. |
@@ -132,7 +136,7 @@ In SQLite mode, lifecycle/query events are stored in the SQLite `events` table. 
 | `MNEMO_MAX_FILE_BYTES` | Max single file bytes read by `lookup_symbol`. Default: `1048576`. |
 | `AGENT_SALIENCE_HOME` | Optional path to local `agent-salience` checkout. |
 
-`MNEMO_MCP_PROFILE` is ignored as of `0.11.0`. Mnemo always exposes one public gateway tool.
+`MNEMO_MCP_PROFILE` is ignored. Mnemo always exposes one public gateway tool.
 
 ## MCP gateway model
 
@@ -152,15 +156,37 @@ This gateway model keeps the MCP surface small for clients with tool-inventory l
 
 ## Gateway actions
 
+Supported top-level actions:
+
+- `doctor`
+- `search`
+- `salience_check`
+- `record`
+- `link`
+- `recall`
+- `get`
+- `export`
+- `update`
+- `delete`
+- `recent`
+- `compact_context`
+- `inspect`
+- `maintenance`
+- `backfill_signatures`
+- `consolidate_full`
+- `lookup_symbol`
+
+`backfill_signatures` and `consolidate_full` are also available as `maintenance` sub-actions.
+
 ### `doctor`
 
-Returns storage, schema, health, export, FTS, and salience diagnostics.
+Returns storage, schema, health, export, FTS, signature, and salience diagnostics.
 
 ```json
 {"action":"doctor"}
 ```
 
-Use this to verify that the backend is SQLite, the SQLite file exists, and memory counts are visible.
+In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, FTS status, and signature warnings.
 
 ### `record`
 
@@ -181,7 +207,7 @@ Structured memory aliases are accepted by the generic record action:
 ```
 
 ```json
-{"action":"record","params":{"kind":"hippocampus_entry","text":"Always run compile and unit tests before handoff.","evidence_ids":["mem_log_id"],"domain":"release"}}
+{"action":"record","params":{"kind":"hippocampus_entry","text":"Always run validation before release handoff.","evidence_ids":["mem_log_id"],"domain":"release"}}
 ```
 
 ```json
@@ -261,18 +287,40 @@ Builds a prompt-ready memory context block.
 
 ### `maintenance`
 
-Maintenance actions include `compact_logs`, `consolidate`, and `import_json`.
+Maintenance actions include `compact_logs`, `consolidate`, `consolidate_full`, `import_json`, and `backfill_signatures`.
 
 ```json
 {"action":"maintenance","params":{"action":"compact_logs","older_than_count":20,"max_logs":50,"dry_run":true}}
 ```
 
 ```json
-{"action":"maintenance","params":{"action":"consolidate","threshold":0.7,"dry_run":true}}
+{"action":"maintenance","params":{"action":"consolidate","threshold":0.7,"dry_run":true,"max_candidates_per_memory":100}}
 ```
 
 ```json
 {"action":"maintenance","params":{"action":"import_json","path":"state/mnemo/memory.json","dry_run":true}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"backfill_signatures","dry_run":true}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"consolidate_full","confirm_full_scan":true,"dry_run":true}}
+```
+
+The default `consolidate` action is candidate-based. The O(n²) full scan is only available through `consolidate_full` with `confirm_full_scan:true`.
+
+### Top-level maintenance aliases
+
+For discoverability, these can also be called directly:
+
+```json
+{"action":"backfill_signatures","params":{"dry_run":false}}
+```
+
+```json
+{"action":"consolidate_full","params":{"confirm_full_scan":true,"dry_run":true}}
 ```
 
 ### `inspect`
@@ -296,8 +344,10 @@ Finds likely source definition locations under `MNEMO_WORKSPACE_ROOT`.
 Optional deterministic salience diagnostics when Agent Salience is available.
 
 ```json
-{"action":"salience_check","params":{"text":"auth middleware decisions","limit":5,"threshold":0.7}}
+{"action":"salience_check","params":{"text":"auth middleware decisions","limit":5,"candidate_limit":500,"max_scored":100}}
 ```
+
+`salience_check` is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, and scores only bounded survivors.
 
 ### `update`, `delete`, and `recent`
 
@@ -357,6 +407,42 @@ Supported kinds:
 
 The store can grow locally without automatically increasing token usage. Mnemo controls token cost by returning bounded previews from search/recall and loading full memory bodies only by id through `action="get"`.
 
+## Signature-at-write-time
+
+Mnemo 0.12.0 stores deterministic signatures when memories are recorded, imported, or backfilled:
+
+- `content_hash`: blake2b digest of full raw text after stable line-ending normalization
+- `normalized_hash`: blake2b digest of normalized tokens joined with spaces
+- `token_count`
+- `unique_token_count`
+- `top_terms_json`: top 32 terms by frequency, ties alphabetically
+- `shingle_hashes_json`: sorted min-K word-shingle hashes, capped at 256
+- `signature_version`
+- `normalizer_version`
+- `signature_updated_at`
+
+`content_hash` covers the full text. Token-based signatures are capped at `MAX_SIGNATURE_TEXT_CHARS = 50,000` characters to avoid runaway tokenization on pasted logs or huge dumps. Raw stored text is unaffected.
+
+Similarity policy:
+
+```text
+jaccard([], []) = 0.0
+```
+
+Empty-empty means no signal, not semantic identity. Tiny texts may match exact hashes but are skipped by shingle-based near-duplicate detection.
+
+## Consolidation and full-scan safety
+
+`action="maintenance"` with `params.action="consolidate"` uses a bounded, candidate-based consolidation path. It relies on exact hashes and compact shingle signatures before doing expensive similarity checks.
+
+The historical all-pairs scan is not the default. To request it intentionally, call `consolidate_full` with explicit confirmation:
+
+```json
+{"action":"consolidate_full","params":{"confirm_full_scan":true,"dry_run":true}}
+```
+
+Without `confirm_full_scan:true`, Mnemo returns an error that includes the estimated number of pairs.
+
 ## Compaction
 
 `action="maintenance"` with `params.action="compact_logs"` keeps recent interaction logs raw and can summarize older logs into a `context_block`. Source logs are retained.
@@ -364,6 +450,12 @@ The store can grow locally without automatically increasing token usage. Mnemo c
 ## Hippocampus storage
 
 Hippocampus is not a separate database. Durable project knowledge is stored in the same SQLite database with `kind="hippocampus_entry"`, plus fields such as `domain`, `scope`, `authority`, and `retention`.
+
+## Salience / IDF / LSH preparation
+
+Mnemo stores deterministic signature fields (`signature_version`, `normalizer_version`, `shingle_hashes_json`, hashes, token counts, and top terms) so future MinHash/LSH can be added without a storage redesign. Full LSH is not active in this release.
+
+Agent Salience can optionally provide deterministic salience diagnostics. Future IDF support should remain corpus-learned, local, language-agnostic, and disabled until enough project/domain corpus exists. See [`docs/salience_lsh_idf_notes.md`](docs/salience_lsh_idf_notes.md).
 
 ## Copilot compatibility
 
@@ -377,13 +469,16 @@ Mnemo exports conservative MCP tool schemas for clients that reject full JSON Sc
 python -m compileall .
 python smoke_test.py
 python -m unittest discover -s . -p "test*.py"
+python benchmark_consolidation.py
 ```
 
 Expected result for this release:
 
 ```text
-172 tests passed, 4 skipped
+219 tests passed, 1 skipped
 ```
+
+The benchmark inserts 50,000 synthetic memories, backfills signatures, runs candidate-based consolidation, and verifies the `consolidate_full` confirmation gate.
 
 ## Privacy
 

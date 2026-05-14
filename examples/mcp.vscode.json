@@ -7,9 +7,7 @@
         "${workspaceFolder}/mnemo/server.py"
       ],
       "env": {
-        "MNEMO_STORE": "sqlite",
-        "MNEMO_FILE": "${workspaceFolder}/state/mnemo/memory.json",
-        "MNEMO_SQLITE_FILE": "${workspaceFolder}/state/mnemo/mnemo.sqlite",
+        "MNEMO_FILE": "${workspaceFolder}/mnemo/memory.json",
         "MNEMO_WORKSPACE_ROOT": "${workspaceFolder}"
       }
     }

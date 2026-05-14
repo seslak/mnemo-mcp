@@ -648,8 +648,8 @@ class MaintenanceTests(MnemoTestCase):
     def test_maintenance_action_consolidate_apply(self) -> None:
         self.write_store(
             [
-                server.new_memory("old", "decision", "use auth middleware", "", []),
-                server.new_memory("new", "decision", "use auth middleware now", "", []),
+                server.new_memory("old", "decision", "use auth middleware before handling route requests securely", "", []),
+                server.new_memory("new", "decision", "use auth middleware before handling route requests now", "", []),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": False})
@@ -665,8 +665,8 @@ class MaintenanceTests(MnemoTestCase):
         os.environ["MNEMO_CONSOLIDATE_THRESHOLD"] = "0.95"
         self.write_store(
             [
-                server.new_memory("old", "decision", "use auth middleware", "", []),
-                server.new_memory("new", "decision", "use auth middleware now", "", []),
+                server.new_memory("old", "decision", "use auth middleware before handling route requests securely", "", []),
+                server.new_memory("new", "decision", "use auth middleware before handling route requests now", "", []),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
@@ -1594,8 +1594,8 @@ class ConsolidateTests(MnemoTestCase):
     def test_consolidate_dry_run_surfaces_cluster_with_survivor(self) -> None:
         self.write_store(
             [
-                self.duplicate_memory("old", "decision", "use auth middleware", "2026-01-01T00:00:00Z"),
-                self.duplicate_memory("new", "decision", "use auth middleware now", "2026-01-02T00:00:00Z"),
+                self.duplicate_memory("old", "decision", "use auth middleware before handling route requests securely", "2026-01-01T00:00:00Z"),
+                self.duplicate_memory("new", "decision", "use auth middleware before handling route requests now", "2026-01-02T00:00:00Z"),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
@@ -1607,8 +1607,8 @@ class ConsolidateTests(MnemoTestCase):
     def test_consolidate_skips_pinned_entries(self) -> None:
         self.write_store(
             [
-                self.duplicate_memory("pinned", "decision", "use auth middleware", "2026-01-01T00:00:00Z", pinned=True),
-                self.duplicate_memory("new", "decision", "use auth middleware", "2026-01-02T00:00:00Z"),
+                self.duplicate_memory("pinned", "decision", "use auth middleware before handling route requests securely", "2026-01-01T00:00:00Z", pinned=True),
+                self.duplicate_memory("new", "decision", "use auth middleware before handling route requests securely", "2026-01-02T00:00:00Z"),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
@@ -1617,8 +1617,8 @@ class ConsolidateTests(MnemoTestCase):
     def test_consolidate_does_not_cluster_across_kinds(self) -> None:
         self.write_store(
             [
-                self.duplicate_memory("d1", "decision", "same text marker", "2026-01-01T00:00:00Z"),
-                self.duplicate_memory("n1", "note", "same text marker", "2026-01-02T00:00:00Z"),
+                self.duplicate_memory("d1", "decision", "use auth middleware before handling route requests securely", "2026-01-01T00:00:00Z"),
+                self.duplicate_memory("n1", "note", "use auth middleware before handling route requests securely", "2026-01-02T00:00:00Z"),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
@@ -1627,8 +1627,8 @@ class ConsolidateTests(MnemoTestCase):
     def test_consolidate_apply_writes_supersede_chain_and_events(self) -> None:
         self.write_store(
             [
-                self.duplicate_memory("old", "decision", "use auth middleware", "2026-01-01T00:00:00Z"),
-                self.duplicate_memory("new", "decision", "use auth middleware now", "2026-01-02T00:00:00Z"),
+                self.duplicate_memory("old", "decision", "use auth middleware before handling route requests securely", "2026-01-01T00:00:00Z"),
+                self.duplicate_memory("new", "decision", "use auth middleware before handling route requests now", "2026-01-02T00:00:00Z"),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": False})
@@ -1643,15 +1643,15 @@ class ConsolidateTests(MnemoTestCase):
         os.environ["MNEMO_CONSOLIDATE_THRESHOLD"] = "0.9"
         self.write_store(
             [
-                self.duplicate_memory("old", "decision", "use auth middleware", "2026-01-01T00:00:00Z"),
-                self.duplicate_memory("new", "decision", "use auth middleware now", "2026-01-02T00:00:00Z"),
+                self.duplicate_memory("old", "decision", "use auth middleware before handling route requests securely", "2026-01-01T00:00:00Z"),
+                self.duplicate_memory("new", "decision", "use auth middleware before handling route requests now", "2026-01-02T00:00:00Z"),
             ]
         )
         result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
         self.assertEqual(result["structuredContent"]["clusters"], [])
 
     def test_consolidate_singletons_not_returned(self) -> None:
-        self.write_store([self.duplicate_memory("solo", "decision", "unique decision", "2026-01-01T00:00:00Z")])
+        self.write_store([self.duplicate_memory("solo", "decision", "unique decision text that stands alone", "2026-01-01T00:00:00Z")])
         result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
         self.assertEqual(result["structuredContent"]["clusters"], [])
 
@@ -2119,6 +2119,619 @@ class SqliteStoreTests(MnemoTestCase):
         self.assertIn("export_files", structured)
         self.assertIn("fts_available", structured)
         self.assertIn("search_backend", structured)
+
+
+class SignatureHelpersTests(MnemoTestCase):
+    def test_stable_hash_hex_determinism(self) -> None:
+        h1 = server._stable_hash_hex("hello world")
+        h2 = server._stable_hash_hex("hello world")
+        self.assertEqual(h1, h2)
+        h3 = server._stable_hash_hex("hello world!")
+        self.assertNotEqual(h1, h3)
+
+    def test_stable_hash_hex_is_blake2b_not_builtin(self) -> None:
+        import hashlib
+        expected = hashlib.blake2b("hello".encode("utf-8"), digest_size=8).hexdigest()
+        self.assertEqual(server._stable_hash_hex("hello"), expected)
+
+    def test_stable_hash_hex_length_is_16(self) -> None:
+        h = server._stable_hash_hex("test value")
+        self.assertEqual(len(h), 16)
+
+    def test_build_memory_signature_has_all_fields(self) -> None:
+        sig = server._build_memory_signature("auth middleware route handler checks")
+        expected_keys = {
+            "content_hash", "normalized_hash", "token_count", "unique_token_count",
+            "top_terms_json", "shingle_hashes_json", "signature_version",
+            "normalizer_version", "signature_updated_at",
+        }
+        self.assertEqual(set(sig.keys()), expected_keys)
+
+    def test_build_memory_signature_token_counts_correct(self) -> None:
+        sig = server._build_memory_signature("apple apple banana cherry")
+        self.assertGreater(sig["token_count"], 0)
+        self.assertLessEqual(sig["unique_token_count"], sig["token_count"])
+
+    def test_build_memory_signature_truncation(self) -> None:
+        long_text = "token " * 20_000  # 120000 chars, well over MAX
+        sig_long = server._build_memory_signature(long_text)
+        sig_long2 = server._build_memory_signature(long_text + " extra stuff that is beyond cap")
+        # Token-based signatures are capped for safety, but content_hash covers full raw text.
+        self.assertNotEqual(sig_long["content_hash"], sig_long2["content_hash"])
+        self.assertEqual(sig_long["normalized_hash"], sig_long2["normalized_hash"])
+        self.assertEqual(sig_long["shingle_hashes_json"], sig_long2["shingle_hashes_json"])
+
+    def test_content_hash_uses_full_raw_text_beyond_signature_cap(self) -> None:
+        prefix = "x" * server.MAX_SIGNATURE_TEXT_CHARS
+        sig_a = server._build_memory_signature(prefix + " A")
+        sig_b = server._build_memory_signature(prefix + " B")
+        self.assertNotEqual(sig_a["content_hash"], sig_b["content_hash"])
+
+    def test_build_memory_signature_top_terms_sorted_by_freq_desc(self) -> None:
+        # "apple" appears 5x, "banana" 3x, "cherry" 1x
+        sig = server._build_memory_signature("apple apple apple apple apple banana banana banana cherry")
+        top = json.loads(sig["top_terms_json"])
+        self.assertTrue(len(top) > 0)
+        # apple should appear before banana (higher freq)
+        if "apple" in top and "banana" in top:
+            self.assertLess(top.index("apple"), top.index("banana"))
+        if "banana" in top and "cherry" in top:
+            self.assertLess(top.index("banana"), top.index("cherry"))
+
+    def test_build_word_shingles_returns_empty_when_too_short(self) -> None:
+        self.assertEqual(server._build_word_shingles(["a", "b"], n=3), [])
+        self.assertEqual(server._build_word_shingles([], n=3), [])
+
+    def test_build_word_shingles_count(self) -> None:
+        tokens = ["a", "b", "c", "d"]
+        shingles = server._build_word_shingles(tokens, n=3)
+        self.assertEqual(len(shingles), 2)  # "a b c", "b c d"
+
+    def test_build_min_k_shingle_hashes_sorted_ascending(self) -> None:
+        tokens = ["the", "quick", "brown", "fox", "jumps", "over"]
+        hashes = server._build_min_k_shingle_hashes(tokens, k=10)
+        self.assertEqual(hashes, sorted(hashes))
+
+    def test_build_min_k_shingle_hashes_capped_at_k(self) -> None:
+        tokens = ["w" + str(i) for i in range(200)]
+        hashes = server._build_min_k_shingle_hashes(tokens, k=50)
+        self.assertLessEqual(len(hashes), 50)
+
+    def test_signature_overlap_empty_both_is_zero(self) -> None:
+        self.assertEqual(server._signature_overlap([], []), 0.0)
+
+    def test_signature_overlap_one_empty_is_zero(self) -> None:
+        hashes = ["aaa", "bbb", "ccc"]
+        self.assertEqual(server._signature_overlap(hashes, []), 0.0)
+        self.assertEqual(server._signature_overlap([], hashes), 0.0)
+
+    def test_signature_overlap_identical_is_one(self) -> None:
+        hashes = ["aaa", "bbb", "ccc"]
+        self.assertAlmostEqual(server._signature_overlap(hashes, hashes), 1.0)
+
+    def test_signature_overlap_disjoint_is_zero(self) -> None:
+        self.assertAlmostEqual(server._signature_overlap(["aaa", "bbb"], ["ccc", "ddd"]), 0.0)
+
+    def test_signature_overlap_partial(self) -> None:
+        a = ["aaa", "bbb", "ccc"]
+        b = ["bbb", "ccc", "ddd"]
+        overlap = server._signature_overlap(a, b)
+        # intersection=2, union=4 → 0.5
+        self.assertAlmostEqual(overlap, 0.5)
+
+
+class JaccardFallbackTests(MnemoTestCase):
+    def test_empty_empty_is_zero(self) -> None:
+        self.assertEqual(server._jaccard_similarity_fallback(set(), set()), 0.0)
+
+    def test_one_empty_is_zero(self) -> None:
+        self.assertEqual(server._jaccard_similarity_fallback({"a"}, set()), 0.0)
+        self.assertEqual(server._jaccard_similarity_fallback(set(), {"a"}), 0.0)
+
+    def test_identical_nonempty_is_one(self) -> None:
+        self.assertAlmostEqual(server._jaccard_similarity_fallback({"a", "b"}, {"a", "b"}), 1.0)
+
+    def test_disjoint_is_zero(self) -> None:
+        self.assertAlmostEqual(server._jaccard_similarity_fallback({"a", "b"}, {"c", "d"}), 0.0)
+
+    def test_partial_overlap(self) -> None:
+        # intersection=1 ("b"), union=3 ("a","b","c") → 0.333...
+        result = server._jaccard_similarity_fallback({"a", "b"}, {"b", "c"})
+        self.assertAlmostEqual(result, 1 / 3, places=5)
+
+    def test_jaccard_alias_matches_fallback(self) -> None:
+        a = {"alpha", "beta", "gamma"}
+        b = {"beta", "gamma", "delta"}
+        self.assertEqual(server.jaccard(a, b), server._jaccard_similarity_fallback(a, b))
+
+    def test_agent_salience_jaccard_parity_when_importable(self) -> None:
+        try:
+            import agent_salience  # type: ignore
+        except Exception as exc:
+            self.skipTest(f"agent_salience not importable: {exc}")
+        cases = [
+            (set(), set()),
+            ({"a"}, set()),
+            (set(), {"a"}),
+            ({"a"}, {"a"}),
+            ({"a", "b"}, {"b", "c"}),
+            ({"a", "b"}, {"c", "d"}),
+            ({"a"}, {"b"}),
+        ]
+        for left, right in cases:
+            self.assertAlmostEqual(
+                server._jaccard_similarity_fallback(left, right),
+                float(agent_salience.jaccard_similarity(left, right)),
+                places=8,
+            )
+
+
+class RecordDuplicateSignatureTests(MnemoTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["MNEMO_STORE"] = "sqlite"
+        sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def test_content_hash_duplicate_rejected(self) -> None:
+        text = "deploy with zero downtime using blue green strategy"
+        self.record(text, kind="decision")
+        result = server.record_memory({"text": text, "kind": "decision"})
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertFalse(sc.get("recorded", True) if "recorded" in sc else False or sc.get("duplicate", False))
+        # The second record call must not create a new memory
+        store = server.load_store()
+        matching = [m for m in store["memories"] if m["text"] == text and not m.get("deleted_at")]
+        self.assertEqual(len(matching), 1)
+
+    def test_same_text_different_kind_allowed(self) -> None:
+        text = "deploy with zero downtime using blue green strategy"
+        self.record(text, kind="decision")
+        result = server.record_memory({"text": text, "kind": "note"})
+        self.assertFalse(result["isError"], result)
+        store = server.load_store()
+        matching = [m for m in store["memories"] if m["text"] == text and not m.get("deleted_at")]
+        self.assertEqual(len(matching), 2)
+
+    def test_signature_fields_stored_in_sqlite(self) -> None:
+        memory = self.record("all signature fields should be stored in sqlite columns", kind="note")
+        sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        conn = sqlite3.connect(str(sqlite_file))
+        try:
+            row = conn.execute(
+                "SELECT content_hash, normalized_hash, shingle_hashes_json, signature_version FROM memories WHERE id=?",
+                (memory["id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row[0])  # content_hash
+        self.assertIsNotNone(row[1])  # normalized_hash
+        self.assertIsNotNone(row[2])  # shingle_hashes_json
+        self.assertIsNotNone(row[3])  # signature_version
+
+
+class BackfillSignaturesTests(MnemoTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _insert_row_without_signature(self, memory_id: str, text: str) -> None:
+        """Insert a row into SQLite manually, leaving all signature columns NULL."""
+        server.load_store()  # ensure schema
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO memories
+                   (id, kind, text, source, tags_json, created_at, deleted)
+                   VALUES (?, 'note', ?, 'test', '[]', '2026-01-01T00:00:00Z', 0)""",
+                (memory_id, text),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_backfill_dry_run_counts_missing(self) -> None:
+        self._insert_row_without_signature("nosig-1", "backfill test text for counting purposes")
+        self._insert_row_without_signature("nosig-2", "another backfill test text for counting purposes")
+        result = server.memory_maintenance({"action": "backfill_signatures", "dry_run": True})
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertTrue(sc["dry_run"])
+        self.assertGreaterEqual(sc["count_missing"], 2)
+
+    def test_backfill_non_dry_run_updates_signatures(self) -> None:
+        self._insert_row_without_signature("nosig-3", "backfill updates signatures for old rows in database")
+        result = server.memory_maintenance({"action": "backfill_signatures", "dry_run": False})
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertFalse(sc["dry_run"])
+        self.assertGreaterEqual(sc["updated_count"], 1)
+        # Verify the column was written
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute("SELECT content_hash FROM memories WHERE id='nosig-3'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row[0])
+
+    def test_backfill_doctor_warning_clears_after_backfill(self) -> None:
+        # Insert enough unsigned rows to exceed 10% threshold
+        for i in range(12):
+            self._insert_row_without_signature(f"nosig-warn-{i}", f"backfill warning test text entry {i} with enough tokens")
+        doctor_before = server.mnemo_doctor({})
+        warnings_before = doctor_before["structuredContent"].get("warnings", [])
+        self.assertTrue(any("signatures_outdated" in w for w in warnings_before))
+        server.memory_maintenance({"action": "backfill_signatures", "dry_run": False})
+        doctor_after = server.mnemo_doctor({})
+        warnings_after = doctor_after["structuredContent"].get("warnings", [])
+        self.assertFalse(any("signatures_outdated" in w for w in warnings_after))
+
+    def test_backfill_json_mode_returns_error(self) -> None:
+        os.environ["MNEMO_STORE"] = "json"
+        result = server.memory_maintenance({"action": "backfill_signatures", "dry_run": True})
+        self.assertTrue(result["isError"])
+
+    def test_import_json_computes_signatures_for_imported_memories(self) -> None:
+        import_path = self.root / "imports" / "legacy.json"
+        import_path.parent.mkdir(parents=True, exist_ok=True)
+        import_path.write_text(
+            json.dumps({
+                "version": 1,
+                "memories": [{
+                    "id": "imported-sig-test",
+                    "kind": "note",
+                    "text": "imported memory should get signature columns populated on import",
+                    "source": "import",
+                    "tags": [],
+                    "created_at": "2026-01-01T00:00:00Z",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        result = server.memory_maintenance({"action": "import_json", "path": str(import_path), "dry_run": False})
+        self.assertFalse(result["isError"], result)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                "SELECT content_hash, signature_version FROM memories WHERE id='imported-sig-test'",
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(row[0])
+
+
+class ConsolidationV12Tests(MnemoTestCase):
+    def _make_near_dup_pair(self) -> tuple[dict, dict]:
+        m_old = server.new_memory(
+            "v12-old", "decision",
+            "use auth middleware before handling route requests securely in production",
+            "", [],
+        )
+        m_old["created_at"] = "2026-01-01T00:00:00Z"
+        m_new = server.new_memory(
+            "v12-new", "decision",
+            "use auth middleware before handling route requests now in production",
+            "", [],
+        )
+        m_new["created_at"] = "2026-01-02T00:00:00Z"
+        return m_old, m_new
+
+    def test_consolidate_full_requires_confirmation(self) -> None:
+        m_old, m_new = self._make_near_dup_pair()
+        self.write_store([m_old, m_new])
+        result = server.memory_maintenance({"action": "consolidate_full"})
+        self.assertTrue(result["isError"])
+        sc = result["structuredContent"]
+        self.assertEqual(sc["error"], "full_scan_confirmation_required")
+        self.assertIn("estimated_pair_count", sc)
+
+    def test_consolidate_full_dry_run_returns_pair_count(self) -> None:
+        m_old, m_new = self._make_near_dup_pair()
+        self.write_store([m_old, m_new])
+        result = server.memory_maintenance({
+            "action": "consolidate_full",
+            "confirm_full_scan": True,
+            "dry_run": True,
+        })
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertTrue(sc["dry_run"])
+        self.assertIn("estimated_pair_count", sc)
+        self.assertEqual(sc["estimated_pair_count"], 1)  # n=2 → n*(n-1)/2 = 1
+
+    def test_consolidate_full_apply_finds_duplicate(self) -> None:
+        m_old, m_new = self._make_near_dup_pair()
+        self.write_store([m_old, m_new])
+        result = server.memory_maintenance({
+            "action": "consolidate_full",
+            "confirm_full_scan": True,
+            "dry_run": False,
+        })
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertFalse(sc["dry_run"])
+        self.assertGreaterEqual(sc["clusters_found"], 1)
+
+    def test_consolidate_reports_similarity_calls(self) -> None:
+        m_old, m_new = self._make_near_dup_pair()
+        self.write_store([m_old, m_new])
+        result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertIn("similarity_calls", sc)
+        self.assertIn("candidates_examined", sc)
+
+    def test_consolidate_tiny_text_skipped(self) -> None:
+        # Two different single-word texts → no shingles (< 3 tokens), no near-dup clusters
+        m1 = server.new_memory("tiny-1", "decision", "yes", "", [])
+        m2 = server.new_memory("tiny-2", "decision", "no", "", [])
+        self.write_store([m1, m2])
+        result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
+        self.assertFalse(result["isError"], result)
+        # No exact-hash cluster (texts differ) and shingle path skipped (< 3 tokens)
+        near_dup = [c for c in result["structuredContent"]["clusters"] if c.get("duplicate_type") != "content_hash"]
+        self.assertEqual(near_dup, [])
+
+    def test_consolidate_exact_content_hash_detected(self) -> None:
+        # Exact same text → content_hash duplicate should be found
+        text = "auth middleware before route handler for security checks token verification"
+        m1 = server.new_memory("exact-1", "decision", text, "", [])
+        m1["created_at"] = "2026-01-01T00:00:00Z"
+        m2 = server.new_memory("exact-2", "decision", text, "", [])
+        m2["created_at"] = "2026-01-02T00:00:00Z"
+        self.write_store([m1, m2])
+        result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
+        self.assertFalse(result["isError"], result)
+        clusters = result["structuredContent"]["clusters"]
+        self.assertGreater(len(clusters), 0)
+        exact = [c for c in clusters if c.get("duplicate_type") == "content_hash"]
+        self.assertGreater(len(exact), 0)
+
+
+class MigrationV12Tests(MnemoTestCase):
+    """Tests that a pre-v0.12.0 SQLite database (no signature columns) loads cleanly."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        self.sqlite_file.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _create_v11_schema(self) -> None:
+        """Create a SQLite file with v0.11.0 full schema (no v0.12.0 signature columns)."""
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    title TEXT,
+                    preview TEXT,
+                    source TEXT,
+                    tags_json TEXT,
+                    linked_ids_json TEXT,
+                    agent_id TEXT,
+                    role TEXT,
+                    scope TEXT,
+                    domain TEXT,
+                    authority TEXT,
+                    retention TEXT,
+                    confidence TEXT,
+                    parent_id TEXT,
+                    source_run_id TEXT,
+                    metadata_json TEXT,
+                    pinned INTEGER DEFAULT 0,
+                    deleted INTEGER DEFAULT 0,
+                    superseded_by TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    token_estimate INTEGER,
+                    content_hash TEXT
+                )
+            """)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS links (
+                    source_id TEXT, target_id TEXT, relation TEXT, created_at TEXT,
+                    PRIMARY KEY (source_id, target_id, relation)
+                );
+                CREATE TABLE IF NOT EXISTS events (
+                    id TEXT PRIMARY KEY, memory_id TEXT, event_type TEXT,
+                    data_json TEXT, created_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+            """)
+            conn.execute(
+                "INSERT INTO memories (id, kind, text, source, tags_json, created_at, deleted) "
+                "VALUES ('legacy-v11', 'note', 'legacy memory from v11 schema without signatures', 'test', '[]', "
+                "'2026-01-01T00:00:00Z', 0)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_v11_sqlite_fixture_loads_cleanly(self) -> None:
+        self._create_v11_schema()
+        # load_store should migrate schema without error
+        store = server.load_store()
+        self.assertIsInstance(store, dict)
+        ids = [m["id"] for m in store.get("memories", [])]
+        self.assertIn("legacy-v11", ids)
+
+    def test_v11_sqlite_record_after_migration(self) -> None:
+        self._create_v11_schema()
+        server.load_store()
+        memory = self.record("new memory written after migration adds signature columns", kind="note")
+        self.assertIsNotNone(memory["id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        finally:
+            conn.close()
+        # All signature columns should now exist
+        for col in ("normalized_hash", "token_count", "shingle_hashes_json", "signature_version"):
+            self.assertIn(col, cols)
+
+    def test_v11_sqlite_backfill_fills_legacy_row(self) -> None:
+        self._create_v11_schema()
+        server.load_store()
+        result = server.memory_maintenance({"action": "backfill_signatures", "dry_run": False})
+        self.assertFalse(result["isError"], result)
+        sc = result["structuredContent"]
+        self.assertGreaterEqual(sc["updated_count"], 1)
+
+
+class MaintenanceActionEnumTests(MnemoTestCase):
+    """Phase K / schema audit: verify the action enum in mnemo_maintenance is complete."""
+
+    def _get_maintenance_schema(self) -> dict:
+        captured: list[dict] = []
+
+        def capture(message: dict) -> None:
+            captured.append(message)
+
+        with mock.patch("server.send", side_effect=capture):
+            server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        tools = captured[-1]["result"]["tools"]
+        for tool in tools:
+            if tool["name"] == "mnemo":
+                return tool["inputSchema"]
+        return {}
+
+    def test_gateway_tool_exists_in_tools_list(self) -> None:
+        captured: list[dict] = []
+
+        def capture(message: dict) -> None:
+            captured.append(message)
+
+        with mock.patch("server.send", side_effect=capture):
+            server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        tools = captured[-1]["result"]["tools"]
+        names = [t["name"] for t in tools]
+        self.assertIn("mnemo", names)
+
+    def test_maintenance_actions_documented_in_tools_description(self) -> None:
+        captured: list[dict] = []
+
+        def capture(message: dict) -> None:
+            captured.append(message)
+
+        with mock.patch("server.send", side_effect=capture):
+            server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        tools = captured[-1]["result"]["tools"]
+        mnemo_tool = next((t for t in tools if t["name"] == "mnemo"), None)
+        self.assertIsNotNone(mnemo_tool)
+        description = str(mnemo_tool.get("description", ""))
+        # All five maintenance actions must be documented
+        for action in ("compact_logs", "consolidate", "consolidate_full", "import_json", "backfill_signatures"):
+            self.assertIn(action, description, f"action '{action}' missing from tool description")
+
+    def test_valid_maintenance_actions_accepted(self) -> None:
+        for action in ("compact_logs", "consolidate", "consolidate_full", "import_json", "backfill_signatures"):
+            # compact_logs and consolidate/consolidate_full should not return "action must be one of"
+            if action == "import_json":
+                # Needs a path arg; will error on missing path, not on invalid action
+                result = server.memory_maintenance({"action": action, "dry_run": True})
+                error_text = result["content"][0]["text"] if result.get("isError") else ""
+                self.assertNotIn("action must be one of", error_text)
+            elif action == "backfill_signatures":
+                # SQLite required — in JSON mode returns backend error, not action error
+                result = server.memory_maintenance({"action": action, "dry_run": True})
+                error_text = result["content"][0]["text"] if result.get("isError") else ""
+                self.assertNotIn("action must be one of", error_text)
+            else:
+                result = server.memory_maintenance({"action": action, "dry_run": True})
+                error_text = result["content"][0]["text"] if result.get("isError") else ""
+                self.assertNotIn("action must be one of", error_text)
+
+    def test_unknown_maintenance_action_rejected(self) -> None:
+        result = server.memory_maintenance({"action": "nonexistent_action_xyz"})
+        self.assertTrue(result["isError"])
+        self.assertIn("action must be one of", result["content"][0]["text"])
+
+
+class SmallBenchmarkTests(MnemoTestCase):
+    """In-process benchmark: 2000 memories, consolidate dry_run must finish in < 30s."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _insert_batch(self, count: int) -> None:
+        """Insert memories directly via SQLite for speed."""
+        server.load_store()  # ensure schema
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            rows = []
+            for i in range(count):
+                text = f"memory entry {i} discussing topic area {i % 50} with related subtopic {i % 10}"
+                sig = server._build_memory_signature(text)
+                rows.append((
+                    f"bench-{i}", "note", text, "bench", "[]",
+                    f"2026-01-{(i % 28) + 1:02d}T00:00:00Z",
+                    sig["content_hash"], sig["normalized_hash"],
+                    sig["token_count"], sig["unique_token_count"],
+                    sig["top_terms_json"], sig["shingle_hashes_json"],
+                    sig["signature_version"], sig["normalizer_version"],
+                    sig["signature_updated_at"],
+                ))
+            conn.executemany(
+                """INSERT OR IGNORE INTO memories
+                   (id, kind, text, source, tags_json, created_at,
+                    content_hash, normalized_hash, token_count, unique_token_count,
+                    top_terms_json, shingle_hashes_json, signature_version, normalizer_version,
+                    signature_updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_consolidate_2000_memories_dry_run_under_30s(self) -> None:
+        self._insert_batch(2000)
+        start = time.monotonic()
+        result = server.memory_maintenance({"action": "consolidate", "dry_run": True})
+        elapsed = time.monotonic() - start
+        self.assertFalse(result["isError"], result)
+        self.assertLess(elapsed, 30.0, f"consolidate dry_run took {elapsed:.1f}s on 2000 memories (limit 30s)")
+
+    def test_backfill_2000_memories_without_signatures_under_30s(self) -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            rows = [
+                (f"nobench-{i}", "note",
+                 f"backfill bench entry {i} with topic area {i % 50} and subtopic {i % 10}",
+                 "bench", "[]", f"2026-01-{(i % 28) + 1:02d}T00:00:00Z")
+                for i in range(2000)
+            ]
+            conn.executemany(
+                "INSERT OR IGNORE INTO memories (id, kind, text, source, tags_json, created_at) VALUES (?,?,?,?,?,?)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        start = time.monotonic()
+        result = server.memory_maintenance({"action": "backfill_signatures", "dry_run": False})
+        elapsed = time.monotonic() - start
+        self.assertFalse(result["isError"], result)
+        self.assertLess(elapsed, 30.0, f"backfill took {elapsed:.1f}s on 2000 memories (limit 30s)")
+        self.assertGreaterEqual(result["structuredContent"]["updated_count"], 2000)
 
 
 if __name__ == "__main__":

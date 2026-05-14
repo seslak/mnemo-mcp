@@ -1,49 +1,28 @@
 # Mnemo Tool Reference
 
-Mnemo exposes one public MCP tool:
+Mnemo exposes one public MCP gateway tool:
 
 ```text
 mnemo
 ```
 
-All operations are selected with an `action` string and optional `params` object.
+Every call uses this shape:
 
 ```json
 {"action":"search","params":{"query":"release checklist"}}
 ```
 
-The single gateway tool keeps the MCP surface small for Copilot-style clients while preserving the full Mnemo feature set.
-
-## Gateway input
-
-```json
-{
-  "action": "record",
-  "params": {
-    "kind": "decision",
-    "text": "Run tests before publishing."
-  }
-}
-```
-
-- `action` is required.
-- `params` is optional and defaults to an empty object.
-- Unknown actions return a structured error with `available_actions`.
+`action` is required. `params` is optional and defaults to an empty object.
 
 ## Actions
 
 ### `doctor`
 
-Returns server, storage, schema, and health diagnostics.
+Returns server, storage, schema, FTS, signature, export, and salience diagnostics.
 
-Useful for checking:
-
-- Mnemo version
-- SQLite/json backend
-- memory count
-- database/file paths
-- available actions
-- gateway status
+```json
+{"action":"doctor"}
+```
 
 ### `record`
 
@@ -69,168 +48,212 @@ Common params:
 - `source_run_id`
 - `metadata`
 
-Examples:
+Example:
 
 ```json
 {"action":"record","params":{"kind":"decision","text":"Use SQLite as the default Mnemo store."}}
 ```
 
-```json
-{"action":"record","params":{"kind":"hippocampus_entry","text":"Mnemo stores hippocampus entries in the same SQLite database as other memories.","domain":"mnemo/storage","authority":"high"}}
-```
+Record-time duplicate behavior:
+
+1. exact `content_hash` duplicate short-circuits
+2. exact `normalized_hash` duplicate short-circuits
+3. shingle-overlap survivors get full salience/fallback scoring
+4. no automatic delete/merge occurs
 
 ### `search`
 
 Searches project memories relevant to a query.
 
-Common params:
-
-- `query`
-- `kind`
-- `limit`
-- `role`
-- `agent_id`
-- `domain`
-- `scope`
-- `authority`
-- `retention`
-- `source_run_id`
-- `include_deleted`
-- `include_superseded`
-- `max_tokens`
+```json
+{"action":"search","params":{"query":"SQLite signature backfill","limit":5}}
+```
 
 ### `recall`
 
 Returns bounded startup or agent-context bundles.
 
-Common params:
+```json
+{"action":"recall","params":{"mode":"startup","role":"coordinator","recent_logs":20}}
+```
 
-- `mode`: `startup` or `agent`
-- `query`
-- `task`
-- `agent_id`
-- `role`
-- `domain`
-- `recent_logs`
-- `max_blocks`
-- `max_hippocampus`
-- `max_feedback`
-- `max_context_blocks`
+```json
+{"action":"recall","params":{"mode":"agent","agent_id":"spec_auth","domain":"auth","task":"review middleware"}}
+```
 
 ### `get`
 
 Retrieves one memory by id.
 
-Common params:
-
-- `id`
-- `full`: true to return the complete memory text
+```json
+{"action":"get","params":{"id":"mem_123","full":true}}
+```
 
 ### `link`
 
-Links two memory records.
+Links one memory to another.
 
-Common params:
-
-- `source_id`
-- `target_id`
-- `relation`
-- `bidirectional`
+```json
+{"action":"link","params":{"source_id":"mem_a","target_id":"mem_b","relation":"expands","bidirectional":true}}
+```
 
 ### `export`
 
 Exports memories to local readable files.
 
-Common params:
+Formats include:
 
-- `format`: `jsonl`, `json`, `markdown`, `hippocampus_markdown`, `agent_feedback_markdown`, or `startup_context_markdown`
-- `path`
-- `kind`
-- `domain`
-- `agent_id`
-- `role`
-- `include_deleted`
-- `max_records`
+- `jsonl`
+- `json`
+- `markdown`
+- `hippocampus_markdown`
+- `agent_feedback_markdown`
+- `startup_context_markdown`
+
+```json
+{"action":"export","params":{"format":"jsonl"}}
+```
 
 Default exports go under `state/mnemo/exports/`.
 
 ### `compact_context`
 
-Builds a prompt-ready compact context block for a query.
+Builds a prompt-ready context block grouped by memory kind.
 
-Common params:
-
-- `query`
-- `limit`
-- `phase`
-- `max_tokens`
-
-### `lookup_symbol`
-
-Finds likely definition locations for a symbol under `MNEMO_WORKSPACE_ROOT`.
-
-Common params:
-
-- `name`
-- `limit`
-- `case_sensitive`
+```json
+{"action":"compact_context","params":{"query":"auth middleware changes","limit":8,"max_tokens":2000}}
+```
 
 ### `salience_check`
 
-Optional deterministic salience diagnostics when Agent Salience is available.
+Runs optional Agent Salience diagnostics when `agent-salience` is importable.
 
-Common params:
+```json
+{"action":"salience_check","params":{"text":"auth middleware decisions","candidate_limit":500,"max_scored":100}}
+```
 
-- `text`
-- `limit`
-- `threshold`
-
-### `update`
-
-Updates an existing memory by id.
-
-### `delete`
-
-Soft-deletes an existing memory by id.
-
-### `recent`
-
-Returns recent project memories.
-
-### `inspect`
-
-Inspects memory history or related records.
-
-Common params:
-
-- `mode`: `history` or `related`
-- `id`
-- `depth`
-- `limit`
+The action is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, then scores bounded survivors.
 
 ### `maintenance`
 
-Runs maintenance actions.
+Runs maintenance sub-actions.
 
-Common actions include:
+#### `compact_logs`
 
-- `compact_logs`
-- `import_json`
-
-Params are action-specific.
-
-## Storage
-
-SQLite is the default backend as of 0.10.0.
-
-Default SQLite path:
-
-```text
-state/mnemo/mnemo.sqlite
+```json
+{"action":"maintenance","params":{"action":"compact_logs","older_than_count":20,"max_logs":50,"dry_run":true}}
 ```
 
-`memory.json` remains a compatibility/import/export format.
+#### `consolidate`
+
+Candidate-based consolidation. This is the default safe path.
+
+```json
+{"action":"maintenance","params":{"action":"consolidate","dry_run":true,"max_candidates_per_memory":100}}
+```
+
+Default consolidation checks exact hashes globally, then uses bounded candidate retrieval and shingle overlap before full similarity.
+
+#### `consolidate_full`
+
+Explicit O(n²) full scan. Requires confirmation.
+
+```json
+{"action":"maintenance","params":{"action":"consolidate_full","confirm_full_scan":true,"dry_run":true}}
+```
+
+Without `confirm_full_scan:true`, this returns `full_scan_confirmation_required` with an estimated pair count.
+
+#### `backfill_signatures`
+
+Backfills missing or outdated v0.12.0 signatures.
+
+```json
+{"action":"maintenance","params":{"action":"backfill_signatures","dry_run":true}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"backfill_signatures","dry_run":false}}
+```
+
+`doctor` warns when more than 10% of active records are unsigned/outdated.
+
+#### `import_json`
+
+Imports JSON memories and computes signatures during import.
+
+```json
+{"action":"maintenance","params":{"action":"import_json","path":"state/mnemo/memory.json","dry_run":true}}
+```
+
+### Top-level maintenance aliases
+
+For schema discoverability, these are also accepted as top-level gateway actions:
+
+```json
+{"action":"backfill_signatures","params":{"dry_run":false}}
+```
+
+```json
+{"action":"consolidate_full","params":{"confirm_full_scan":true,"dry_run":true}}
+```
+
+### `inspect`
+
+Reads lifecycle history and/or related-memory graph.
+
+```json
+{"action":"inspect","params":{"id":"mem_123","mode":"both","include_archive":true}}
+```
+
+### `recent`
+
+Returns the most recently recorded memories.
+
+```json
+{"action":"recent","params":{"limit":10}}
+```
+
+### `update`
+
+Updates fields on an existing memory.
+
+```json
+{"action":"update","params":{"id":"mem_123","tags":["release"]}}
+```
+
+### `delete`
+
+Soft-deletes an existing memory.
+
+```json
+{"action":"delete","params":{"id":"mem_123","reason":"obsolete"}}
+```
+
+### `lookup_symbol`
+
+Finds likely source definition locations under `MNEMO_WORKSPACE_ROOT`.
+
+```json
+{"action":"lookup_symbol","params":{"name":"authenticate","limit":10}}
+```
+
+## Signature fields
+
+SQLite rows include deterministic signatures:
+
+- `content_hash`
+- `normalized_hash`
+- `token_count`
+- `unique_token_count`
+- `top_terms_json`
+- `shingle_hashes_json`
+- `signature_version`
+- `normalizer_version`
+- `signature_updated_at`
+
+`content_hash` uses full raw text after stable line-ending normalization. Token-based signatures are capped at 50,000 characters.
 
 ## Schema compatibility
 
-Mnemo exports a conservative MCP input schema for Copilot-style clients. Validation, defaults, and bounds are enforced inside Python handlers rather than relying on advanced JSON Schema keywords.
+Mnemo exports a conservative MCP schema for Copilot-style clients. Advanced JSON Schema features are intentionally avoided; handlers enforce ranges, defaults, and validation.

@@ -48,11 +48,17 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.11.0"
+SERVER_VERSION = "0.12.0"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
 TOKEN_CHARS_PER_TOKEN = 3.7
+NORMALIZER_VERSION = 1
+SIGNATURE_VERSION = 1
+DEFAULT_MAX_SIGNATURE_SHINGLES = 256
+DEFAULT_SHINGLE_SIZE = 3
+DEFAULT_TOP_TERMS = 32
+MAX_SIGNATURE_TEXT_CHARS = 50_000
 MEMORY_KINDS = (
     "decision",
     "invariant",
@@ -508,12 +514,117 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def jaccard(a: set[str], b: set[str]) -> float:
-    if not a and not b:
-        return 1.0
+# Fallback mirrors Agent Salience semantics when agent-salience is unavailable.
+# Do not change this independently from Agent Salience behavior.
+def _jaccard_similarity_fallback(a: set[str], b: set[str]) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    """Compatibility alias for _jaccard_similarity_fallback."""
+    return _jaccard_similarity_fallback(a, b)
+
+
+def _normalize_for_signature(text: str) -> list[str]:
+    """Normalize text to a token list for signature purposes. Caps at MAX_SIGNATURE_TEXT_CHARS."""
+    capped = text[:MAX_SIGNATURE_TEXT_CHARS]
+    tokens: list[str] = []
+    for match in TOKEN_RE.finditer(capped.lower()):
+        raw = match.group(0)
+        tokens.extend(token_variants(raw))
+    return tokens
+
+
+def _stable_hash_hex(value: str) -> str:
+    """Deterministic blake2b hex hash. Never uses Python's built-in hash()."""
+    return hashlib.blake2b(value.encode("utf-8"), digest_size=8).hexdigest()
+
+
+def _build_word_shingles(tokens: list[str], n: int = DEFAULT_SHINGLE_SIZE) -> list[str]:
+    """Build word n-gram shingles. Returns [] if fewer than n tokens (tiny texts have no shingle signature)."""
+    if len(tokens) < n:
+        return []
+    return [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+
+
+def _build_min_k_shingle_hashes(tokens: list[str], k: int = DEFAULT_MAX_SIGNATURE_SHINGLES) -> list[str]:
+    """Compute deterministic blake2b hashes for all shingles, return the k smallest sorted ascending."""
+    shingles = _build_word_shingles(tokens)
+    if not shingles:
+        return []
+    hashes = [_stable_hash_hex(s) for s in shingles]
+    hashes.sort()
+    return hashes[:k]
+
+
+def _build_top_terms(tokens: list[str], k: int = DEFAULT_TOP_TERMS) -> list[str]:
+    """Return the top k tokens by descending frequency, alpha tiebreak. All unique tokens if fewer than k."""
+    if not tokens:
+        return []
+    freq: dict[str, int] = {}
+    for t in tokens:
+        freq[t] = freq.get(t, 0) + 1
+    sorted_terms = sorted(freq.keys(), key=lambda t: (-freq[t], t))
+    return sorted_terms[:k]
+
+
+def _normalize_raw_text_for_content_hash(text: str) -> str:
+    """Normalize raw text for exact content hashing without truncating content."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in normalized.split("\n"))
+
+
+def _build_memory_signature(text: str) -> dict[str, Any]:
+    """Compute all signature fields for a memory text.
+
+    content_hash covers the full raw text after stable line-ending normalization.
+    Normalized-token signatures are capped at MAX_SIGNATURE_TEXT_CHARS to avoid
+    runaway tokenization on pasted logs or dumps. Raw text storage is unaffected.
+    """
+    content_hash = _stable_hash_hex(_normalize_raw_text_for_content_hash(text))
+    tokens = _normalize_for_signature(text)
+    unique_tokens = list(dict.fromkeys(tokens))
+    normalized_hash = _stable_hash_hex(" ".join(tokens))
+    top_terms = _build_top_terms(tokens)
+    shingle_hashes = _build_min_k_shingle_hashes(tokens)
+    return {
+        "content_hash": content_hash,
+        "normalized_hash": normalized_hash,
+        "token_count": len(tokens),
+        "unique_token_count": len(unique_tokens),
+        "top_terms_json": json.dumps(top_terms, ensure_ascii=False),
+        "shingle_hashes_json": json.dumps(shingle_hashes, ensure_ascii=False),
+        "signature_version": SIGNATURE_VERSION,
+        "normalizer_version": NORMALIZER_VERSION,
+        "signature_updated_at": now_iso(),
+    }
+
+
+def _signature_overlap(sig_a: list[str], sig_b: list[str]) -> float:
+    """Jaccard overlap between two sorted min-K shingle hash lists. 0.0 if either is empty.
+
+    Uses a linear merge on sorted input — faster than set operations for the hot
+    consolidation candidate loop.
+    """
+    if not sig_a or not sig_b:
+        return 0.0
+    intersection = 0
+    i = j = 0
+    la, lb = len(sig_a), len(sig_b)
+    while i < la and j < lb:
+        a, b = sig_a[i], sig_b[j]
+        if a == b:
+            intersection += 1
+            i += 1
+            j += 1
+        elif a < b:
+            i += 1
+        else:
+            j += 1
+    union = la + lb - intersection
+    return intersection / union if union > 0 else 0.0
 
 
 def validate_kind(kind: str) -> str:
@@ -950,6 +1061,21 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
     ):
         conn.execute(statement)
+    # Idempotent column migrations for v0.12.0 signature columns
+    _v12_signature_columns = [
+        ("normalized_hash", "TEXT"),
+        ("token_count", "INTEGER"),
+        ("unique_token_count", "INTEGER"),
+        ("top_terms_json", "TEXT"),
+        ("shingle_hashes_json", "TEXT"),
+        ("signature_version", "INTEGER"),
+        ("normalizer_version", "INTEGER"),
+        ("signature_updated_at", "TEXT"),
+    ]
+    _existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for _col_name, _col_type in _v12_signature_columns:
+        if _col_name not in _existing_cols:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
     _sqlite_set_meta(conn, "schema_version", "1")
     if _sqlite_get_meta(conn, "created_at") is None:
         _sqlite_set_meta(conn, "created_at", now_iso())
@@ -1006,9 +1132,17 @@ def _memory_to_sqlite_row(memory: dict[str, Any]) -> dict[str, Any]:
         "created_at": str(migrated.get("created_at") or now_iso()),
         "updated_at": normalize_optional_string(migrated.get("updated_at")),
         "token_estimate": int(estimate_tokens(text_value)),
-        "content_hash": memory_content_hash(migrated),
         "deletion_reason": normalize_optional_string(migrated.get("deletion_reason")),
+        **_build_memory_signature(text_value),
     }
+
+
+def _safe_row_get(row: sqlite3.Row, col: str) -> Any:
+    """Access a sqlite3.Row column by name, returning None if the column doesn't exist."""
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return None
 
 
 def _sqlite_row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
@@ -1044,6 +1178,15 @@ def _sqlite_row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
         "deleted_at": deleted_at,
         "deletion_reason": deletion_reason,
         "superseded_by": row["superseded_by"],
+        "content_hash": _safe_row_get(row, "content_hash"),
+        "normalized_hash": _safe_row_get(row, "normalized_hash"),
+        "token_count": _safe_row_get(row, "token_count"),
+        "unique_token_count": _safe_row_get(row, "unique_token_count"),
+        "top_terms_json": _safe_row_get(row, "top_terms_json"),
+        "shingle_hashes_json": _safe_row_get(row, "shingle_hashes_json"),
+        "signature_version": _safe_row_get(row, "signature_version"),
+        "normalizer_version": _safe_row_get(row, "normalizer_version"),
+        "signature_updated_at": _safe_row_get(row, "signature_updated_at"),
     }
     return migrate_memory(memory)
 
@@ -1107,12 +1250,18 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
             id, kind, text, title, preview, source, tags_json, linked_ids_json,
             agent_id, role, scope, domain, authority, retention, confidence,
             parent_id, source_run_id, metadata_json, pinned, deleted, superseded_by,
-            created_at, updated_at, token_estimate, content_hash
+            created_at, updated_at, token_estimate, content_hash,
+            normalized_hash, token_count, unique_token_count,
+            top_terms_json, shingle_hashes_json,
+            signature_version, normalizer_version, signature_updated_at
         ) VALUES(
             :id, :kind, :text, :title, :preview, :source, :tags_json, :linked_ids_json,
             :agent_id, :role, :scope, :domain, :authority, :retention, :confidence,
             :parent_id, :source_run_id, :metadata_json, :pinned, :deleted, :superseded_by,
-            :created_at, :updated_at, :token_estimate, :content_hash
+            :created_at, :updated_at, :token_estimate, :content_hash,
+            :normalized_hash, :token_count, :unique_token_count,
+            :top_terms_json, :shingle_hashes_json,
+            :signature_version, :normalizer_version, :signature_updated_at
         )
         ON CONFLICT(id) DO UPDATE SET
             kind=excluded.kind,
@@ -1138,7 +1287,15 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
             created_at=excluded.created_at,
             updated_at=excluded.updated_at,
             token_estimate=excluded.token_estimate,
-            content_hash=excluded.content_hash
+            content_hash=excluded.content_hash,
+            normalized_hash=excluded.normalized_hash,
+            token_count=excluded.token_count,
+            unique_token_count=excluded.unique_token_count,
+            top_terms_json=excluded.top_terms_json,
+            shingle_hashes_json=excluded.shingle_hashes_json,
+            signature_version=excluded.signature_version,
+            normalizer_version=excluded.normalizer_version,
+            signature_updated_at=excluded.signature_updated_at
         """,
         row,
     )
@@ -1851,6 +2008,74 @@ def _sqlite_fts_candidate_memories(
         return []
 
 
+
+
+def _load_json_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed if str(item)]
+    return []
+
+
+def _memory_top_terms(memory: dict[str, Any], max_terms: int = DEFAULT_TOP_TERMS) -> list[str]:
+    terms = _load_json_string_list(memory.get("top_terms_json"))
+    if terms:
+        return terms[:max_terms]
+    return _build_top_terms(_normalize_for_signature(str(memory.get("text", ""))), max_terms)
+
+
+def _metadata_compatible_for_duplicate(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    if str(a.get("kind", "")) != str(b.get("kind", "")):
+        return False
+    for field in ("domain", "role", "agent_id"):
+        av = normalize_optional_string(a.get(field))
+        bv = normalize_optional_string(b.get(field))
+        if av is not None and bv is not None and av != bv:
+            return False
+    return True
+
+
+def _sqlite_fts_candidate_ids_for_memory(memory: dict[str, Any], *, limit: int, exclude_pinned: bool = True) -> list[str]:
+    terms = _memory_top_terms(memory)
+    match_expression = _sqlite_fts_match_expression(set(terms))
+    if not match_expression:
+        return []
+    clauses = ["memories_fts MATCH ?", "m.deleted = 0", "(m.superseded_by IS NULL OR m.superseded_by = '')", "m.id <> ?"]
+    params: list[Any] = [match_expression, str(memory.get("id", ""))]
+    kind = normalize_optional_string(memory.get("kind"))
+    if kind is not None:
+        clauses.append("m.kind = ?")
+        params.append(kind)
+    if exclude_pinned:
+        clauses.append("m.pinned = 0")
+    sql = (
+        "SELECT m.id "
+        "FROM memories_fts "
+        "JOIN memories m ON m.id = memories_fts.id "
+        f"WHERE {' AND '.join(clauses)} "
+        "ORDER BY bm25(memories_fts), COALESCE(m.updated_at, m.created_at) DESC, m.id DESC "
+        "LIMIT ?"
+    )
+    params.append(max(1, int(limit)))
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            if not _sqlite_has_fts_table(conn) and not _sqlite_fts_available(conn):
+                return []
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            return [str(row["id"]) for row in rows]
+    except Exception:
+        return []
+
 def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str, Any]]:
     query = str(args.get("query", "")).strip()
     include_deleted = parse_bool(args.get("include_deleted"), default=False)
@@ -2259,6 +2484,11 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         raw_threshold = args.get("threshold")
         threshold = 0.70 if raw_threshold is None else float(raw_threshold)
         threshold = max(0.0, min(1.0, threshold))
+        candidate_limit = max(1, min(int(args.get("candidate_limit") or 500), 5000))
+        max_scored = max(1, min(int(args.get("max_scored") or 100), candidate_limit))
+        min_token_count = max(1, int(args.get("min_token_count") or 5))
+        use_fts = parse_bool(args.get("use_fts"), default=True)
+        shingle_overlap_threshold = max(0.0, min(1.0, float(args.get("shingle_overlap_threshold") or 0.30)))
     except Exception as exc:
         return tool_error(str(exc))
 
@@ -2266,14 +2496,74 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     if salience is None:
         return salience_unavailable_result(reason)
 
-    store = load_store()
-    candidates = [
-        memory
-        for memory in store.get("memories", [])
-        if visible_memory(memory, include_deleted, include_superseded)
-    ]
+    input_sig = _build_memory_signature(text)
+    input_shingles = _load_json_string_list(input_sig.get("shingle_hashes_json"))
+    input_token_count = int(input_sig.get("token_count") or 0)
+
+    candidate_source = "fallback"
+    fts_used = False
+    fts_available = _sqlite_fts_flag() if store_backend() == "sqlite" else False
+    candidates: list[dict[str, Any]] = []
+
+    if store_backend() == "sqlite" and use_fts and fts_available:
+        fts_query = " ".join(_load_json_string_list(input_sig.get("top_terms_json")))
+        candidates = _sqlite_fts_candidate_memories(
+            args,
+            fts_query,
+            include_deleted=include_deleted,
+            include_superseded=include_superseded,
+            limit=candidate_limit,
+        )[:candidate_limit]
+        if candidates:
+            candidate_source = "fts5"
+            fts_used = True
+
+    if not candidates:
+        store = load_store()
+        all_visible = [
+            memory
+            for memory in store.get("memories", [])
+            if visible_memory(memory, include_deleted, include_superseded)
+        ]
+        # Bounded fallback chain: filter by metadata, shared top terms, then recent window.
+        wanted_terms = set(_load_json_string_list(input_sig.get("top_terms_json")))
+        ranked: list[tuple[int, str, dict[str, Any]]] = []
+        for memory in all_visible:
+            if normalize_optional_string(args.get("kind")) and str(memory.get("kind")) != normalize_optional_string(args.get("kind")):
+                continue
+            for field in ("role", "agent_id", "domain", "scope", "source_run_id"):
+                wanted = normalize_optional_string(args.get(field))
+                if wanted is not None and normalize_optional_string(memory.get(field)) != wanted:
+                    break
+            else:
+                mem_terms = set(_memory_top_terms(memory))
+                overlap = len(wanted_terms & mem_terms) if wanted_terms and mem_terms else 0
+                if overlap > 0:
+                    ranked.append((overlap, str(memory.get("created_at") or ""), memory))
+        ranked.sort(key=lambda item: (item[0], item[1], str(item[2].get("id", ""))), reverse=True)
+        candidates = [item[2] for item in ranked[:candidate_limit]]
+        if not candidates:
+            candidates = all_visible[-candidate_limit:]
+        candidate_source = "signature" if ranked else "fallback"
+
+    scored_candidates: list[tuple[dict[str, Any], float]] = []
+    if input_token_count >= min_token_count and input_shingles:
+        for memory in candidates:
+            cand_token_count = int(memory.get("token_count") or 0)
+            cand_shingles = _load_json_string_list(memory.get("shingle_hashes_json"))
+            if cand_token_count < min_token_count or not cand_shingles:
+                continue
+            overlap = _signature_overlap(input_shingles, cand_shingles)
+            if overlap >= shingle_overlap_threshold:
+                scored_candidates.append((memory, overlap))
+            if len(scored_candidates) >= max_scored:
+                break
+    if not scored_candidates:
+        # Tiny inputs / missing signatures still get bounded scoring, never all-memory scoring.
+        scored_candidates = [(memory, 0.0) for memory in candidates[:max_scored]]
+
     matches: list[dict[str, Any]] = []
-    for memory in candidates:
+    for memory, overlap in scored_candidates[:max_scored]:
         memory_text = str(memory.get("text", ""))
         breakdown = salience.signal_score(text, memory_text)
         score = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
@@ -2286,6 +2576,8 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
                 "score": round(score, 3),
                 "triggered": triggered,
                 "margin": round(score - threshold, 3),
+                "shingle_overlap": round(overlap, 4),
+                "candidate_source": candidate_source,
                 "breakdown": salience_breakdown_payload(breakdown),
             }
         )
@@ -2295,10 +2587,12 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     warnings: list[str] = []
     if not top_matches:
         warnings.append("No visible memories available for salience comparison.")
+    if store_backend() == "sqlite" and use_fts and not fts_available:
+        warnings.append("SQLite FTS5 unavailable; salience_check used bounded signature fallback.")
 
     anchors = [
         str(memory.get("text", ""))
-        for memory in candidates
+        for memory, _overlap in scored_candidates
         if bool(memory.get("pinned")) or str(memory.get("kind", "")) == "invariant"
     ]
     max_anchor_drift = None
@@ -2321,6 +2615,13 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         "available": True,
         "triggered": triggered_count > 0,
         "threshold": threshold,
+        "candidate_source": candidate_source,
+        "fts_available": fts_available,
+        "fts_used": fts_used,
+        "candidate_limit": candidate_limit,
+        "max_scored": max_scored,
+        "candidates_considered": len(candidates),
+        "scored_count": len(scored_candidates[:max_scored]),
         "matches": top_matches,
         "warnings": warnings,
         "explanation": explanation,
@@ -2329,13 +2630,14 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         structured["anchor_drift"] = round(max_anchor_drift, 3)
     lines = [
         f"Salience check threshold: {threshold:.2f}",
+        f"Candidate source: {candidate_source}",
+        f"Scored candidates: {structured['scored_count']}",
         f"Triggered matches: {triggered_count}/{len(top_matches)}",
         explanation,
     ]
     if warnings:
         lines.append("Warnings: " + "; ".join(warnings))
     return text_result("\n".join(lines), structured)
-
 
 def record_memory(args: dict[str, Any]) -> dict[str, Any]:
     try:
@@ -2422,24 +2724,110 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
             if supersedes_id and old is None:
                 return tool_error(f"supersedes id not found: {supersedes_id}")
 
-            candidate_norm = normalize_text(text)
-            candidate_tokens = tokenize(candidate_norm)
+            sig = _build_memory_signature(text)
+            new_content_hash = sig["content_hash"]
+            new_normalized_hash = sig["normalized_hash"]
+            new_shingle_hashes = json.loads(sig["shingle_hashes_json"])
+            new_token_count = sig["token_count"]
+
             near_duplicate_of: list[str] = []
-            for memory in duplicate_candidates(memories, kind, supersedes_id):
-                existing_norm = normalize_text(str(memory.get("text", "")))
-                if existing_norm == candidate_norm:
+            shingle_overlap_threshold = 0.30
+            similarity_threshold = float(os.environ.get("MNEMO_CONSOLIDATE_THRESHOLD", "0.7"))
+
+            candidates = duplicate_candidates(memories, kind, supersedes_id)
+
+            # Pre-compute signatures for candidates that don't have them stored (e.g. JSON mode or pre-backfill)
+            _cand_sigs: dict[str, dict[str, Any]] = {}
+            for memory in candidates:
+                if not memory.get("content_hash") or not memory.get("normalized_hash"):
+                    _cand_sigs[str(memory.get("id", ""))] = _build_memory_signature(str(memory.get("text", "")))
+
+            def _cand_content_hash(m: dict[str, Any]) -> str | None:
+                stored = m.get("content_hash")
+                if stored:
+                    return stored
+                return _cand_sigs.get(str(m.get("id", "")), {}).get("content_hash")
+
+            def _cand_normalized_hash(m: dict[str, Any]) -> str | None:
+                stored = m.get("normalized_hash")
+                if stored:
+                    return stored
+                return _cand_sigs.get(str(m.get("id", "")), {}).get("normalized_hash")
+
+            def _cand_shingles(m: dict[str, Any]) -> list[str]:
+                raw = m.get("shingle_hashes_json")
+                if raw:
+                    try:
+                        return json.loads(raw)
+                    except Exception:
+                        pass
+                cached = _cand_sigs.get(str(m.get("id", "")), {}).get("shingle_hashes_json")
+                if cached:
+                    try:
+                        return json.loads(cached)
+                    except Exception:
+                        pass
+                return []
+
+            def _cand_token_count(m: dict[str, Any]) -> int:
+                tc = m.get("token_count")
+                if tc is not None:
+                    return int(tc)
+                return _cand_sigs.get(str(m.get("id", "")), {}).get("token_count") or 0
+
+            # Step 2: exact content_hash short-circuit
+            for memory in candidates:
+                if _cand_content_hash(memory) == new_content_hash:
                     structured = {
+                        "recorded": False,
+                        "duplicate": True,
+                        "duplicate_type": "content_hash",
+                        "existing_id": str(memory.get("id")),
                         "memory": memory,
                         "memory_file": str(memory_path()),
-                        "duplicate": True,
                     }
                     return text_result(
-                        f"Duplicate {kind} memory already exists as {memory.get('id')}.",
+                        f"Duplicate {kind} memory (content_hash) already exists as {memory.get('id')}.",
                         structured,
                     )
-                sim = jaccard(candidate_tokens, tokenize(existing_norm))
-                if sim >= 0.9:
-                    near_duplicate_of.append(str(memory.get("id")))
+
+            # Step 3: normalized_hash short-circuit
+            for memory in candidates:
+                if _cand_normalized_hash(memory) == new_normalized_hash:
+                    structured = {
+                        "recorded": False,
+                        "duplicate": True,
+                        "duplicate_type": "normalized_hash",
+                        "existing_id": str(memory.get("id")),
+                        "memory": memory,
+                        "memory_file": str(memory_path()),
+                    }
+                    return text_result(
+                        f"Duplicate {kind} memory (normalized_hash) already exists as {memory.get('id')}.",
+                        structured,
+                    )
+
+            # Step 4: signature-based near-duplicate detection
+            if new_token_count >= 5 and new_shingle_hashes:
+                salience, _reason = load_optional_agent_salience()
+                for memory in candidates:
+                    cand_tc = _cand_token_count(memory)
+                    cand_shingles = _cand_shingles(memory)
+                    if cand_tc < 5 or not cand_shingles:
+                        continue
+                    overlap = _signature_overlap(new_shingle_hashes, cand_shingles)
+                    if overlap < shingle_overlap_threshold:
+                        continue
+                    if salience is not None:
+                        breakdown = salience.signal_score(text, str(memory.get("text", "")))
+                        sim = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+                    else:
+                        sim = _jaccard_similarity_fallback(
+                            set(_normalize_for_signature(text)),
+                            set(_normalize_for_signature(str(memory.get("text", "")))),
+                        )
+                    if sim >= similarity_threshold:
+                        near_duplicate_of.append(str(memory.get("id")))
 
             ok_cap, cap_error = enforce_size_cap(store)
             if not ok_cap:
@@ -3054,58 +3442,289 @@ def timestamp_key(memory: dict[str, Any]) -> str:
     return str(memory.get("updated_at") or memory.get("created_at") or "")
 
 
-def build_consolidation_clusters(store: dict[str, Any], threshold: float) -> list[dict[str, Any]]:
-    clusters: list[dict[str, Any]] = []
-    for kind in MEMORY_KINDS:
-        memories = [
-            memory
-            for memory in store.get("memories", [])
-            if memory.get("kind") == kind
-            and is_active(memory)
-            and not memory.get("pinned")
-        ]
-        if len(memories) < 2:
-            continue
-        parent = list(range(len(memories)))
 
-        def find(index: int) -> int:
-            while parent[index] != index:
-                parent[index] = parent[parent[index]]
-                index = parent[index]
-            return index
 
-        def union(left: int, right: int) -> None:
-            left_root = find(left)
-            right_root = find(right)
-            if left_root != right_root:
-                parent[right_root] = left_root
+def _memory_candidate_sort_key(memory: dict[str, Any]) -> tuple[Any, ...]:
+    memory_id = str(memory.get("id", ""))
+    match = re.search(r"(\d+)$", memory_id)
+    if match:
+        return (memory_id[: match.start()], int(match.group(1)))
+    return (str(memory.get("created_at") or ""), memory_id)
 
-        tokens = [tokenize(str(memory.get("text", ""))) for memory in memories]
-        for i in range(len(memories)):
-            for j in range(i + 1, len(memories)):
-                if jaccard(tokens[i], tokens[j]) >= threshold:
-                    union(i, j)
+def build_consolidation_clusters(
+    store: dict[str, Any],
+    threshold: float,
+    *,
+    max_candidates_per_memory: int = 100,
+    min_token_count: int = 5,
+    shingle_overlap_threshold: float = 0.30,
+    use_fts: bool = True,
+) -> dict[str, Any]:
+    memories = [
+        memory
+        for memory in store.get("memories", [])
+        if not match_is_deleted(memory) and not memory.get("superseded_by") and not bool(memory.get("pinned"))
+    ]
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    by_id = {str(memory.get("id", "")): memory for memory in memories}
+    for memory in memories:
+        by_kind.setdefault(str(memory.get("kind", "note")), []).append(memory)
 
-        grouped: dict[int, list[dict[str, Any]]] = {}
-        for index, memory in enumerate(memories):
-            grouped.setdefault(find(index), []).append(memory)
-        for members in grouped.values():
-            if len(members) < 2:
-                continue
-            survivor = max(members, key=timestamp_key)
-            ids = [str(memory.get("id")) for memory in members]
-            to_retire = [memory_id for memory_id in ids if memory_id != survivor.get("id")]
-            clusters.append(
-                {
+    exact_clusters: list[dict[str, Any]] = []
+    near_clusters: list[dict[str, Any]] = []
+    seen_pairs: set[frozenset] = set()
+    skipped_unsafe = 0
+    candidates_examined = 0
+    similarity_calls = 0
+    fts_globally_available = bool(use_fts and store_backend() == "sqlite" and _sqlite_fts_flag())
+    fts_available = fts_globally_available
+    candidate_source_counts: dict[str, int] = {"fts5": 0, "signature": 0, "fallback": 0}
+
+    salience, _reason = load_optional_agent_salience()
+
+    for kind, kind_memories in by_kind.items():
+        kind_memories.sort(key=_memory_candidate_sort_key)
+
+        _hash_sig_cache: dict[str, dict[str, Any]] = {}
+        def _get_hash_sig(m: dict[str, Any]) -> dict[str, Any]:
+            mid = str(m.get("id", ""))
+            if mid not in _hash_sig_cache:
+                _hash_sig_cache[mid] = _build_memory_signature(str(m.get("text", "")))
+            return _hash_sig_cache[mid]
+
+        by_content_hash: dict[str, list[str]] = {}
+        by_normalized_hash: dict[str, list[str]] = {}
+        for m in kind_memories:
+            mid = str(m.get("id", ""))
+            fly = _get_hash_sig(m)
+            ch = m.get("content_hash") or fly.get("content_hash")
+            nh = m.get("normalized_hash") or fly.get("normalized_hash")
+            if ch:
+                by_content_hash.setdefault(ch, []).append(mid)
+            if nh:
+                by_normalized_hash.setdefault(nh, []).append(mid)
+
+        for duplicate_type, buckets in (("content_hash", by_content_hash), ("normalized_hash", by_normalized_hash)):
+            for _hash, ids in buckets.items():
+                if len(ids) < 2:
+                    continue
+                pair = frozenset(ids[:2])
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                survivor = max(ids, key=lambda mid: str(by_id.get(mid, {}).get("created_at") or ""))
+                to_retire = [mid for mid in ids if mid != survivor]
+                exact_clusters.append({
                     "kind": kind,
-                    "size": len(members),
+                    "size": len(ids),
                     "ids": ids,
-                    "survivor": str(survivor.get("id")),
+                    "survivor": survivor,
                     "to_retire": to_retire,
-                }
-            )
-    return clusters
+                    "duplicate_type": duplicate_type,
+                    "candidate_source": "exact_hash",
+                })
 
+        # Only suppress exact duplicates that would be retired. Keep the survivor
+        # eligible so near-duplicates can still cluster with the canonical record.
+        exact_ids: set[str] = {mid for cl in exact_clusters for mid in cl.get("to_retire", [])}
+
+        preloaded_token_counts: dict[str, int] = {}
+        preloaded_shingle_sets: dict[str, frozenset] = {}
+        preloaded_shingles_empty: set[str] = set()
+        fly_sigs: dict[str, dict[str, Any]] = {}
+        token_sets: dict[str, set[str]] = {}
+        top_terms_by_id: dict[str, set[str]] = {}
+
+        for pm in kind_memories:
+            mid = str(pm.get("id", ""))
+            raw_sh = pm.get("shingle_hashes_json")
+            if raw_sh:
+                lst = _load_json_string_list(raw_sh)
+                if lst:
+                    preloaded_shingle_sets[mid] = frozenset(lst)
+                else:
+                    preloaded_shingles_empty.add(mid)
+            raw_tc = pm.get("token_count")
+            if raw_tc is not None:
+                try:
+                    preloaded_token_counts[mid] = int(raw_tc)
+                except Exception:
+                    pass
+            terms = set(_memory_top_terms(pm))
+            if terms:
+                top_terms_by_id[mid] = terms
+
+        def _get_sig(m: dict[str, Any]) -> dict[str, Any]:
+            mid = str(m.get("id", ""))
+            if mid not in fly_sigs:
+                fly_sigs[mid] = _build_memory_signature(str(m.get("text", "")))
+            return fly_sigs[mid]
+
+        def _get_shingle_set(m: dict[str, Any]) -> frozenset | None:
+            mid = str(m.get("id", ""))
+            if mid in preloaded_shingle_sets:
+                return preloaded_shingle_sets[mid]
+            if mid in preloaded_shingles_empty:
+                return None
+            lst = _load_json_string_list(_get_sig(m).get("shingle_hashes_json"))
+            if lst:
+                fs = frozenset(lst)
+                preloaded_shingle_sets[mid] = fs
+                return fs
+            preloaded_shingles_empty.add(mid)
+            return None
+
+        def _get_token_count(m: dict[str, Any]) -> int:
+            mid = str(m.get("id", ""))
+            if mid in preloaded_token_counts:
+                return preloaded_token_counts[mid]
+            tc = int(_get_sig(m).get("token_count") or 0)
+            preloaded_token_counts[mid] = tc
+            return tc
+
+        def _get_token_set(m: dict[str, Any]) -> set[str]:
+            mid = str(m.get("id", ""))
+            if mid not in token_sets:
+                token_sets[mid] = set(_normalize_for_signature(str(m.get("text", ""))))
+            return token_sets[mid]
+
+        eligible: list[tuple[str, dict[str, Any], frozenset]] = []
+        for m in kind_memories:
+            mid = str(m.get("id", ""))
+            if mid in exact_ids:
+                continue
+            fs = _get_shingle_set(m)
+            tc = _get_token_count(m)
+            if fs is None or tc < min_token_count:
+                skipped_unsafe += 1
+                continue
+            eligible.append((mid, m, fs))
+
+        eligible_by_id = {mid: (m, fs) for mid, m, fs in eligible}
+        eligible_index = {mid: idx for idx, (mid, _m, _fs) in enumerate(eligible)}
+        # Build a shingle-hash inverted index. This is much cheaper and more
+        # selective than comparing every pair or expanding common top terms.
+        large_store_window_mode = len(eligible) > 5_000
+        shingle_to_ids: dict[str, list[str]] = {}
+        if not large_store_window_mode:
+            bucket_cap = max(max_candidates_per_memory, 100)
+            for mid, _m, fs in eligible:
+                for shingle_hash in fs:
+                    bucket = shingle_to_ids.setdefault(str(shingle_hash), [])
+                    # Keep buckets bounded to avoid pathological common-shingle fanout.
+                    if len(bucket) < bucket_cap:
+                        bucket.append(mid)
+        # FTS candidate lookup is useful on small stores, but per-row FTS queries are
+        # intentionally disabled on large stores because that becomes expensive on
+        # local machines. Large-store default relies on bounded neighbor windows.
+        fts_available = bool(fts_globally_available and len(eligible) <= 500)
+
+        def _fast_shingle_overlap(fs_a: frozenset, fs_b: frozenset) -> float:
+            inter = len(fs_a & fs_b)
+            if inter == 0:
+                return 0.0
+            return inter / (len(fs_a) + len(fs_b) - inter)
+
+        def _candidate_ids_for(mid: str, m: dict[str, Any], idx: int) -> tuple[list[str], str]:
+            if large_store_window_mode:
+                # Large stores must stay cheap on local machines. Exact hashes are
+                # handled globally; use a narrow deterministic neighborhood window
+                # over stable id/created order for near-duplicate candidates.
+                large_radius = min(max_candidates_per_memory, 3)
+                start = max(0, idx - large_radius)
+                end_idx = min(len(eligible), idx + large_radius + 1)
+                window = [cid for cid, _cm, _fs in eligible[start:idx] + eligible[idx + 1:end_idx] if cid != mid]
+                return window[:large_radius], "fallback"
+
+            ids: list[str] = []
+            if fts_available:
+                fts_ids = _sqlite_fts_candidate_ids_for_memory(
+                    m,
+                    limit=max_candidates_per_memory * 3,
+                    exclude_pinned=True,
+                )
+                for cid in fts_ids:
+                    if cid == mid or cid not in eligible_by_id:
+                        continue
+                    cand, _cand_fs = eligible_by_id[cid]
+                    if not _metadata_compatible_for_duplicate(m, cand):
+                        continue
+                    if cid not in ids:
+                        ids.append(cid)
+                    if len(ids) >= max_candidates_per_memory:
+                        break
+                if ids:
+                    return ids, "fts5"
+
+            # Signature fallback: candidates sharing min-K shingle hashes.
+            scored_ids: dict[str, int] = {}
+            for shingle_hash in m_shingle_set:
+                for cid in shingle_to_ids.get(str(shingle_hash), []):
+                    if cid == mid or cid not in eligible_by_id:
+                        continue
+                    cand, _cand_fs = eligible_by_id[cid]
+                    if not _metadata_compatible_for_duplicate(m, cand):
+                        continue
+                    scored_ids[cid] = scored_ids.get(cid, 0) + 1
+            if scored_ids:
+                ordered = sorted(
+                    scored_ids.keys(),
+                    key=lambda cid: (scored_ids[cid], str(eligible_by_id[cid][0].get("created_at") or ""), cid),
+                    reverse=True,
+                )
+                return ordered[:max_candidates_per_memory], "signature"
+
+            start = max(0, idx - max_candidates_per_memory)
+            end_idx = min(len(eligible), idx + max_candidates_per_memory + 1)
+            window = [cid for cid, _cm, _fs in eligible[start:idx] + eligible[idx + 1:end_idx] if cid != mid]
+            return window[:max_candidates_per_memory], "fallback"
+
+        for idx, (mid, m, m_shingle_set) in enumerate(eligible):
+            candidate_ids, source = _candidate_ids_for(mid, m, idx)
+            candidate_source_counts[source] = candidate_source_counts.get(source, 0) + 1
+            candidates_examined += len(candidate_ids)
+
+            for cand_id in candidate_ids:
+                cand, cand_shingle_set = eligible_by_id[cand_id]
+                pair = frozenset([mid, cand_id])
+                if pair in seen_pairs:
+                    continue
+                overlap = _fast_shingle_overlap(m_shingle_set, cand_shingle_set)
+                if overlap < shingle_overlap_threshold:
+                    continue
+
+                seen_pairs.add(pair)
+                similarity_calls += 1
+
+                if salience is not None:
+                    breakdown = salience.signal_score(str(m.get("text", "")), str(cand.get("text", "")))
+                    sim = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+                else:
+                    sim = _jaccard_similarity_fallback(_get_token_set(m), _get_token_set(cand))
+
+                if sim >= threshold:
+                    survivor = max([mid, cand_id], key=lambda x: str(by_id.get(x, {}).get("created_at") or ""))
+                    to_retire = [x for x in [mid, cand_id] if x != survivor]
+                    near_clusters.append({
+                        "kind": kind,
+                        "size": 2,
+                        "ids": [mid, cand_id],
+                        "survivor": survivor,
+                        "to_retire": to_retire,
+                        "duplicate_type": "near_duplicate",
+                        "candidate_source": source,
+                        "shingle_overlap": round(overlap, 4),
+                        "similarity": round(sim, 4),
+                    })
+
+    return {
+        "clusters": exact_clusters + near_clusters,
+        "skipped_unsafe": skipped_unsafe,
+        "candidates_examined": candidates_examined,
+        "similarity_calls": similarity_calls,
+        "candidate_source_counts": candidate_source_counts,
+        "fts_available": fts_available,
+    }
 
 def render_consolidation_text(clusters: list[dict[str, Any]], threshold: float, applied: bool, retired: int) -> str:
     lines = [f"Consolidation candidates (threshold {threshold}):"]
@@ -3128,17 +3747,48 @@ def render_consolidation_text(clusters: list[dict[str, Any]], threshold: float, 
 
 def _consolidate_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     threshold = consolidate_threshold(args.get("threshold") if "threshold" in args else None)
+    max_cands = int(args.get("max_candidates_per_memory") or 100)
+    min_tok = int(args.get("min_token_count") or 5)
+    shingle_thresh = float(args.get("shingle_overlap_threshold") or 0.30)
+    use_fts = parse_bool(args.get("use_fts"), default=True)
+
+    result = build_consolidation_clusters(
+        load_store(),
+        threshold,
+        max_candidates_per_memory=max_cands,
+        min_token_count=min_tok,
+        shingle_overlap_threshold=shingle_thresh,
+        use_fts=use_fts,
+    )
+    clusters = result["clusters"]
 
     if dry_run:
-        clusters = build_consolidation_clusters(load_store(), threshold)
-        structured = {"action": "consolidate", "applied": False, "threshold": threshold, "clusters": clusters}
+        structured = {
+            "action": "consolidate",
+            "applied": False,
+            "threshold": threshold,
+            "clusters": clusters,
+            "skipped_unsafe": result["skipped_unsafe"],
+            "candidates_examined": result["candidates_examined"],
+            "similarity_calls": result["similarity_calls"],
+            "candidate_source_counts": result.get("candidate_source_counts", {}),
+            "fts_available": result.get("fts_available", False),
+        }
         return text_result(render_consolidation_text(clusters, threshold, False, 0), structured)
 
     retired = 0
     try:
         with MemoryFileLock(store_lock_path()):
             store = load_store()
-            clusters = build_consolidation_clusters(store, threshold)
+            result2 = build_consolidation_clusters(
+                store,
+                threshold,
+                max_candidates_per_memory=max_cands,
+                min_token_count=min_tok,
+                shingle_overlap_threshold=shingle_thresh,
+                use_fts=use_fts,
+            )
+            clusters = result2["clusters"]
             by_id = {str(memory.get("id")): memory for memory in store.get("memories", [])}
             for cluster in clusters:
                 survivor = cluster["survivor"]
@@ -3156,7 +3806,17 @@ def _consolidate_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, A
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
-    structured = {"action": "consolidate", "applied": True, "threshold": threshold, "clusters": clusters}
+    structured = {
+        "action": "consolidate",
+        "applied": True,
+        "threshold": threshold,
+        "clusters": clusters,
+        "skipped_unsafe": result2.get("skipped_unsafe", 0),
+        "candidates_examined": result2.get("candidates_examined", 0),
+        "similarity_calls": result2.get("similarity_calls", 0),
+        "candidate_source_counts": result2.get("candidate_source_counts", {}),
+        "fts_available": result2.get("fts_available", False),
+    }
     return text_result(render_consolidation_text(clusters, threshold, True, retired), structured)
 
 
@@ -3224,15 +3884,213 @@ def _import_json_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, A
     )
 
 
+def _backfill_signatures_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    """Backfill signature columns for rows with missing or outdated signatures."""
+    if store_backend() != "sqlite":
+        return tool_error("backfill_signatures requires SQLite backend")
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            rows = conn.execute(
+                """SELECT id, text FROM memories
+                   WHERE deleted=0
+                   AND (
+                       signature_version IS NULL OR signature_version != ?
+                       OR normalizer_version IS NULL OR normalizer_version != ?
+                       OR content_hash IS NULL OR normalized_hash IS NULL
+                       OR shingle_hashes_json IS NULL
+                   )""",
+                (SIGNATURE_VERSION, NORMALIZER_VERSION),
+            ).fetchall()
+            count_missing = len(rows)
+            total_active = conn.execute("SELECT COUNT(*) FROM memories WHERE deleted=0").fetchone()[0]
+            if dry_run:
+                return text_result(
+                    f"backfill_signatures dry_run: {count_missing} of {total_active} active memories have missing/outdated signatures.",
+                    {
+                        "action": "backfill_signatures",
+                        "dry_run": True,
+                        "count_missing": count_missing,
+                        "count_total": total_active,
+                        "ratio": round(count_missing / total_active, 4) if total_active else 0.0,
+                    },
+                )
+            # Batch update in chunks of 500
+            updated = 0
+            BATCH_SIZE = 500
+            for i in range(0, len(rows), BATCH_SIZE):
+                batch = rows[i : i + BATCH_SIZE]
+                updates = []
+                for row in batch:
+                    memory_id = str(row["id"])
+                    text_val = str(row["text"] or "")
+                    sig = _build_memory_signature(text_val)
+                    updates.append((
+                        sig["content_hash"],
+                        sig["normalized_hash"],
+                        sig["token_count"],
+                        sig["unique_token_count"],
+                        sig["top_terms_json"],
+                        sig["shingle_hashes_json"],
+                        sig["signature_version"],
+                        sig["normalizer_version"],
+                        sig["signature_updated_at"],
+                        memory_id,
+                    ))
+                conn.executemany(
+                    """UPDATE memories SET
+                        content_hash=?, normalized_hash=?, token_count=?,
+                        unique_token_count=?, top_terms_json=?, shingle_hashes_json=?,
+                        signature_version=?, normalizer_version=?, signature_updated_at=?
+                       WHERE id=?""",
+                    updates,
+                )
+                updated += len(batch)
+        return text_result(
+            f"backfill_signatures: updated {updated} memories.",
+            {
+                "action": "backfill_signatures",
+                "dry_run": False,
+                "updated_count": updated,
+                "count_total": total_active,
+            },
+        )
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+
+def _consolidate_full_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    """O(n^2) full-scan consolidation. Requires confirm_full_scan: true."""
+    if not parse_bool(args.get("confirm_full_scan"), default=False):
+        store = load_store()
+        active = [m for m in store.get("memories", []) if is_active(m) and not m.get("pinned")]
+        n = len(active)
+        estimated_pairs = n * (n - 1) // 2
+        return {
+            "content": [{"type": "text", "text": "Error: full_scan_confirmation_required"}],
+            "isError": True,
+            "structuredContent": {
+                "error": "full_scan_confirmation_required",
+                "message": "consolidate_full is O(n^2) and can be expensive on large stores. Pass confirm_full_scan: true to proceed.",
+                "estimated_pair_count": estimated_pairs,
+            },
+        }
+
+    dry_run = parse_bool(args.get("dry_run"), default=True)
+    threshold = consolidate_threshold(args.get("threshold") if "threshold" in args else None)
+    store = load_store()
+
+    active = [m for m in store.get("memories", []) if is_active(m) and not m.get("pinned")]
+    n = len(active)
+    estimated_pairs = n * (n - 1) // 2
+    warning_msg = f"consolidate_full is O(n^2). Examining {estimated_pairs} pairs across {n} active memories."
+
+    if dry_run:
+        return text_result(
+            warning_msg + " dry_run=true; no changes applied.",
+            {
+                "action": "consolidate_full",
+                "dry_run": True,
+                "estimated_pair_count": estimated_pairs,
+                "active_memory_count": n,
+                "warning": warning_msg,
+                "threshold": threshold,
+            },
+        )
+
+    # Full all-pairs scan
+    clusters: list[dict[str, Any]] = []
+    seen_pairs: set[frozenset[str]] = set()
+    by_kind: dict[str, list[dict[str, Any]]] = {}
+    for m in active:
+        k = str(m.get("kind", "note"))
+        by_kind.setdefault(k, []).append(m)
+
+    salience, _ = load_optional_agent_salience()
+    for kind, kind_memories in by_kind.items():
+        tokens = [set(_normalize_for_signature(str(m.get("text", "")))) for m in kind_memories]
+        for i in range(len(kind_memories)):
+            for j in range(i + 1, len(kind_memories)):
+                mid_i = str(kind_memories[i].get("id", ""))
+                mid_j = str(kind_memories[j].get("id", ""))
+                pair = frozenset([mid_i, mid_j])
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                if salience is not None:
+                    breakdown = salience.signal_score(
+                        str(kind_memories[i].get("text", "")),
+                        str(kind_memories[j].get("text", "")),
+                    )
+                    sim = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+                else:
+                    sim = _jaccard_similarity_fallback(tokens[i], tokens[j])
+                if sim >= threshold:
+                    survivor = max(
+                        [mid_i, mid_j],
+                        key=lambda x: str(kind_memories[i if x == mid_i else j].get("created_at") or ""),
+                    )
+                    to_retire = [x for x in [mid_i, mid_j] if x != survivor]
+                    clusters.append({
+                        "kind": kind,
+                        "size": 2,
+                        "ids": [mid_i, mid_j],
+                        "survivor": survivor,
+                        "to_retire": to_retire,
+                        "similarity": round(sim, 4),
+                    })
+
+    retired = 0
+    try:
+        with MemoryFileLock(store_lock_path()):
+            store2 = load_store()
+            by_id = {str(m.get("id")): m for m in store2.get("memories", [])}
+            for cluster in clusters:
+                survivor = cluster["survivor"]
+                for memory_id in cluster["to_retire"]:
+                    memory = by_id.get(memory_id)
+                    if memory is None:
+                        continue
+                    memory["superseded_by"] = survivor
+                    retired += 1
+                    append_event_log("supersede", memory_id, {"superseded_by": survivor})
+            if retired:
+                save_store(store2)
+    except LockTimeout as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    return text_result(
+        warning_msg + f" Applied {len(clusters)} cluster(s), {retired} retired.",
+        {
+            "action": "consolidate_full",
+            "dry_run": False,
+            "applied": True,
+            "clusters": clusters,
+            "clusters_found": len(clusters),
+            "retired": retired,
+            "estimated_pair_count": estimated_pairs,
+            "warning": warning_msg,
+            "threshold": threshold,
+        },
+    )
+
+
 def memory_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     action = str(args.get("action", "")).strip().lower()
-    if action not in {"compact_logs", "consolidate", "import_json"}:
-        return tool_error("action must be one of: compact_logs, consolidate, import_json")
+    valid_actions = {"compact_logs", "consolidate", "consolidate_full", "import_json", "backfill_signatures"}
+    if action not in valid_actions:
+        return tool_error(f"action must be one of: {', '.join(sorted(valid_actions))}")
     dry_run = parse_bool(args.get("dry_run"), default=True)
     if action == "compact_logs":
         return _compact_logs_maintenance(args, dry_run)
     if action == "import_json":
         return _import_json_maintenance(args, dry_run)
+    if action == "backfill_signatures":
+        return _backfill_signatures_maintenance(args, dry_run)
+    if action == "consolidate_full":
+        return _consolidate_full_maintenance(args)
     return _consolidate_maintenance(args, dry_run)
 
 
@@ -4225,6 +5083,29 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         warnings.append("sqlite database file does not exist yet")
     if backend == "sqlite" and not fts_available:
         warnings.append("FTS unavailable, using simple search")
+    # Signature outdated warning
+    sig_missing = 0
+    sig_total = 0
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as _conn:
+                _sqlite_ensure_schema(_conn)
+                sig_total = _conn.execute("SELECT COUNT(*) FROM memories WHERE deleted=0").fetchone()[0]
+                sig_missing = _conn.execute(
+                    """SELECT COUNT(*) FROM memories WHERE deleted=0
+                       AND (signature_version IS NULL OR signature_version != ?
+                            OR normalizer_version IS NULL OR normalizer_version != ?
+                            OR content_hash IS NULL OR normalized_hash IS NULL
+                            OR shingle_hashes_json IS NULL)""",
+                    (SIGNATURE_VERSION, NORMALIZER_VERSION),
+                ).fetchone()[0]
+        except Exception:
+            pass
+    if sig_total > 0 and sig_missing / sig_total > 0.10:
+        warnings.append(
+            f"signatures_outdated: {sig_missing} of {sig_total} active memories have missing or outdated signatures. "
+            f"Run mnemo {{\"action\":\"maintenance\",\"params\":{{\"action\":\"backfill_signatures\",\"dry_run\":false}}}}."
+        )
     if uncompacted_logs_count >= 40:
         warnings.append("many uncompacted interaction logs; consider compact_logs maintenance")
     if not any(info.get("exists") for info in export_files.values()):
@@ -4327,6 +5208,11 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "newest_memory": newest_memory,
         "export_files": export_files,
         "fts_available": fts_available,
+        "fts": {
+            "available": fts_available,
+            "enabled": fts_available,
+            "candidate_source": "fts5" if fts_available else "fallback",
+        },
         "search_backend": search_backend,
         "memory_file": memory_file_payload,
         "events_log": events_payload,
@@ -4338,6 +5224,16 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     }
     return text_result("\n".join(summary_lines), payload)
 
+
+
+
+def memory_backfill_signatures_gateway(args: dict[str, Any]) -> dict[str, Any]:
+    dry_run = parse_bool(args.get("dry_run"), default=True)
+    return _backfill_signatures_maintenance(args, dry_run)
+
+
+def memory_consolidate_full_gateway(args: dict[str, Any]) -> dict[str, Any]:
+    return _consolidate_full_maintenance(args)
 
 GATEWAY_ACTIONS: dict[str, Any] = {
     "doctor": mnemo_doctor,
@@ -4354,8 +5250,12 @@ GATEWAY_ACTIONS: dict[str, Any] = {
     "compact_context": compact_context,
     "inspect": memory_inspect,
     "maintenance": memory_maintenance,
+    "backfill_signatures": memory_backfill_signatures_gateway,
+    "consolidate_full": memory_consolidate_full_gateway,
     "lookup_symbol": lookup_symbol,
 }
+# v0.12.0: backfill_signatures and consolidate_full are available both as
+# maintenance sub-actions and as top-level gateway aliases for schema discoverability.
 
 
 def gateway_error(error: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -4400,20 +5300,20 @@ def mnemo_gateway(args: dict[str, Any]) -> dict[str, Any]:
 TOOLS = [
     {
         "name": GATEWAY_TOOL_NAME,
-        "title": "Mnemo Project Memory Gateway",
+        "title": "Mnemo Memory Gateway",
         "description": (
-            "Mnemo project-memory gateway. Use this for portable project memory, startup recall, "
-            "hippocampus entries, agent feedback, exports, maintenance, salience diagnostics, "
-            "and source symbol lookup. This is not Copilot native memory. Supported actions: "
-            + ", ".join(sorted(GATEWAY_ACTIONS))
-            + ". Pass action plus optional params."
+            "Mnemo project-memory gateway; not Copilot native memory. "
+            "Actions: doctor, record, search, recall, get, link, export, "
+            "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures), "
+            "inspect, lookup_symbol, salience_check, update, delete, recent."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Required action name. Supported actions are listed in the tool description.",
+                    "enum": sorted(GATEWAY_ACTIONS),
+                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json, or the top-level aliases backfill_signatures and consolidate_full for those v0.12 actions.",
                 },
                 "params": {
                     "type": "object",
@@ -4517,15 +5417,6 @@ def _apply_tool_constraint_notes() -> None:
 
 
 _apply_tool_constraint_notes()
-
-
-_TOOL_DESC_PREFIX = (
-    "Mnemo project-memory tool. Use this for portable project memory, not Copilot native memory. "
-)
-for _tool in TOOLS:
-    _desc = str(_tool.get("description", ""))
-    if _desc and not _desc.startswith(_TOOL_DESC_PREFIX):
-        _tool["description"] = _TOOL_DESC_PREFIX + _desc
 
 
 def send(message: dict[str, Any]) -> None:

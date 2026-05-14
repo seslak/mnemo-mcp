@@ -7,13 +7,14 @@
         "mnemo/server.py"
       ],
       "env": {
-        "MNEMO_STORE": "sqlite",
-        "MNEMO_FILE": "state/mnemo/memory.json",
-        "MNEMO_SQLITE_FILE": "state/mnemo/mnemo.sqlite",
+        "MNEMO_FILE": "mnemo/memory.json",
         "MNEMO_WORKSPACE_ROOT": "."
       },
       "tools": [
-        "mnemo"
+        "mnemo_search",
+        "mnemo_recent",
+        "mnemo_compact_context",
+        "mnemo_lookup_symbol"
       ]
     }
   }
