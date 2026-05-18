@@ -8,7 +8,7 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.12.0**
+Current version: **0.13.2**
 
 Runtime requirements:
 
@@ -31,6 +31,7 @@ Mnemo is local-first. It does not require a cloud service, vector database, exte
 - Maintenance actions for log compaction, consolidation, JSON import, and signature backfill
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
+- Automatic local IDF activation when project/domain corpus maturity thresholds are met
 - Lightweight symbol lookup under a configured workspace root
 
 ## Non-goals
@@ -134,6 +135,14 @@ In SQLite mode, lifecycle/query events are stored in the SQLite `events` table. 
 | `MNEMO_MAX_FILES_SCANNED` | Max files scanned by `lookup_symbol`. Default: `5000`. |
 | `MNEMO_MAX_TOTAL_BYTES` | Max total bytes scanned by `lookup_symbol`. Default: `52428800`. |
 | `MNEMO_MAX_FILE_BYTES` | Max single file bytes read by `lookup_symbol`. Default: `1048576`. |
+| `MNEMO_IDF_MODE` | IDF mode: `auto`, `off`, or `force`. Default: `auto`. |
+| `MNEMO_IDF_MIN_DOCUMENTS` | Project IDF minimum eligible memory records. Default: `200`. |
+| `MNEMO_IDF_MIN_UNIQUE_TERMS` | Project IDF minimum unique normalized terms. Default: `1000`. |
+| `MNEMO_IDF_MIN_TOTAL_TOKENS` | Project IDF minimum total normalized tokens. Default: `10000`. |
+| `MNEMO_IDF_DOMAIN_MIN_DOCUMENTS` | Domain IDF minimum eligible memory records. Default: `50`. |
+| `MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS` | Domain IDF minimum unique normalized terms. Default: `300`. |
+| `MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS` | Domain IDF minimum total normalized tokens. Default: `3000`. |
+| `MNEMO_IDF_MIN_TEXT_TOKENS` | Minimum tokens per memory included in the IDF corpus. Default: `5`. |
 | `AGENT_SALIENCE_HOME` | Optional path to local `agent-salience` checkout. |
 
 `MNEMO_MCP_PROFILE` is ignored. Mnemo always exposes one public gateway tool.
@@ -169,6 +178,10 @@ Supported top-level actions:
 - `update`
 - `delete`
 - `recent`
+- `recent_events`
+- `search_events`
+- `get_event`
+- `memory_events`
 - `compact_context`
 - `inspect`
 - `maintenance`
@@ -178,15 +191,33 @@ Supported top-level actions:
 
 `backfill_signatures` and `consolidate_full` are also available as `maintenance` sub-actions.
 
+### Event history actions
+
+```json
+{"action":"recent_events","params":{"limit":20}}
+```
+
+```json
+{"action":"search_events","params":{"query":"IBAN validation","limit":20}}
+```
+
+```json
+{"action":"get_event","params":{"event_id":"evt_..."}}
+```
+
+```json
+{"action":"memory_events","params":{"memory_id":"mem_...","limit":50}}
+```
+
 ### `doctor`
 
-Returns storage, schema, health, export, FTS, signature, and salience diagnostics.
+Returns storage, schema, health, export, FTS, signature, salience, and IDF diagnostics.
 
 ```json
 {"action":"doctor"}
 ```
 
-In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, FTS status, and signature warnings.
+In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, FTS status, signature warnings, and `idf` activation status.
 
 ### `record`
 
@@ -341,13 +372,20 @@ Finds likely source definition locations under `MNEMO_WORKSPACE_ROOT`.
 
 ### `salience_check`
 
-Optional deterministic salience diagnostics when Agent Salience is available.
+Optional deterministic salience diagnostics when Agent Salience is available. When local IDF profiles are active, `salience_check` automatically uses IDF-dominant scoring.
 
 ```json
 {"action":"salience_check","params":{"text":"auth middleware decisions","limit":5,"candidate_limit":500,"max_scored":100}}
 ```
 
-`salience_check` is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, and scores only bounded survivors.
+`salience_check` is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, and scores only bounded survivors. Candidate generation is intentionally unchanged by IDF activation.
+
+When IDF is active, Mnemo uses IDF-dominant weights:
+
+- `idf_cosine: 0.55`
+- `idf_jaccard: 0.35`
+- `cosine: 0.05`
+- `jaccard: 0.05`
 
 ### `update`, `delete`, and `recent`
 
@@ -451,11 +489,21 @@ Without `confirm_full_scan:true`, Mnemo returns an error that includes the estim
 
 Hippocampus is not a separate database. Durable project knowledge is stored in the same SQLite database with `kind="hippocampus_entry"`, plus fields such as `domain`, `scope`, `authority`, and `retention`.
 
-## Salience / IDF / LSH preparation
+## Salience / IDF / LSH
 
-Mnemo stores deterministic signature fields (`signature_version`, `normalizer_version`, `shingle_hashes_json`, hashes, token counts, and top terms) so future MinHash/LSH can be added without a storage redesign. Full LSH is not active in this release.
+Mnemo stores deterministic signature fields (`signature_version`, `normalizer_version`, `shingle_hashes_json`, hashes, token counts, and top terms) and automatically builds local project/domain IDF profiles when corpus maturity thresholds are met.
 
-Agent Salience can optionally provide deterministic salience diagnostics. Future IDF support should remain corpus-learned, local, language-agnostic, and disabled until enough project/domain corpus exists. See [`docs/salience_lsh_idf_notes.md`](docs/salience_lsh_idf_notes.md).
+Default activation thresholds:
+
+- Project: `200` eligible memory records, `1000` unique terms, and `10000` total tokens
+- Domain: `50` eligible memory records, `300` unique terms, and `3000` total tokens
+- Inclusion floor: `5` tokens per memory record
+
+All activation thresholds are AND-gated: document count, unique terms, and total tokens must all pass. IDF activation is lazy automatic: `doctor`, `salience_check`, query recall, write/update/delete, and material maintenance writes refresh profile status as needed. No coordinator policy decision is required.
+
+When active, IDF is a scoring aid. It contributes through both `idf_cosine` and IDF-weighted Jaccard/Tanimoto (`idf_jaccard`) so common-token-only overlap does not create meaningful similarity. It does not replace signatures, lexical ranking, FTS, or baseline cosine/Jaccard primitives.
+
+Full LSH/MinHash buckets are still not implemented in this release. See [`docs/salience_lsh_idf_notes.md`](docs/salience_lsh_idf_notes.md).
 
 ## Copilot compatibility
 

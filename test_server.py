@@ -37,6 +37,14 @@ ENV_KEYS = [
     "MNEMO_MAX_TOTAL_BYTES",
     "MNEMO_MAX_FILE_BYTES",
     "MNEMO_MCP_PROFILE",
+    "MNEMO_IDF_MODE",
+    "MNEMO_IDF_MIN_DOCUMENTS",
+    "MNEMO_IDF_MIN_UNIQUE_TERMS",
+    "MNEMO_IDF_MIN_TOTAL_TOKENS",
+    "MNEMO_IDF_DOMAIN_MIN_DOCUMENTS",
+    "MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS",
+    "MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS",
+    "MNEMO_IDF_MIN_TEXT_TOKENS",
     "AGENT_SALIENCE_HOME",
 ]
 
@@ -66,6 +74,14 @@ class MnemoTestCase(unittest.TestCase):
         os.environ.pop("MNEMO_MAX_TOTAL_BYTES", None)
         os.environ.pop("MNEMO_MAX_FILE_BYTES", None)
         os.environ.pop("MNEMO_MCP_PROFILE", None)
+        os.environ.pop("MNEMO_IDF_MODE", None)
+        os.environ.pop("MNEMO_IDF_MIN_DOCUMENTS", None)
+        os.environ.pop("MNEMO_IDF_MIN_UNIQUE_TERMS", None)
+        os.environ.pop("MNEMO_IDF_MIN_TOTAL_TOKENS", None)
+        os.environ.pop("MNEMO_IDF_DOMAIN_MIN_DOCUMENTS", None)
+        os.environ.pop("MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS", None)
+        os.environ.pop("MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS", None)
+        os.environ.pop("MNEMO_IDF_MIN_TEXT_TOKENS", None)
         os.environ.pop("AGENT_SALIENCE_HOME", None)
         server._SYMBOL_CACHE.clear()
 
@@ -508,6 +524,14 @@ class ToolSurfaceTests(MnemoTestCase):
         self.assertEqual(payload["public_tool_count"], 1)
         self.assertIn("record", payload["available_actions"])
         self.assertIn("search", payload["available_actions"])
+
+    def test_gateway_includes_event_history_actions(self) -> None:
+        for action in ("recent_events", "search_events", "get_event", "memory_events"):
+            self.assertIn(action, server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        for action in ("recent_events", "search_events", "get_event", "memory_events"):
+            self.assertIn(action, enum_values)
 
 
 class DoctorPayloadTests(MnemoTestCase):
@@ -2119,6 +2143,538 @@ class SqliteStoreTests(MnemoTestCase):
         self.assertIn("export_files", structured)
         self.assertIn("fts_available", structured)
         self.assertIn("search_backend", structured)
+        self.assertIn("event_count", structured)
+        self.assertIn("events_fts_enabled", structured)
+
+    def test_events_schema_typed_columns_and_migration_idempotent(self) -> None:
+        self.record("typed event schema marker", kind="note")
+        expected = {
+            "event_id",
+            "ts",
+            "action",
+            "memory_id",
+            "source_id",
+            "target_id",
+            "relation",
+            "query_text",
+            "result_count",
+            "success",
+            "agent_id",
+            "role",
+            "domain",
+            "kind",
+            "summary",
+            "salience_text",
+            "include_in_salience",
+            "data_json",
+        }
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        finally:
+            conn.close()
+        self.assertTrue(expected.issubset(cols))
+        # Migration should stay idempotent on repeated loads.
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            cols2 = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+        finally:
+            conn.close()
+        self.assertTrue(expected.issubset(cols2))
+
+    def test_recent_events_returns_compact_rows(self) -> None:
+        self.record("recent events marker", kind="note", domain="payments", role="specialist", agent_id="spec_pay")
+        server.search_memories({"query": "recent events marker", "limit": 3})
+        result = server.recent_events({"limit": 20})
+        self.assertFalse(result["isError"], result)
+        events = result["structuredContent"]["events"]
+        self.assertGreater(len(events), 0)
+        first = events[0]
+        self.assertIn("event_id", first)
+        self.assertIn("timestamp", first)
+        self.assertIn("action", first)
+
+    def test_search_events_returns_matches(self) -> None:
+        self.record("IBAN validation historical note", kind="note", domain="payments")
+        server.search_memories({"query": "IBAN validation", "limit": 5})
+        result = server.search_events({"query": "IBAN validation", "limit": 20})
+        self.assertFalse(result["isError"], result)
+        events = result["structuredContent"]["events"]
+        self.assertGreater(len(events), 0)
+        actions = {str(item.get("action")) for item in events}
+        self.assertTrue("mnemo_search" in actions or "query" in actions)
+
+    def test_get_event_returns_full_detail(self) -> None:
+        self.record("get event marker", kind="note")
+        recent = server.recent_events({"limit": 1})
+        self.assertFalse(recent["isError"], recent)
+        event_id = recent["structuredContent"]["events"][0]["event_id"]
+        result = server.get_event({"event_id": event_id})
+        self.assertFalse(result["isError"], result)
+        payload = result["structuredContent"]["event"]
+        self.assertEqual(payload["event_id"], event_id)
+        self.assertIn("data", payload)
+
+    def test_memory_events_returns_memory_scoped_rows(self) -> None:
+        memory = self.record("memory scoped events marker", kind="note")
+        server.update_memory({"id": memory["id"], "text": "memory scoped events marker updated"})
+        result = server.memory_events({"memory_id": memory["id"], "limit": 50})
+        self.assertFalse(result["isError"], result)
+        events = result["structuredContent"]["events"]
+        self.assertGreater(len(events), 0)
+        self.assertTrue(all(item.get("memory_id") == memory["id"] for item in events))
+        actions = {str(item.get("action")) for item in events}
+        self.assertIn("create", actions)
+        self.assertIn("update", actions)
+
+    def test_search_events_fts_fallback_when_unavailable(self) -> None:
+        self.record("fts fallback event marker", kind="note")
+        server.search_memories({"query": "fts fallback event marker", "limit": 5})
+        with mock.patch("server._sqlite_events_fts_flag", return_value=False):
+            result = server.search_events({"query": "fallback event marker", "limit": 20})
+        self.assertFalse(result["isError"], result)
+        self.assertGreater(len(result["structuredContent"]["events"]), 0)
+
+    def test_typed_event_columns_populated(self) -> None:
+        memory = self.record("typed population marker", kind="note", domain="auth", role="specialist", agent_id="spec_auth")
+        server.search_memories({"query": "typed population marker", "limit": 5})
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                """
+                SELECT action, query_text, result_count, success, salience_text, include_in_salience
+                FROM events
+                WHERE event_type = 'query'
+                ORDER BY rowid DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            create_row = conn.execute(
+                "SELECT kind, domain, role, agent_id FROM events WHERE memory_id = ? AND event_type = 'create' LIMIT 1",
+                (memory["id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertIn("mnemo_search", str(row[0]))
+        self.assertIn("typed population marker", str(row[1]))
+        self.assertGreaterEqual(int(row[2]), 0)
+        self.assertIn(int(row[3]), {0, 1})
+        self.assertTrue(str(row[4]))
+        self.assertIn(int(row[5]), {0, 1})
+        self.assertIsNotNone(create_row)
+        assert create_row is not None
+        self.assertEqual(str(create_row[0]), "note")
+        self.assertEqual(str(create_row[1]), "auth")
+        self.assertEqual(str(create_row[2]), "specialist")
+        self.assertEqual(str(create_row[3]), "spec_auth")
+
+    def test_doctor_reports_event_stats(self) -> None:
+        self.record("doctor event stats marker", kind="note")
+        server.search_memories({"query": "doctor event stats marker", "limit": 3})
+        result = server.mnemo_doctor({})
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertGreaterEqual(int(structured["event_count"]), 1)
+        self.assertGreaterEqual(int(structured["recent_event_count"]), 1)
+        self.assertIn("events_fts_enabled", structured)
+        events_log = structured["events_log"]
+        self.assertIn("event_count", events_log)
+        self.assertIn("recent_event_count", events_log)
+        self.assertIn("events_fts_enabled", events_log)
+
+    def test_existing_record_search_get_behavior_unaffected(self) -> None:
+        memory = self.record("existing behavior marker", kind="decision")
+        searched = server.search_memories({"query": "existing behavior marker", "limit": 5})
+        self.assertFalse(searched["isError"], searched)
+        ids = [item["id"] for item in searched["structuredContent"]["matches"]]
+        self.assertIn(memory["id"], ids)
+        got = server.memory_get({"id": memory["id"], "full": True})
+        self.assertFalse(got["isError"], got)
+        self.assertEqual(got["structuredContent"]["memory"]["id"], memory["id"])
+
+
+class IdfActivationTests(MnemoTestCase):
+    class _FakeBreakdown:
+        def __init__(
+            self,
+            *,
+            cosine: float,
+            jaccard: float,
+            idf_cosine: float,
+            idf_jaccard: float,
+            final: float,
+            weights: dict[str, float],
+            idf_status: str,
+            idf_used: bool,
+        ) -> None:
+            self.cosine = cosine
+            self.jaccard = jaccard
+            self.idf_cosine = idf_cosine
+            self.idf_jaccard = idf_jaccard
+            self.repetition = 0.0
+            self.recency = 0.0
+            self.novelty = 0.0
+            self.drift = 0.0
+            self.final = final
+            self.weights = weights
+            self.idf_status = idf_status
+            self.idf_used = idf_used
+
+        def to_dict(self) -> dict:
+            return {
+                "cosine": self.cosine,
+                "jaccard": self.jaccard,
+                "idf_cosine": self.idf_cosine,
+                "idf_jaccard": self.idf_jaccard,
+                "repetition": self.repetition,
+                "recency": self.recency,
+                "novelty": self.novelty,
+                "drift": self.drift,
+                "final": self.final,
+                "weights": self.weights,
+                "idf_status": self.idf_status,
+                "idf_used": self.idf_used,
+            }
+
+    class _FakeIdfProfile:
+        def __init__(
+            self,
+            *,
+            domain: str | None,
+            doc_count: int,
+            unique_terms: int,
+            total_tokens: int,
+            min_documents: int,
+            min_unique_terms: int,
+            min_total_tokens: int,
+            idf_values: dict[str, float],
+        ) -> None:
+            ready = (
+                doc_count >= min_documents
+                and unique_terms >= min_unique_terms
+                and total_tokens >= min_total_tokens
+            )
+            self._payload = {
+                "domain": domain,
+                "doc_count": doc_count,
+                "unique_terms": unique_terms,
+                "total_tokens": total_tokens,
+                "status": "ready" if ready else "cold",
+                "ready": ready,
+                "idf": idf_values,
+                "min_documents": min_documents,
+                "min_unique_terms": min_unique_terms,
+                "min_total_tokens": min_total_tokens,
+                "version": 1,
+            }
+
+        def to_dict(self) -> dict:
+            return dict(self._payload)
+
+    class _FakeSalience:
+        __version__ = "0.2.fake"
+        __file__ = "fake_agent_salience.py"
+
+        def __init__(self) -> None:
+            self.build_calls = 0
+            self.signal_calls: list[dict] = []
+
+        def _tokens(self, text: str) -> list[str]:
+            return [token for token in text.lower().split() if token]
+
+        def build_idf_profile(
+            self,
+            documents,
+            *,
+            domain=None,
+            min_documents=200,
+            min_unique_terms=1000,
+            min_total_tokens=10000,
+        ):
+            import math
+
+            self.build_calls += 1
+            docs = [self._tokens(str(doc)) for doc in documents if str(doc).strip()]
+            doc_count = len(docs)
+            total_tokens = sum(len(doc) for doc in docs)
+            doc_freq: dict[str, int] = {}
+            for doc in docs:
+                for token in set(doc):
+                    doc_freq[token] = doc_freq.get(token, 0) + 1
+            unique_terms = len(doc_freq)
+            idf_values = {
+                token: math.log((1.0 + doc_count) / (1.0 + freq)) + 1.0
+                for token, freq in sorted(doc_freq.items())
+            }
+            return IdfActivationTests._FakeIdfProfile(
+                domain=domain,
+                doc_count=doc_count,
+                unique_terms=unique_terms,
+                total_tokens=total_tokens,
+                min_documents=int(min_documents),
+                min_unique_terms=int(min_unique_terms),
+                min_total_tokens=int(min_total_tokens),
+                idf_values=idf_values,
+            )
+
+        def signal_score(self, source_text: str, target_text: str, **kwargs):
+            self.signal_calls.append(dict(kwargs))
+            source = set(self._tokens(source_text))
+            target = set(self._tokens(target_text))
+            intersection = source & target
+            union = source | target
+            overlap = 1.0 if intersection else 0.0
+            mode = str(kwargs.get("mode", "lexical"))
+            idf_profile = kwargs.get("idf_profile")
+            idf_status = "not_requested"
+            idf_used = False
+            idf_cosine = 0.0
+            idf_jaccard = 0.0
+            cosine = float(len(intersection) / ((len(source) * len(target)) ** 0.5)) if source and target else 0.0
+            jaccard = float(len(intersection) / len(union)) if union else 0.0
+            if mode in {"auto", "idf"}:
+                if isinstance(idf_profile, dict):
+                    idf_status = str(idf_profile.get("status", "cold"))
+                    idf_used = idf_status == "ready"
+                    if idf_used:
+                        idf_map = {str(k): float(v) for k, v in dict(idf_profile.get("idf", {})).items()}
+                        unknown = min(idf_map.values()) * 0.5 if idf_map else 0.1
+                        def _w(term: str) -> float:
+                            return float(idf_map.get(term, unknown))
+                        source_vec = {t: _w(t) for t in source}
+                        target_vec = {t: _w(t) for t in target}
+                        dot = sum(source_vec[t] * target_vec[t] for t in intersection)
+                        left_norm = sum(v * v for v in source_vec.values()) ** 0.5
+                        right_norm = sum(v * v for v in target_vec.values()) ** 0.5
+                        idf_cosine = (dot / (left_norm * right_norm)) if left_norm > 0 and right_norm > 0 else 0.0
+                        idf_num = sum(_w(t) for t in intersection)
+                        idf_den = sum(_w(t) for t in union)
+                        idf_jaccard = (idf_num / idf_den) if idf_den > 0 else 0.0
+                else:
+                    idf_status = "missing"
+            weights = kwargs.get("weights")
+            if isinstance(weights, dict):
+                w_cos = float(weights.get("cosine", 0.0))
+                w_jac = float(weights.get("jaccard", 0.0))
+                w_idf_cos = float(weights.get("idf_cosine", 0.0))
+                w_idf_jac = float(weights.get("idf_jaccard", 0.0))
+                total = w_cos + w_jac + w_idf_cos + w_idf_jac
+                if total <= 0:
+                    final = 0.0
+                    norm = {"cosine": 0.0, "jaccard": 0.0, "idf_cosine": 0.0, "idf_jaccard": 0.0}
+                else:
+                    norm = {
+                        "cosine": w_cos / total,
+                        "jaccard": w_jac / total,
+                        "idf_cosine": w_idf_cos / total,
+                        "idf_jaccard": w_idf_jac / total,
+                    }
+                    final = (
+                        cosine * norm["cosine"]
+                        + jaccard * norm["jaccard"]
+                        + idf_cosine * norm["idf_cosine"]
+                        + idf_jaccard * norm["idf_jaccard"]
+                    )
+            else:
+                norm = {"cosine": 0.7, "jaccard": 0.3, "idf_cosine": 0.0, "idf_jaccard": 0.0}
+                final = (cosine * 0.7) + (jaccard * 0.3)
+            return IdfActivationTests._FakeBreakdown(
+                cosine=cosine,
+                jaccard=jaccard,
+                idf_cosine=idf_cosine,
+                idf_jaccard=idf_jaccard,
+                final=final,
+                weights=norm,
+                idf_status=idf_status,
+                idf_used=idf_used,
+            )
+
+        def drift_score(self, _source_text: str, _target_text: str) -> float:
+            return 0.0
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        self.sqlite_file.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _record_many(self, count: int, *, domain: str | None = None, prefix: str = "idf") -> None:
+        for idx in range(count):
+            self.record(
+                f"{prefix} memory {idx} contains enough repeated tokens for idf activation checks",
+                kind="note",
+                domain=domain,
+            )
+
+    def test_doctor_reports_idf_object_even_when_cold(self) -> None:
+        result = server.mnemo_doctor({})
+        self.assertFalse(result["isError"], result)
+        payload = result["structuredContent"]
+        self.assertIn("idf", payload)
+        self.assertIn("project", payload["idf"])
+        self.assertIn(payload["idf"]["project"]["status"], {"cold", "unavailable", "disabled"})
+
+    def test_cold_corpus_keeps_project_idf_inactive(self) -> None:
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self.record("short corpus sample for cold idf behavior with five tokens", kind="note")
+            doctor = server.mnemo_doctor({})
+        project = doctor["structuredContent"]["idf"]["project"]
+        self.assertEqual(project["status"], "cold")
+        self.assertFalse(project["active"])
+
+    def test_low_thresholds_activate_project_idf(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self.record("project idf activation test data with enough lexical material", kind="note")
+            doctor = server.mnemo_doctor({})
+        project = doctor["structuredContent"]["idf"]["project"]
+        self.assertEqual(project["status"], "ready")
+        self.assertTrue(project["active"])
+
+    def test_idf_mode_off_disables_even_if_mature(self) -> None:
+        os.environ["MNEMO_IDF_MODE"] = "off"
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self.record("idf off mode should remain disabled regardless of corpus maturity", kind="note")
+            doctor = server.mnemo_doctor({})
+        project = doctor["structuredContent"]["idf"]["project"]
+        self.assertEqual(project["status"], "disabled")
+        self.assertFalse(project["active"])
+
+    def test_idf_mode_off_salience_check_keeps_lexical_path(self) -> None:
+        os.environ["MNEMO_IDF_MODE"] = "off"
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self.record("auth middleware guard clause before route handlers", kind="decision")
+            result = server.memory_salience_check({"text": "auth middleware guard clause", "limit": 5})
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertFalse(structured["idf_used"])
+        self.assertEqual(structured["idf_scope_used"], "none")
+        self.assertEqual(structured["idf_profile_status"], "disabled")
+
+    def test_missing_salience_reports_unavailable_without_crash(self) -> None:
+        with mock.patch("server.load_optional_agent_salience", return_value=(None, "forced missing")):
+            doctor = server.mnemo_doctor({})
+        self.assertFalse(doctor["isError"], doctor)
+        idf_payload = doctor["structuredContent"]["idf"]
+        self.assertFalse(idf_payload["available"])
+        self.assertEqual(idf_payload["project"]["status"], "unavailable")
+
+    def test_domain_profiles_activate_independently(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "20"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1000"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "10000"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_DOCUMENTS"] = "2"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self._record_many(2, domain="auth", prefix="auth")
+            self._record_many(1, domain="billing", prefix="billing")
+            doctor = server.mnemo_doctor({})
+        domains = doctor["structuredContent"]["idf"]["domains"]
+        self.assertIn("auth", domains)
+        self.assertIn("billing", domains)
+        self.assertTrue(domains["auth"]["active"])
+        self.assertFalse(domains["billing"]["active"])
+        self.assertFalse(doctor["structuredContent"]["idf"]["project"]["active"])
+
+    def test_salience_check_uses_active_idf_profile(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self.record("auth middleware marker token set for idf scoring pathway", kind="decision", domain="auth")
+            result = server.memory_salience_check({"text": "auth middleware marker", "domain": "auth", "limit": 5})
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertTrue(structured["idf_used"])
+        self.assertEqual(structured["idf_scope_used"], "project")
+        self.assertEqual(structured["idf_profile_status"], "ready")
+        self.assertEqual(structured["idf"]["status"], "ready")
+        self.assertIn("idf_jaccard", structured["score_breakdown"])
+        self.assertGreaterEqual(float(structured["score_breakdown"]["idf_jaccard"]), 0.0)
+        self.assertIn("idf_jaccard", structured["score_weights"])
+        self.assertGreater(len(fake.signal_calls), 0)
+        self.assertEqual(fake.signal_calls[-1].get("mode"), "auto")
+        self.assertIsNotNone(fake.signal_calls[-1].get("idf_profile"))
+        self.assertIn("idf_jaccard", fake.signal_calls[-1].get("weights", {}))
+
+    def test_false_positive_pair_scores_low_with_active_idf(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            for idx in range(12):
+                self.record(
+                    f"and shared common filler token{idx} repeated for idf maturity",
+                    kind="note",
+                    domain="core",
+                )
+            self.record("MCP server entrypoint and tests", kind="decision", domain="core")
+            self.record("Discuss apartment prices and kindergarten logistics", kind="note", domain="core")
+            result = server.memory_salience_check(
+                {
+                    "text": "MCP server entrypoint and tests",
+                    "limit": 50,
+                    "domain": "core",
+                    "use_fts": False,
+                    "candidate_limit": 100,
+                    "max_scored": 100,
+                    "shingle_overlap_threshold": 0.0,
+                }
+            )
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertTrue(structured["idf_used"])
+        self.assertEqual(structured["idf_profile_status"], "ready")
+        unrelated = next(
+            (
+                item
+                for item in structured["matches"]
+                if "apartment prices and kindergarten logistics" in item["text_preview"].lower()
+            ),
+            None,
+        )
+        self.assertIsNotNone(unrelated)
+        assert unrelated is not None
+        breakdown = unrelated["breakdown"]
+        self.assertIn("idf_jaccard", breakdown)
+        self.assertLess(float(breakdown["idf_jaccard"]), 0.10)
+        self.assertLess(float(unrelated["score"]), 0.10)
+
+    def test_cached_profile_reused_when_signature_unchanged(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        fake = self._FakeSalience()
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            self.record("cached idf reuse test with stable corpus signature", kind="note")
+            first = server.mnemo_doctor({})
+            self.assertFalse(first["isError"], first)
+            build_calls_after_first = fake.build_calls
+            second = server.mnemo_doctor({})
+            self.assertFalse(second["isError"], second)
+        self.assertGreater(build_calls_after_first, 0)
+        self.assertEqual(fake.build_calls, build_calls_after_first)
 
 
 class SignatureHelpersTests(MnemoTestCase):

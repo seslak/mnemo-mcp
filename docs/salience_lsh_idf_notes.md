@@ -1,6 +1,6 @@
-# Salience, IDF, and LSH Preparation Notes
+# Salience, IDF, and LSH Notes
 
-Mnemo v0.12 stores deterministic memory signatures so future search/consolidation improvements can be added without changing the storage model.
+Mnemo stores deterministic memory signatures and can automatically activate local IDF profiles when corpus maturity thresholds are met.
 
 ## Current status
 
@@ -17,6 +17,11 @@ Mnemo currently stores:
 - `signature_updated_at`
 
 These fields support exact duplicate detection, bounded near-duplicate candidate selection, and safe consolidation without all-pairs comparison.
+
+Mnemo stores IDF profile state in SQLite (`idf_profiles`) for:
+
+- project scope (`scope=project`, `name=default`)
+- domain scope (`scope=domain`, `name=<domain>`)
 
 ## LSH stance
 
@@ -42,6 +47,7 @@ Agent Salience owns reusable salience math:
 - optional fuzzy lexical similarity
 - optional alias expansion
 - optional cold-start-aware IDF profiles
+- optional IDF-weighted Jaccard/Tanimoto scoring
 
 Mnemo owns:
 
@@ -51,17 +57,36 @@ Mnemo owns:
 - candidate selection
 - memory lifecycle and consolidation
 
-## IDF stance
+## IDF activation stance
 
-IDF should be local and corpus-learned.
+IDF is local and corpus-learned.
 
 Rules:
 
-- IDF is disabled while the corpus is cold.
-- Project-level IDF can activate after enough local records exist.
-- Domain-specific IDF should activate independently per domain when that domain has enough context.
-- IDF is a scoring aid, not a replacement for Jaccard/signatures.
-- Mnemo can store or export corpus material; Agent Salience defines IDF math.
+- In `MNEMO_IDF_MODE=auto`, IDF remains cold until maturity thresholds are reached.
+- Project-level IDF activates after enough local records exist.
+- Domain-level IDF activates independently per domain.
+- In `MNEMO_IDF_MODE=off`, IDF remains disabled.
+- In `MNEMO_IDF_MODE=force`, IDF can activate below thresholds (dev/test use only).
+- IDF is a scoring aid, not a replacement for lexical/FTS/signature/Jaccard behavior.
+- In active mode, Mnemo uses both `idf_cosine` and `idf_jaccard` so common words such as "and" have low impact.
+- Mnemo owns corpus selection and persistence; Agent Salience defines IDF math/scoring.
+
+Default thresholds:
+
+- project: `200 docs`, `1000 unique terms`, `10000 total tokens`
+- domain: `50 docs`, `300 unique terms`, `3000 total tokens`
+- memory inclusion floor: `MNEMO_IDF_MIN_TEXT_TOKENS=5`
+
+Each threshold set is AND-gated:
+
+- docs threshold must pass
+- unique-terms threshold must pass
+- total-tokens threshold must pass
+
+`mnemo.doctor` reports `idf.mode`, `idf.available`, project/domain status, remaining maturity counts, warnings, and recommendations.
+
+This patch does not change candidate generation. It closes scoring behavior only.
 
 ## Alias-map stance
 

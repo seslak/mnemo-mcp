@@ -24,6 +24,14 @@ Environment variables:
 - MNEMO_MAX_FILE_BYTES: max single file bytes read by lookup_symbol. Defaults to 1048576.
 - MNEMO_MAX_CHARS_PER_ITEM: per-item preview cap for recall/search bundles. Defaults to 1200.
 - MNEMO_MAX_TOTAL_CHARS: total preview cap for recall/search bundles. Defaults to 12000.
+- MNEMO_IDF_MODE: auto|off|force. Defaults to auto.
+- MNEMO_IDF_MIN_DOCUMENTS: project corpus documents threshold. Defaults to 200.
+- MNEMO_IDF_MIN_UNIQUE_TERMS: project corpus unique-terms threshold. Defaults to 1000.
+- MNEMO_IDF_MIN_TOTAL_TOKENS: project corpus token threshold. Defaults to 10000.
+- MNEMO_IDF_DOMAIN_MIN_DOCUMENTS: domain corpus documents threshold. Defaults to 50.
+- MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS: domain corpus unique-terms threshold. Defaults to 300.
+- MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS: domain corpus token threshold. Defaults to 3000.
+- MNEMO_IDF_MIN_TEXT_TOKENS: per-memory minimum tokens for IDF corpus inclusion. Defaults to 5.
 - AGENT_SALIENCE_HOME: optional path to local agent-salience checkout for diagnostics when not installed.
 """
 
@@ -38,7 +46,7 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,13 +56,14 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.12.0"
+SERVER_VERSION = "0.13.2"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
 TOKEN_CHARS_PER_TOKEN = 3.7
 NORMALIZER_VERSION = 1
 SIGNATURE_VERSION = 1
+IDF_PROFILE_VERSION = 1
 DEFAULT_MAX_SIGNATURE_SHINGLES = 256
 DEFAULT_SHINGLE_SIZE = 3
 DEFAULT_TOP_TERMS = 32
@@ -155,6 +164,36 @@ _SHOULD_EXIT = False
 _SYMBOL_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
 _SQLITE_BOOTSTRAPPED: set[str] = set()
 _SQLITE_FTS_CANDIDATE_LIMIT = 500
+DEFAULT_EVENT_LIMIT = 20
+MAX_EVENT_LIMIT = 200
+EVENT_SALIENCE_ACTIONS = {
+    "create",
+    "update",
+    "delete",
+    "supersede",
+    "link",
+    "archive",
+    "query",
+    "mnemo_search",
+    "mnemo_compact_context",
+    "mnemo_recent",
+    "mnemo_recall",
+    "mnemo_get",
+    "mnemo_lookup_symbol",
+    "mnemo_maintenance",
+    "record",
+    "search",
+    "recent",
+    "recall",
+    "get",
+    "lookup_symbol",
+}
+IDF_ACTIVE_WEIGHTS: dict[str, float] = {
+    "idf_cosine": 0.55,
+    "idf_jaccard": 0.35,
+    "cosine": 0.05,
+    "jaccard": 0.05,
+}
 SALIENCE_UNAVAILABLE_MESSAGE = (
     "Configure AGENT_SALIENCE_HOME or install agent-salience to use salience diagnostics."
 )
@@ -438,6 +477,32 @@ def max_total_bytes() -> int:
 
 def max_file_bytes() -> int:
     return positive_int_env("MNEMO_MAX_FILE_BYTES", 1024 * 1024)
+
+
+def idf_mode() -> str:
+    raw = str(os.environ.get("MNEMO_IDF_MODE", "auto")).strip().lower()
+    if raw in {"auto", "off", "force"}:
+        return raw
+    return "auto"
+
+
+def idf_min_text_tokens() -> int:
+    return positive_int_env("MNEMO_IDF_MIN_TEXT_TOKENS", 5)
+
+
+def idf_thresholds(scope: str) -> dict[str, int]:
+    scope_name = str(scope).strip().lower()
+    if scope_name == "domain":
+        return {
+            "min_documents": positive_int_env("MNEMO_IDF_DOMAIN_MIN_DOCUMENTS", 50),
+            "min_unique_terms": positive_int_env("MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS", 300),
+            "min_total_tokens": positive_int_env("MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS", 3000),
+        }
+    return {
+        "min_documents": positive_int_env("MNEMO_IDF_MIN_DOCUMENTS", 200),
+        "min_unique_terms": positive_int_env("MNEMO_IDF_MIN_UNIQUE_TERMS", 1000),
+        "min_total_tokens": positive_int_env("MNEMO_IDF_MIN_TOTAL_TOKENS", 10000),
+    }
 
 
 def estimate_tokens(text: str) -> int:
@@ -979,6 +1044,305 @@ def _sqlite_rebuild_fts_index(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _event_payload_dict(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return dict(payload)
+    return {"value": payload}
+
+
+def _event_int_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return 1 if value else 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_query_text(payload: dict[str, Any]) -> str | None:
+    query_text = normalize_optional_string(payload.get("query_text"))
+    if query_text:
+        return query_text
+    query_text = normalize_optional_string(payload.get("query"))
+    if query_text:
+        return query_text
+    args = payload.get("args")
+    if isinstance(args, dict):
+        return normalize_optional_string(args.get("query"))
+    return None
+
+
+def _event_action(payload: dict[str, Any], event_type: str) -> str:
+    action = normalize_optional_string(payload.get("action"))
+    if action:
+        return action
+    tool_name = normalize_optional_string(payload.get("tool"))
+    if tool_name:
+        return tool_name
+    return event_type
+
+
+def _event_summary(action: str, event_type: str, payload: dict[str, Any], query_text: str | None) -> str | None:
+    explicit = normalize_optional_string(payload.get("summary"))
+    if explicit:
+        return explicit
+    if query_text:
+        n_results = _event_int_value(payload.get("result_count"))
+        if n_results is None:
+            n_results = _event_int_value(payload.get("n_results"))
+        if n_results is not None:
+            return f"{action}: {query_text} ({n_results} results)"
+        return f"{action}: {query_text}"
+    if event_type == "create":
+        kind = normalize_optional_string(payload.get("kind"))
+        if kind:
+            return f"created {kind} memory"
+        return "created memory"
+    if event_type == "update":
+        changed = payload.get("changed")
+        if isinstance(changed, list) and changed:
+            fields = ", ".join(str(field) for field in changed[:6])
+            return f"updated fields: {fields}"
+        return "updated memory"
+    if event_type == "delete":
+        reason = normalize_optional_string(payload.get("reason"))
+        if reason:
+            return f"deleted memory ({reason})"
+        return "deleted memory"
+    if event_type == "supersede":
+        target = normalize_optional_string(payload.get("superseded_by"))
+        return f"superseded by {target}" if target else "superseded memory"
+    if event_type == "link":
+        target = normalize_optional_string(payload.get("target_id"))
+        relation = normalize_optional_string(payload.get("relation"))
+        if target and relation:
+            return f"linked to {target} ({relation})"
+        if target:
+            return f"linked to {target}"
+        return "linked memory"
+    if event_type == "archive":
+        archived_to = normalize_optional_string(payload.get("archived_to"))
+        return f"archived to {archived_to}" if archived_to else "archived memory"
+    return normalize_optional_string(payload.get("message")) or event_type
+
+
+def _event_include_in_salience(action: str, payload: dict[str, Any]) -> int:
+    explicit = payload.get("include_in_salience")
+    if explicit is not None:
+        return 1 if parse_bool(explicit, default=False) else 0
+    return 1 if action in EVENT_SALIENCE_ACTIONS else 0
+
+
+def _event_salience_text(
+    action: str,
+    memory_id: str | None,
+    source_id: str | None,
+    target_id: str | None,
+    relation: str | None,
+    query_text: str | None,
+    summary: str | None,
+    payload: dict[str, Any],
+) -> str | None:
+    parts = [
+        action,
+        memory_id,
+        source_id,
+        target_id,
+        relation,
+        query_text,
+        summary,
+        normalize_optional_string(payload.get("error")),
+        normalize_optional_string(payload.get("message")),
+    ]
+    text = " | ".join(str(part).strip() for part in parts if part and str(part).strip())
+    return text or None
+
+
+def _event_record_fields(
+    memory_id: str | None,
+    event_type: str,
+    payload_raw: Any,
+    created: str,
+    event_id: str,
+) -> dict[str, Any]:
+    payload = _event_payload_dict(payload_raw)
+    action = _event_action(payload, event_type)
+    query_text = _event_query_text(payload)
+    args = payload.get("args")
+    args_dict = args if isinstance(args, dict) else {}
+
+    memory_value = normalize_optional_string(memory_id) or normalize_optional_string(payload.get("memory_id"))
+    source_id = normalize_optional_string(payload.get("source_id"))
+    target_id = normalize_optional_string(payload.get("target_id")) or normalize_optional_string(payload.get("superseded_by"))
+    relation = normalize_optional_string(payload.get("relation"))
+    if source_id is None and action == "link":
+        source_id = memory_value
+    if target_id is None and action == "link":
+        target_id = normalize_optional_string(payload.get("id"))
+    result_count = _event_int_value(payload.get("result_count"))
+    if result_count is None:
+        result_count = _event_int_value(payload.get("n_results"))
+    success = _event_int_value(payload.get("success"))
+    if success is None:
+        success = 1
+    kind = normalize_optional_string(payload.get("kind")) or normalize_optional_string(args_dict.get("kind"))
+    domain = normalize_optional_string(payload.get("domain")) or normalize_optional_string(args_dict.get("domain"))
+    role = normalize_optional_string(payload.get("role")) or normalize_optional_string(args_dict.get("role"))
+    agent_id = normalize_optional_string(payload.get("agent_id")) or normalize_optional_string(args_dict.get("agent_id"))
+    summary = _event_summary(action, event_type, payload, query_text)
+    include_in_salience = _event_include_in_salience(action, payload)
+    salience_text = _event_salience_text(
+        action,
+        memory_value,
+        source_id,
+        target_id,
+        relation,
+        query_text,
+        summary,
+        payload,
+    )
+
+    return {
+        "id": event_id,
+        "event_id": event_id,
+        "memory_id": memory_value,
+        "event_type": event_type,
+        "action": action,
+        "source_id": source_id,
+        "target_id": target_id,
+        "relation": relation,
+        "query_text": query_text,
+        "result_count": result_count,
+        "success": success,
+        "agent_id": agent_id,
+        "role": role,
+        "domain": domain,
+        "kind": kind,
+        "summary": summary,
+        "salience_text": salience_text,
+        "include_in_salience": include_in_salience,
+        "data_json": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        "created_at": created,
+        "ts": created,
+    }
+
+
+def _sqlite_events_fts_available(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(
+                event_id UNINDEXED,
+                action,
+                memory_id,
+                source_id,
+                target_id,
+                relation,
+                query_text,
+                summary,
+                salience_text,
+                agent_id,
+                role,
+                domain,
+                kind
+            )
+            """
+        )
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def _sqlite_has_events_fts_table(conn: sqlite3.Connection) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='events_fts'"
+    ).fetchone()
+    return row is not None
+
+
+def _sqlite_sync_events_fts_for_record(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    if not _sqlite_has_events_fts_table(conn) and not _sqlite_events_fts_available(conn):
+        return
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO events_fts(
+            event_id, action, memory_id, source_id, target_id, relation, query_text,
+            summary, salience_text, agent_id, role, domain, kind
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(record.get("event_id") or ""),
+            str(record.get("action") or ""),
+            str(record.get("memory_id") or ""),
+            str(record.get("source_id") or ""),
+            str(record.get("target_id") or ""),
+            str(record.get("relation") or ""),
+            str(record.get("query_text") or ""),
+            str(record.get("summary") or ""),
+            str(record.get("salience_text") or ""),
+            str(record.get("agent_id") or ""),
+            str(record.get("role") or ""),
+            str(record.get("domain") or ""),
+            str(record.get("kind") or ""),
+        ),
+    )
+
+
+def _sqlite_rebuild_events_fts_index(conn: sqlite3.Connection) -> bool:
+    if not _sqlite_has_events_fts_table(conn) and not _sqlite_events_fts_available(conn):
+        return False
+    conn.execute("DELETE FROM events_fts")
+    rows = conn.execute(
+        """
+        SELECT event_id, action, memory_id, source_id, target_id, relation, query_text,
+               summary, salience_text, agent_id, role, domain, kind
+        FROM events
+        """
+    ).fetchall()
+    for row in rows:
+        record = {
+            "event_id": row["event_id"],
+            "action": row["action"],
+            "memory_id": row["memory_id"],
+            "source_id": row["source_id"],
+            "target_id": row["target_id"],
+            "relation": row["relation"],
+            "query_text": row["query_text"],
+            "summary": row["summary"],
+            "salience_text": row["salience_text"],
+            "agent_id": row["agent_id"],
+            "role": row["role"],
+            "domain": row["domain"],
+            "kind": row["kind"],
+        }
+        _sqlite_sync_events_fts_for_record(conn, record)
+    _sqlite_set_meta(conn, "events_fts_index_built_at", now_iso())
+    return True
+
+
+def _sqlite_enrich_event_record_from_memory(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    memory_id = normalize_optional_string(record.get("memory_id"))
+    if not memory_id:
+        return
+    needs = any(
+        normalize_optional_string(record.get(field)) is None
+        for field in ("kind", "domain", "role", "agent_id")
+    )
+    if not needs:
+        return
+    row = conn.execute(
+        "SELECT kind, domain, role, agent_id FROM memories WHERE id = ?",
+        (memory_id,),
+    ).fetchone()
+    if row is None:
+        return
+    for field in ("kind", "domain", "role", "agent_id"):
+        if normalize_optional_string(record.get(field)) is None:
+            record[field] = normalize_optional_string(row[field])
+
+
 def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -1041,6 +1405,27 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS idf_profiles (
+            scope TEXT NOT NULL,
+            name TEXT NOT NULL,
+            profile_version INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            doc_count INTEGER NOT NULL,
+            unique_terms INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            min_documents INTEGER NOT NULL,
+            min_unique_terms INTEGER NOT NULL,
+            min_total_tokens INTEGER NOT NULL,
+            corpus_signature TEXT,
+            profile_json TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (scope, name, profile_version)
+        )
+        """
+    )
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)",
         "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
@@ -1059,6 +1444,8 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_memory_id ON events(memory_id)",
         "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
         "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_idf_profiles_scope_name ON idf_profiles(scope, name)",
+        "CREATE INDEX IF NOT EXISTS idx_idf_profiles_updated_at ON idf_profiles(updated_at)",
     ):
         conn.execute(statement)
     # Idempotent column migrations for v0.12.0 signature columns
@@ -1076,7 +1463,49 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     for _col_name, _col_type in _v12_signature_columns:
         if _col_name not in _existing_cols:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
-    _sqlite_set_meta(conn, "schema_version", "1")
+    _event_columns = [
+        ("event_id", "TEXT"),
+        ("ts", "TEXT"),
+        ("action", "TEXT"),
+        ("source_id", "TEXT"),
+        ("target_id", "TEXT"),
+        ("relation", "TEXT"),
+        ("query_text", "TEXT"),
+        ("result_count", "INTEGER"),
+        ("success", "INTEGER"),
+        ("agent_id", "TEXT"),
+        ("role", "TEXT"),
+        ("domain", "TEXT"),
+        ("kind", "TEXT"),
+        ("summary", "TEXT"),
+        ("salience_text", "TEXT"),
+        ("include_in_salience", "INTEGER"),
+    ]
+    _event_existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+    for _col_name, _col_type in _event_columns:
+        if _col_name not in _event_existing_cols:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {_col_name} {_col_type}")
+    conn.execute("UPDATE events SET event_id = id WHERE event_id IS NULL OR event_id = ''")
+    conn.execute("UPDATE events SET ts = created_at WHERE ts IS NULL OR ts = ''")
+    conn.execute(
+        "UPDATE events SET action = COALESCE(NULLIF(action, ''), event_type) WHERE action IS NULL OR action = ''"
+    )
+    conn.execute("UPDATE events SET success = 1 WHERE success IS NULL")
+    conn.execute("UPDATE events SET include_in_salience = 0 WHERE include_in_salience IS NULL")
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS idx_mnemo_events_ts ON events(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_mnemo_events_action ON events(action)",
+        "CREATE INDEX IF NOT EXISTS idx_mnemo_events_memory_id ON events(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_mnemo_events_domain ON events(domain)",
+        "CREATE INDEX IF NOT EXISTS idx_mnemo_events_success ON events(success)",
+        "CREATE INDEX IF NOT EXISTS idx_mnemo_events_include_salience ON events(include_in_salience)",
+    ):
+        conn.execute(statement)
+    events_fts_available = _sqlite_events_fts_available(conn)
+    _sqlite_set_meta(conn, "events_fts_available", "1" if events_fts_available else "0")
+    if events_fts_available and _sqlite_get_meta(conn, "events_fts_index_built_at") is None:
+        _sqlite_rebuild_events_fts_index(conn)
+    _sqlite_set_meta(conn, "schema_version", "2")
     if _sqlite_get_meta(conn, "created_at") is None:
         _sqlite_set_meta(conn, "created_at", now_iso())
 
@@ -1200,7 +1629,7 @@ def _sqlite_insert_event(
     event_id: str | None = None,
 ) -> None:
     created = created_at or now_iso()
-    payload = data if isinstance(data, dict) else {"value": data}
+    payload = _event_payload_dict(data)
     if not event_id:
         digest = hashlib.sha1(
             f"{created}:{event_type}:{memory_id or ''}:{json.dumps(payload, sort_keys=True, ensure_ascii=False)}".encode(
@@ -1208,16 +1637,23 @@ def _sqlite_insert_event(
             )
         ).hexdigest()[:16]
         event_id = f"evt_{digest}"
+    record = _event_record_fields(memory_id, event_type, payload, created, event_id)
+    _sqlite_enrich_event_record_from_memory(conn, record)
     conn.execute(
-        "INSERT OR IGNORE INTO events(id, memory_id, event_type, data_json, created_at) VALUES(?, ?, ?, ?, ?)",
-        (
-            event_id,
-            memory_id or None,
-            event_type,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-            created,
-        ),
+        """
+        INSERT OR IGNORE INTO events(
+            id, event_id, memory_id, event_type, action, source_id, target_id, relation,
+            query_text, result_count, success, agent_id, role, domain, kind, summary,
+            salience_text, include_in_salience, data_json, created_at, ts
+        ) VALUES(
+            :id, :event_id, :memory_id, :event_type, :action, :source_id, :target_id, :relation,
+            :query_text, :result_count, :success, :agent_id, :role, :domain, :kind, :summary,
+            :salience_text, :include_in_salience, :data_json, :created_at, :ts
+        )
+        """,
+        record,
     )
+    _sqlite_sync_events_fts_for_record(conn, record)
 
 
 def _sqlite_sync_links_for_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> None:
@@ -1627,12 +2063,16 @@ def salience_breakdown_payload(breakdown: Any) -> dict[str, Any]:
     return {
         "cosine": float(getattr(breakdown, "cosine", 0.0)),
         "jaccard": float(getattr(breakdown, "jaccard", 0.0)),
+        "idf_cosine": float(getattr(breakdown, "idf_cosine", 0.0)),
+        "idf_jaccard": float(getattr(breakdown, "idf_jaccard", 0.0)),
         "repetition": float(getattr(breakdown, "repetition", 0.0)),
         "recency": float(getattr(breakdown, "recency", 0.0)),
         "novelty": float(getattr(breakdown, "novelty", 0.0)),
         "drift": float(getattr(breakdown, "drift", 0.0)),
         "final": float(getattr(breakdown, "final", 0.0)),
         "weights": dict(getattr(breakdown, "weights", {})),
+        "idf_status": str(getattr(breakdown, "idf_status", "not_requested")),
+        "idf_used": bool(getattr(breakdown, "idf_used", False)),
     }
 
 
@@ -2208,12 +2648,24 @@ def memory_bundle_item(memory: dict[str, Any], max_chars: int = 300, score: floa
     return item
 
 
-def rank_against_query(memory: dict[str, Any], query: str, salience_module: Any | None = None) -> float:
+def rank_against_query(
+    memory: dict[str, Any],
+    query: str,
+    salience_module: Any | None = None,
+    idf_profile: dict[str, Any] | None = None,
+) -> float:
     if not query.strip():
         return 0.0
     if salience_module is not None:
         try:
-            breakdown = salience_module.signal_score(query, str(memory.get("text", "")))
+            kwargs: dict[str, Any] = {}
+            if isinstance(idf_profile, dict):
+                kwargs = {
+                    "mode": "auto",
+                    "idf_profile": idf_profile,
+                    "weights": dict(IDF_ACTIVE_WEIGHTS),
+                }
+            breakdown = salience_module.signal_score(query, str(memory.get("text", "")), **kwargs)
             return max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
         except Exception:
             pass
@@ -2226,10 +2678,11 @@ def select_memories_by_query(
     query: str,
     limit: int,
     salience_module: Any | None = None,
+    idf_profile: dict[str, Any] | None = None,
 ) -> list[tuple[float, dict[str, Any]]]:
     scored: list[tuple[float, dict[str, Any]]] = []
     for memory in memories:
-        score = rank_against_query(memory, query, salience_module)
+        score = rank_against_query(memory, query, salience_module, idf_profile)
         if score > 0.0 or not query.strip():
             scored.append((score, memory))
     scored.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
@@ -2385,7 +2838,12 @@ def read_event_rows(include_archive: bool = False) -> list[dict[str, Any]]:
                 _sqlite_ensure_schema(conn)
                 _sqlite_bootstrap_if_needed(conn)
                 rows = conn.execute(
-                    "SELECT memory_id, event_type, data_json, created_at FROM events WHERE event_type != 'query' ORDER BY created_at ASC, rowid ASC"
+                    """
+                    SELECT memory_id, event_type, data_json, COALESCE(ts, created_at) AS ts
+                    FROM events
+                    WHERE event_type != 'query'
+                    ORDER BY COALESCE(ts, created_at) ASC, rowid ASC
+                    """
                 ).fetchall()
             out: list[dict[str, Any]] = []
             for row in rows:
@@ -2396,7 +2854,7 @@ def read_event_rows(include_archive: bool = False) -> list[dict[str, Any]]:
                     continue
                 out.append(
                     {
-                        "ts": str(row["created_at"] or ""),
+                        "ts": str(row["ts"] or ""),
                         "event": str(row["event_type"] or ""),
                         "id": str(row["memory_id"] or ""),
                         "details": details,
@@ -2426,6 +2884,344 @@ def read_event_rows(include_archive: bool = False) -> list[dict[str, Any]]:
         except OSError:
             continue
     return rows
+
+
+def _clamp_event_limit(value: Any, default: int = DEFAULT_EVENT_LIMIT) -> int:
+    try:
+        raw = default if value is None else int(value)
+    except (TypeError, ValueError):
+        raw = default
+    return max(1, min(raw, MAX_EVENT_LIMIT))
+
+
+def _event_output_row(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_id": str(record.get("event_id") or record.get("id") or ""),
+        "memory_id": normalize_optional_string(record.get("memory_id")),
+        "timestamp": str(record.get("ts") or record.get("created_at") or ""),
+        "action": str(record.get("action") or record.get("event_type") or ""),
+        "event_type": str(record.get("event_type") or record.get("action") or ""),
+        "kind": normalize_optional_string(record.get("kind")),
+        "domain": normalize_optional_string(record.get("domain")),
+        "role": normalize_optional_string(record.get("role")),
+        "agent_id": normalize_optional_string(record.get("agent_id")),
+        "summary": normalize_optional_string(record.get("summary")),
+        "salience_text": normalize_optional_string(record.get("salience_text")),
+        "source_id": normalize_optional_string(record.get("source_id")),
+        "target_id": normalize_optional_string(record.get("target_id")),
+        "relation": normalize_optional_string(record.get("relation")),
+        "query_text": normalize_optional_string(record.get("query_text")),
+        "result_count": _event_int_value(record.get("result_count")),
+        "success": _event_int_value(record.get("success")),
+        "include_in_salience": _event_int_value(record.get("include_in_salience")),
+    }
+
+
+def _event_output_row_full(record: dict[str, Any]) -> dict[str, Any]:
+    out = _event_output_row(record)
+    data_raw = record.get("data_json")
+    if isinstance(data_raw, str):
+        try:
+            parsed = json.loads(data_raw)
+        except json.JSONDecodeError:
+            parsed = {"raw": data_raw}
+    elif isinstance(data_raw, dict):
+        parsed = data_raw
+    else:
+        parsed = {}
+    out["data"] = parsed if isinstance(parsed, dict) else {"value": parsed}
+    return out
+
+
+def _sqlite_event_row_to_record(row: sqlite3.Row) -> dict[str, Any]:
+    data_json = str(_safe_row_get(row, "data_json") or "{}")
+    try:
+        payload = json.loads(data_json)
+    except json.JSONDecodeError:
+        payload = {"raw": data_json}
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+
+    event_id = str(_safe_row_get(row, "event_id") or _safe_row_get(row, "id") or "")
+    event_type = str(_safe_row_get(row, "event_type") or _safe_row_get(row, "action") or "event")
+    ts = str(_safe_row_get(row, "ts") or _safe_row_get(row, "created_at") or now_iso())
+    memory_id = normalize_optional_string(_safe_row_get(row, "memory_id"))
+    base = _event_record_fields(memory_id, event_type, payload, ts, event_id)
+
+    for key in (
+        "action",
+        "source_id",
+        "target_id",
+        "relation",
+        "query_text",
+        "result_count",
+        "success",
+        "agent_id",
+        "role",
+        "domain",
+        "kind",
+        "summary",
+        "salience_text",
+        "include_in_salience",
+    ):
+        value = _safe_row_get(row, key)
+        if value is None:
+            continue
+        base[key] = value
+    base["id"] = str(_safe_row_get(row, "id") or event_id)
+    base["event_id"] = str(base.get("event_id") or event_id)
+    base["created_at"] = str(_safe_row_get(row, "created_at") or ts)
+    base["ts"] = str(base.get("ts") or ts)
+    base["data_json"] = data_json
+    return base
+
+
+def _legacy_event_rows(include_archive: bool = False) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in read_event_rows(include_archive=include_archive):
+        created = str(row.get("ts", "")).strip() or now_iso()
+        memory_id = normalize_optional_string(row.get("id"))
+        event_type = str(row.get("event", "")).strip() or "event"
+        details = row.get("details")
+        payload = details if isinstance(details, dict) else {"details": details}
+        digest = hashlib.sha1(
+            f"{created}:{event_type}:{memory_id or ''}:{json.dumps(payload, sort_keys=True, ensure_ascii=False)}".encode("utf-8")
+        ).hexdigest()[:16]
+        event_id = f"evt_{digest}"
+        rows.append(_event_record_fields(memory_id, event_type, payload, created, event_id))
+
+    query_paths = [query_log_path().with_name("queries.1.jsonl"), query_log_path()]
+    if include_archive:
+        query_paths.insert(0, query_archive_path())
+    for path in query_paths:
+        for row in _read_jsonl_rows(path):
+            created = str(row.get("ts", "")).strip() or now_iso()
+            payload = dict(row)
+            event_type = "query"
+            digest = hashlib.sha1(
+                f"{created}:{event_type}:{json.dumps(payload, sort_keys=True, ensure_ascii=False)}".encode("utf-8")
+            ).hexdigest()[:16]
+            event_id = f"evt_{digest}"
+            rows.append(_event_record_fields(None, event_type, payload, created, event_id))
+    rows.sort(key=lambda row: (str(row.get("ts") or ""), str(row.get("event_id") or "")), reverse=True)
+    return rows
+
+
+def _sqlite_recent_event_records(
+    *,
+    limit: int,
+    action: str | None = None,
+    kind: str | None = None,
+    domain: str | None = None,
+    memory_id: str | None = None,
+    event_id: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if action:
+        clauses.append("COALESCE(action, event_type) = ?")
+        params.append(action)
+    if kind:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if domain:
+        clauses.append("domain = ?")
+        params.append(domain)
+    if memory_id:
+        clauses.append("memory_id = ?")
+        params.append(memory_id)
+    if event_id:
+        clauses.append("(event_id = ? OR id = ?)")
+        params.extend([event_id, event_id])
+    sql = "SELECT * FROM events"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY COALESCE(ts, created_at) DESC, rowid DESC LIMIT ?"
+    params.append(limit)
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        rows = conn.execute(sql, params).fetchall()
+    return [_sqlite_event_row_to_record(row) for row in rows]
+
+
+def _event_matches_query(record: dict[str, Any], query_terms: set[str]) -> bool:
+    if not query_terms:
+        return True
+    fields = [
+        str(record.get("action") or ""),
+        str(record.get("event_type") or ""),
+        str(record.get("memory_id") or ""),
+        str(record.get("query_text") or ""),
+        str(record.get("summary") or ""),
+        str(record.get("salience_text") or ""),
+        str(record.get("domain") or ""),
+        str(record.get("role") or ""),
+        str(record.get("agent_id") or ""),
+        str(record.get("source_id") or ""),
+        str(record.get("target_id") or ""),
+        str(record.get("relation") or ""),
+    ]
+    haystack = " ".join(fields)
+    hay_tokens = tokenize(haystack)
+    return bool(query_terms & hay_tokens)
+
+
+def recent_events(args: dict[str, Any]) -> dict[str, Any]:
+    limit = _clamp_event_limit(args.get("limit"), default=DEFAULT_EVENT_LIMIT)
+    action = normalize_optional_string(args.get("action"))
+    kind = normalize_optional_string(args.get("kind"))
+    domain = normalize_optional_string(args.get("domain"))
+    try:
+        if store_backend() == "sqlite":
+            rows = _sqlite_recent_event_records(limit=limit, action=action, kind=kind, domain=domain)
+        else:
+            rows = _legacy_event_rows(include_archive=False)
+            if action:
+                rows = [row for row in rows if str(row.get("action") or row.get("event_type") or "") == action]
+            if kind:
+                rows = [row for row in rows if normalize_optional_string(row.get("kind")) == kind]
+            if domain:
+                rows = [row for row in rows if normalize_optional_string(row.get("domain")) == domain]
+            rows = rows[:limit]
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    compact = [_event_output_row(row) for row in rows]
+    text_lines = [f"Recent events ({len(compact)}):"]
+    for item in compact:
+        text_lines.append(
+            f"- {item['timestamp']} {item['action']} event_id={item['event_id']} memory_id={item.get('memory_id') or '-'}"
+        )
+    return text_result("\n".join(text_lines), {"events": compact, "count": len(compact)})
+
+
+def memory_events(args: dict[str, Any]) -> dict[str, Any]:
+    memory_id = str(args.get("memory_id", "")).strip()
+    if not memory_id:
+        return tool_error("memory_id is required")
+    limit = _clamp_event_limit(args.get("limit"), default=50)
+    try:
+        if store_backend() == "sqlite":
+            rows = _sqlite_recent_event_records(limit=limit, memory_id=memory_id)
+        else:
+            rows = [row for row in _legacy_event_rows(include_archive=False) if str(row.get("memory_id") or "") == memory_id]
+            rows = rows[:limit]
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    compact = [_event_output_row(row) for row in rows]
+    text_lines = [f"Events for memory {memory_id} ({len(compact)}):"]
+    for item in compact:
+        text_lines.append(f"- {item['timestamp']} {item['action']} event_id={item['event_id']}")
+    return text_result("\n".join(text_lines), {"memory_id": memory_id, "events": compact, "count": len(compact)})
+
+
+def get_event(args: dict[str, Any]) -> dict[str, Any]:
+    event_id = str(args.get("event_id", "")).strip()
+    if not event_id:
+        return tool_error("event_id is required")
+    try:
+        if store_backend() == "sqlite":
+            rows = _sqlite_recent_event_records(limit=1, event_id=event_id)
+        else:
+            rows = [row for row in _legacy_event_rows(include_archive=True) if str(row.get("event_id") or "") == event_id]
+            rows = rows[:1]
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+    if not rows:
+        return tool_error(f"event not found: {event_id}")
+    full = _event_output_row_full(rows[0])
+    return text_result(
+        f"Event {event_id}: {full.get('action')} {full.get('timestamp')}",
+        {"event": full},
+    )
+
+
+def _search_events_sqlite(
+    query: str,
+    limit: int,
+    action: str | None = None,
+    domain: str | None = None,
+) -> list[dict[str, Any]]:
+    tokens = tokenize(query)
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        use_fts = bool(tokens) and _sqlite_events_fts_flag()
+        if use_fts:
+            try:
+                match_expression = _sqlite_fts_match_expression(tokens)
+                clauses = ["events_fts MATCH ?"]
+                params: list[Any] = [match_expression]
+                if action:
+                    clauses.append("COALESCE(e.action, e.event_type) = ?")
+                    params.append(action)
+                if domain:
+                    clauses.append("e.domain = ?")
+                    params.append(domain)
+                sql = (
+                    "SELECT e.* FROM events_fts "
+                    "JOIN events e ON e.event_id = events_fts.event_id "
+                    "WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY COALESCE(e.ts, e.created_at) DESC, e.rowid DESC LIMIT ?"
+                )
+                params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
+                return [_sqlite_event_row_to_record(row) for row in rows]
+            except sqlite3.OperationalError:
+                _sqlite_set_meta(conn, "events_fts_available", "0")
+
+        clauses = []
+        params = []
+        if action:
+            clauses.append("COALESCE(action, event_type) = ?")
+            params.append(action)
+        if domain:
+            clauses.append("domain = ?")
+            params.append(domain)
+        base = "SELECT * FROM events"
+        if clauses:
+            base += " WHERE " + " AND ".join(clauses)
+        base += " ORDER BY COALESCE(ts, created_at) DESC, rowid DESC LIMIT ?"
+        params.append(max(limit * 6, limit))
+        rows = conn.execute(base, params).fetchall()
+    records = [_sqlite_event_row_to_record(row) for row in rows]
+    terms = tokenize(query)
+    filtered = [record for record in records if _event_matches_query(record, terms)]
+    return filtered[:limit]
+
+
+def search_events(args: dict[str, Any]) -> dict[str, Any]:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return tool_error("query is required")
+    limit = _clamp_event_limit(args.get("limit"), default=DEFAULT_EVENT_LIMIT)
+    action = normalize_optional_string(args.get("action"))
+    domain = normalize_optional_string(args.get("domain"))
+    try:
+        if store_backend() == "sqlite":
+            rows = _search_events_sqlite(query, limit, action=action, domain=domain)
+        else:
+            rows = _legacy_event_rows(include_archive=True)
+            if action:
+                rows = [row for row in rows if str(row.get("action") or row.get("event_type") or "") == action]
+            if domain:
+                rows = [row for row in rows if normalize_optional_string(row.get("domain")) == domain]
+            terms = tokenize(query)
+            rows = [row for row in rows if _event_matches_query(row, terms)]
+            rows = rows[:limit]
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    compact = [_event_output_row(row) for row in rows[:limit]]
+    lines = [f"Event search matches ({len(compact)}):"]
+    for item in compact:
+        lines.append(
+            f"- {item['timestamp']} {item['action']} event_id={item['event_id']} summary={item.get('summary') or ''}"
+        )
+    return text_result("\n".join(lines), {"query": query, "events": compact, "count": len(compact)})
 
 
 def search_memories(args: dict[str, Any]) -> dict[str, Any]:
@@ -2488,13 +3284,22 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         max_scored = max(1, min(int(args.get("max_scored") or 100), candidate_limit))
         min_token_count = max(1, int(args.get("min_token_count") or 5))
         use_fts = parse_bool(args.get("use_fts"), default=True)
-        shingle_overlap_threshold = max(0.0, min(1.0, float(args.get("shingle_overlap_threshold") or 0.30)))
+        raw_shingle_overlap_threshold = args.get("shingle_overlap_threshold")
+        shingle_overlap_threshold = 0.30 if raw_shingle_overlap_threshold is None else float(raw_shingle_overlap_threshold)
+        shingle_overlap_threshold = max(0.0, min(1.0, shingle_overlap_threshold))
     except Exception as exc:
         return tool_error(str(exc))
 
     salience, reason = load_optional_agent_salience()
     if salience is None:
         return salience_unavailable_result(reason)
+    idf_state = _ensure_idf_profiles(trigger="salience_check")
+    idf_selection = _resolve_idf_profile_for_memory_or_query(
+        domain=normalize_optional_string(args.get("domain")),
+        idf_state=idf_state,
+    )
+    active_idf_profile = dict(idf_selection["profile"]) if isinstance(idf_selection.get("profile"), dict) else None
+    use_idf = bool(idf_selection.get("active")) and active_idf_profile is not None
 
     input_sig = _build_memory_signature(text)
     input_shingles = _load_json_string_list(input_sig.get("shingle_hashes_json"))
@@ -2565,7 +3370,16 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
     for memory, overlap in scored_candidates[:max_scored]:
         memory_text = str(memory.get("text", ""))
-        breakdown = salience.signal_score(text, memory_text)
+        if use_idf and active_idf_profile is not None:
+            breakdown = salience.signal_score(
+                text,
+                memory_text,
+                mode="auto",
+                idf_profile=active_idf_profile,
+                weights=dict(IDF_ACTIVE_WEIGHTS),
+            )
+        else:
+            breakdown = salience.signal_score(text, memory_text)
         score = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
         triggered = score >= threshold
         matches.append(
@@ -2606,6 +3420,8 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
             )
 
     triggered_count = sum(1 for item in top_matches if item["triggered"])
+    idf_used = any(bool((item.get("breakdown") or {}).get("idf_used")) for item in top_matches)
+    top_breakdown = (top_matches[0].get("breakdown") if top_matches else {}) if top_matches else {}
     explanation = (
         f"{triggered_count}/{len(top_matches)} top matches met threshold {threshold:.2f}."
         if top_matches
@@ -2623,6 +3439,25 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         "candidates_considered": len(candidates),
         "scored_count": len(scored_candidates[:max_scored]),
         "matches": top_matches,
+        "idf_status": str(idf_selection.get("status", "cold")),
+        "idf_used": idf_used,
+        "idf_scope_used": str(idf_selection.get("scope", "none")) if idf_used else "none",
+        "idf_profile_status": str(idf_selection.get("status", "cold")),
+        "score_breakdown": {
+            "cosine": float((top_breakdown or {}).get("cosine", 0.0)),
+            "jaccard": float((top_breakdown or {}).get("jaccard", 0.0)),
+            "idf_cosine": float((top_breakdown or {}).get("idf_cosine", 0.0)),
+            "idf_jaccard": float((top_breakdown or {}).get("idf_jaccard", 0.0)),
+        },
+        "score_weights": dict((top_breakdown or {}).get("weights", {})) if isinstance(top_breakdown, dict) else {},
+        "idf": {
+            "mode": str(idf_state.get("mode", idf_mode())),
+            "available": bool(idf_state.get("available", False)),
+            "scope": str(idf_selection.get("scope", "project")),
+            "name": str(idf_selection.get("name", "default")),
+            "status": str(idf_selection.get("status", "cold")),
+            "active": bool(idf_selection.get("active", False)),
+        },
         "warnings": warnings,
         "explanation": explanation,
     }
@@ -2632,6 +3467,7 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         f"Salience check threshold: {threshold:.2f}",
         f"Candidate source: {candidate_source}",
         f"Scored candidates: {structured['scored_count']}",
+        f"IDF: status={structured['idf_status']} used={'yes' if structured['idf_used'] else 'no'} scope={structured['idf_scope_used']} mode={structured['idf']['mode']}",
         f"Triggered matches: {triggered_count}/{len(top_matches)}",
         explanation,
     ]
@@ -2861,6 +3697,7 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
             append_event_log("create", memory["id"], {"kind": kind, "supersedes": supersedes_id})
             if old is not None:
                 append_event_log("supersede", str(old.get("id")), {"superseded_by": memory["id"]})
+            _refresh_idf_profiles_safely(trigger="write")
 
             structured = {
                 "memory": memory,
@@ -2970,6 +3807,7 @@ def update_memory(args: dict[str, Any]) -> dict[str, Any]:
             save_store(store)
             if changed:
                 append_event_log("update", memory_id, {"changed": changed})
+                _refresh_idf_profiles_safely(trigger="write")
             return text_result(f"Updated memory {memory_id}.", {"memory": memory})
     except LockTimeout as exc:
         return tool_error(str(exc))
@@ -2992,6 +3830,7 @@ def delete_memory(args: dict[str, Any]) -> dict[str, Any]:
             memory["deletion_reason"] = reason
             save_store(store)
             append_event_log("delete", memory_id, {"reason": reason})
+            _refresh_idf_profiles_safely(trigger="write")
             return text_result(f"Deleted memory {memory_id}.", {"memory": memory})
     except LockTimeout as exc:
         return tool_error(str(exc))
@@ -3801,6 +4640,7 @@ def _consolidate_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, A
                     append_event_log("supersede", memory_id, {"superseded_by": survivor})
             if retired:
                 save_store(store)
+                _refresh_idf_profiles_safely(trigger="maintenance")
     except LockTimeout as exc:
         return tool_error(str(exc))
     except Exception as exc:
@@ -3870,6 +4710,9 @@ def _import_json_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, A
                     save_store(store)
         except Exception as exc:
             return tool_error(f"{type(exc).__name__}: {exc}")
+
+    if imported and not dry_run:
+        _refresh_idf_profiles_safely(trigger="maintenance")
 
     return text_result(
         f"Import complete from {source_path}: imported={imported}, skipped={skipped}.",
@@ -3946,6 +4789,8 @@ def _backfill_signatures_maintenance(args: dict[str, Any], dry_run: bool) -> dic
                     updates,
                 )
                 updated += len(batch)
+        if updated:
+            _refresh_idf_profiles_safely(trigger="maintenance")
         return text_result(
             f"backfill_signatures: updated {updated} memories.",
             {
@@ -4056,6 +4901,7 @@ def _consolidate_full_maintenance(args: dict[str, Any]) -> dict[str, Any]:
                     append_event_log("supersede", memory_id, {"superseded_by": survivor})
             if retired:
                 save_store(store2)
+                _refresh_idf_profiles_safely(trigger="maintenance")
     except LockTimeout as exc:
         return tool_error(str(exc))
     except Exception as exc:
@@ -4191,6 +5037,7 @@ def _build_recall_bundle(
     include_pinned: bool,
     include_recent_logs: bool,
     salience_module: Any | None,
+    idf_profile: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     visible = [
         memory
@@ -4223,7 +5070,13 @@ def _build_recall_bundle(
         ]
 
         block_candidates = [memory for memory in visible if str(memory.get("kind", "")) == "context_block"]
-        scored_blocks = select_memories_by_query(block_candidates, query, max_blocks * 2, salience_module)
+        scored_blocks = select_memories_by_query(
+            block_candidates,
+            query,
+            max_blocks * 2,
+            salience_module,
+            idf_profile,
+        )
         blocks_by_id: dict[str, dict[str, Any]] = {}
         for memory in linked_blocks:
             blocks_by_id[str(memory.get("id"))] = memory
@@ -4234,7 +5087,13 @@ def _build_recall_bundle(
         context_blocks = list(blocks_by_id.values())[:max_blocks]
 
         hippocampus = [memory for memory in visible if str(memory.get("kind", "")) == "hippocampus_entry"]
-        scored_hippocampus = select_memories_by_query(hippocampus, query, max_hippocampus, salience_module)
+        scored_hippocampus = select_memories_by_query(
+            hippocampus,
+            query,
+            max_hippocampus,
+            salience_module,
+            idf_profile,
+        )
         hippocampus_entries = [memory for _, memory in scored_hippocampus]
 
         feedback = [
@@ -4300,7 +5159,7 @@ def _build_recall_bundle(
             score += 2.0
         if domain and str(memory.get("domain", "")).strip() == domain:
             score += 2.0
-        score += rank_against_query(memory, task, salience_module) if task else 0.0
+        score += rank_against_query(memory, task, salience_module, idf_profile) if task else 0.0
         if score > 0:
             scored_feedback.append((score, memory))
     scored_feedback.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
@@ -4316,13 +5175,25 @@ def _build_recall_bundle(
             or str(memory.get("domain", "")).strip() == ""
         )
     ]
-    scored_hippocampus = select_memories_by_query(hippocampus_candidates, task, max_hippocampus, salience_module)
+    scored_hippocampus = select_memories_by_query(
+        hippocampus_candidates,
+        task,
+        max_hippocampus,
+        salience_module,
+        idf_profile,
+    )
     hippocampus_entries = [memory for _, memory in scored_hippocampus]
 
     block_candidates = [memory for memory in visible if str(memory.get("kind", "")) == "context_block"]
     if domain:
         block_candidates = [memory for memory in block_candidates if str(memory.get("domain", "")).strip() in {"", domain}]
-    scored_blocks = select_memories_by_query(block_candidates, task, max_blocks, salience_module)
+    scored_blocks = select_memories_by_query(
+        block_candidates,
+        task,
+        max_blocks,
+        salience_module,
+        idf_profile,
+    )
     context_blocks = [memory for _, memory in scored_blocks]
 
     recent_logs: list[dict[str, Any]] = []
@@ -4425,6 +5296,20 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
             query = task
 
     salience, _ = load_optional_agent_salience()
+    recall_idf_profile: dict[str, Any] | None = None
+    idf_choice: dict[str, Any] = {
+        "scope": "none",
+        "status": "not_requested",
+        "active": False,
+    }
+    if salience is not None:
+        try:
+            idf_state = _ensure_idf_profiles(trigger="salience_check")
+            idf_choice = _resolve_idf_profile_for_memory_or_query(domain=domain, idf_state=idf_state)
+            if bool(idf_choice.get("active")) and isinstance(idf_choice.get("profile"), dict):
+                recall_idf_profile = dict(idf_choice["profile"])
+        except Exception:
+            recall_idf_profile = None
     summary, structured = _build_recall_bundle(
         load_store(),
         mode=mode,
@@ -4440,8 +5325,13 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
         include_pinned=include_pinned,
         include_recent_logs=include_recent_logs,
         salience_module=salience,
+        idf_profile=recall_idf_profile,
     )
     structured = _apply_recall_output_caps(structured)
+    structured["idf_used"] = bool(recall_idf_profile)
+    structured["idf_scope_used"] = str(idf_choice.get("scope", "none")) if recall_idf_profile else "none"
+    structured["idf_profile_status"] = str(idf_choice.get("status", "not_requested"))
+    structured["score_weights"] = dict(IDF_ACTIVE_WEIGHTS) if recall_idf_profile else {}
     return text_result(summary, structured)
 
 
@@ -4955,6 +5845,731 @@ def _sqlite_fts_flag() -> bool:
         return False
 
 
+def _sqlite_events_fts_flag() -> bool:
+    if store_backend() != "sqlite":
+        return False
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            meta_value = _sqlite_get_meta(conn, "events_fts_available")
+            if meta_value is not None:
+                return str(meta_value).strip() == "1"
+            available = _sqlite_events_fts_available(conn)
+            _sqlite_set_meta(conn, "events_fts_available", "1" if available else "0")
+            if available and _sqlite_get_meta(conn, "events_fts_index_built_at") is None:
+                _sqlite_rebuild_events_fts_index(conn)
+            return available
+    except Exception:
+        return False
+
+
+def _idf_profile_to_dict(profile: Any) -> dict[str, Any]:
+    if profile is None:
+        return {}
+    if hasattr(profile, "to_dict"):
+        payload = profile.to_dict()
+        if isinstance(payload, dict):
+            return dict(payload)
+    if isinstance(profile, dict):
+        return dict(profile)
+    return {}
+
+
+def _idf_remaining(profile_info: dict[str, Any]) -> dict[str, int]:
+    return {
+        "documents": max(0, int(profile_info.get("min_documents", 0)) - int(profile_info.get("doc_count", 0))),
+        "unique_terms": max(0, int(profile_info.get("min_unique_terms", 0)) - int(profile_info.get("unique_terms", 0))),
+        "total_tokens": max(0, int(profile_info.get("min_total_tokens", 0)) - int(profile_info.get("total_tokens", 0))),
+    }
+
+
+def _idf_profile_diagnostic(
+    *,
+    scope: str,
+    name: str,
+    thresholds: dict[str, int],
+    status: str,
+    active: bool,
+    doc_count: int,
+    unique_terms: int,
+    total_tokens: int,
+    corpus_signature: str | None = None,
+    updated_at: str | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    info = {
+        "scope": scope,
+        "name": name,
+        "status": status,
+        "active": bool(active),
+        "doc_count": max(0, int(doc_count)),
+        "unique_terms": max(0, int(unique_terms)),
+        "total_tokens": max(0, int(total_tokens)),
+        "min_documents": max(1, int(thresholds.get("min_documents", 1))),
+        "min_unique_terms": max(1, int(thresholds.get("min_unique_terms", 1))),
+        "min_total_tokens": max(1, int(thresholds.get("min_total_tokens", 1))),
+        "profile_version": IDF_PROFILE_VERSION,
+        "corpus_signature": corpus_signature,
+        "updated_at": updated_at,
+        "profile": profile,
+    }
+    info["remaining"] = _idf_remaining(info)
+    return info
+
+
+def _idf_corpus_records(domain: str | None = None) -> list[dict[str, Any]]:
+    min_text_tokens = idf_min_text_tokens()
+    wanted_domain = normalize_optional_string(domain)
+    records: list[dict[str, Any]] = []
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                query = """
+                    SELECT id, text, domain, token_count, unique_token_count, content_hash, normalized_hash,
+                           signature_updated_at, updated_at, created_at
+                    FROM memories
+                    WHERE deleted = 0
+                      AND (superseded_by IS NULL OR superseded_by = '')
+                      AND text IS NOT NULL
+                      AND TRIM(text) != ''
+                """
+                params: list[Any] = []
+                if wanted_domain is not None:
+                    query += " AND domain = ?"
+                    params.append(wanted_domain)
+                rows = conn.execute(query, params).fetchall()
+            for row in rows:
+                text_value = str(row["text"] or "").strip()
+                if not text_value:
+                    continue
+                token_count = int(row["token_count"] or 0)
+                if token_count <= 0:
+                    token_count = len(_normalize_for_signature(text_value))
+                if token_count < min_text_tokens:
+                    continue
+                unique_terms = int(row["unique_token_count"] or 0)
+                if unique_terms <= 0:
+                    unique_terms = len(set(_normalize_for_signature(text_value)))
+                records.append(
+                    {
+                        "id": str(row["id"] or ""),
+                        "text": text_value,
+                        "domain": normalize_optional_string(row["domain"]),
+                        "token_count": token_count,
+                        "unique_token_count": unique_terms,
+                        "content_hash": normalize_optional_string(row["content_hash"]),
+                        "normalized_hash": normalize_optional_string(row["normalized_hash"]),
+                        "signature_updated_at": normalize_optional_string(row["signature_updated_at"]),
+                        "updated_at": normalize_optional_string(row["updated_at"]),
+                        "created_at": normalize_optional_string(row["created_at"]),
+                    }
+                )
+            return records
+        except Exception:
+            return []
+
+    try:
+        store = load_store()
+    except Exception:
+        return []
+    for memory in store.get("memories", []):
+        if not isinstance(memory, dict) or not is_active(memory):
+            continue
+        text_value = str(memory.get("text", "")).strip()
+        if not text_value:
+            continue
+        mem_domain = normalize_optional_string(memory.get("domain"))
+        if wanted_domain is not None and mem_domain != wanted_domain:
+            continue
+        token_count = int(memory.get("token_count") or 0)
+        if token_count <= 0:
+            token_count = len(_normalize_for_signature(text_value))
+        if token_count < min_text_tokens:
+            continue
+        unique_terms = int(memory.get("unique_token_count") or 0)
+        if unique_terms <= 0:
+            unique_terms = len(set(_normalize_for_signature(text_value)))
+        records.append(
+            {
+                "id": str(memory.get("id") or ""),
+                "text": text_value,
+                "domain": mem_domain,
+                "token_count": token_count,
+                "unique_token_count": unique_terms,
+                "content_hash": normalize_optional_string(memory.get("content_hash")),
+                "normalized_hash": normalize_optional_string(memory.get("normalized_hash")),
+                "signature_updated_at": normalize_optional_string(memory.get("signature_updated_at")),
+                "updated_at": normalize_optional_string(memory.get("updated_at")),
+                "created_at": normalize_optional_string(memory.get("created_at")),
+            }
+        )
+    return records
+
+
+def _idf_corpus_signature(records: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha1()
+    digest.update(str(IDF_PROFILE_VERSION).encode("ascii"))
+    for record in sorted(records, key=lambda item: (str(item.get("id") or ""), str(item.get("created_at") or ""))):
+        payload = {
+            "id": str(record.get("id") or ""),
+            "domain": str(record.get("domain") or ""),
+            "token_count": int(record.get("token_count") or 0),
+            "unique_token_count": int(record.get("unique_token_count") or 0),
+            "content_hash": str(record.get("content_hash") or ""),
+            "normalized_hash": str(record.get("normalized_hash") or ""),
+            "signature_updated_at": str(record.get("signature_updated_at") or ""),
+            "updated_at": str(record.get("updated_at") or ""),
+        }
+        digest.update(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _idf_quick_stats(domain: str | None = None) -> dict[str, int]:
+    min_text_tokens = idf_min_text_tokens()
+    wanted_domain = normalize_optional_string(domain)
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                query = """
+                    SELECT COUNT(*) AS doc_count, COALESCE(SUM(token_count), 0) AS total_tokens
+                    FROM memories
+                    WHERE deleted = 0
+                      AND (superseded_by IS NULL OR superseded_by = '')
+                      AND text IS NOT NULL
+                      AND TRIM(text) != ''
+                      AND COALESCE(token_count, 0) >= ?
+                """
+                params: list[Any] = [min_text_tokens]
+                if wanted_domain is not None:
+                    query += " AND domain = ?"
+                    params.append(wanted_domain)
+                row = conn.execute(query, params).fetchone()
+            return {
+                "doc_count": int(row["doc_count"] if row is not None else 0),
+                "total_tokens": int(row["total_tokens"] if row is not None else 0),
+            }
+        except Exception:
+            return {"doc_count": 0, "total_tokens": 0}
+
+    try:
+        records = _idf_corpus_records(domain=wanted_domain)
+    except Exception:
+        records = []
+    return {
+        "doc_count": len(records),
+        "total_tokens": int(sum(int(record.get("token_count") or 0) for record in records)),
+    }
+
+
+def _idf_domain_quick_stats() -> dict[str, dict[str, int]]:
+    min_text_tokens = idf_min_text_tokens()
+    out: dict[str, dict[str, int]] = {}
+    if store_backend() == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                rows = conn.execute(
+                    """
+                    SELECT domain, COUNT(*) AS doc_count, COALESCE(SUM(token_count), 0) AS total_tokens
+                    FROM memories
+                    WHERE deleted = 0
+                      AND (superseded_by IS NULL OR superseded_by = '')
+                      AND text IS NOT NULL
+                      AND TRIM(text) != ''
+                      AND COALESCE(token_count, 0) >= ?
+                      AND domain IS NOT NULL
+                      AND TRIM(domain) != ''
+                    GROUP BY domain
+                    """,
+                    (min_text_tokens,),
+                ).fetchall()
+            for row in rows:
+                domain_name = normalize_optional_string(row["domain"])
+                if not domain_name:
+                    continue
+                out[domain_name] = {
+                    "doc_count": int(row["doc_count"] or 0),
+                    "total_tokens": int(row["total_tokens"] or 0),
+                }
+            return out
+        except Exception:
+            return {}
+
+    for record in _idf_corpus_records():
+        domain_name = normalize_optional_string(record.get("domain"))
+        if not domain_name:
+            continue
+        entry = out.setdefault(domain_name, {"doc_count": 0, "total_tokens": 0})
+        entry["doc_count"] += 1
+        entry["total_tokens"] += int(record.get("token_count") or 0)
+    return out
+
+
+def _load_cached_idf_profile(scope: str, name: str) -> dict[str, Any] | None:
+    if store_backend() != "sqlite":
+        return None
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            row = conn.execute(
+                """
+                SELECT scope, name, profile_version, status, active, doc_count, unique_terms, total_tokens,
+                       min_documents, min_unique_terms, min_total_tokens, corpus_signature, profile_json, updated_at
+                FROM idf_profiles
+                WHERE scope = ? AND name = ? AND profile_version = ?
+                """,
+                (scope, name, IDF_PROFILE_VERSION),
+            ).fetchone()
+        if row is None:
+            return None
+        profile_json = normalize_optional_string(row["profile_json"])
+        profile_data: dict[str, Any] | None = None
+        if profile_json:
+            try:
+                parsed = json.loads(profile_json)
+                if isinstance(parsed, dict):
+                    profile_data = parsed
+            except Exception:
+                profile_data = None
+        return {
+            "scope": str(row["scope"] or scope),
+            "name": str(row["name"] or name),
+            "profile_version": int(row["profile_version"] or IDF_PROFILE_VERSION),
+            "status": str(row["status"] or "cold"),
+            "active": bool(int(row["active"] or 0)),
+            "doc_count": int(row["doc_count"] or 0),
+            "unique_terms": int(row["unique_terms"] or 0),
+            "total_tokens": int(row["total_tokens"] or 0),
+            "min_documents": int(row["min_documents"] or 0),
+            "min_unique_terms": int(row["min_unique_terms"] or 0),
+            "min_total_tokens": int(row["min_total_tokens"] or 0),
+            "corpus_signature": normalize_optional_string(row["corpus_signature"]),
+            "profile": profile_data,
+            "updated_at": normalize_optional_string(row["updated_at"]),
+        }
+    except Exception:
+        return None
+
+
+def _save_idf_profile(
+    scope: str,
+    name: str,
+    profile: dict[str, Any],
+    corpus_signature: str,
+    active: bool,
+) -> None:
+    if store_backend() != "sqlite":
+        return
+    payload = _idf_profile_to_dict(profile)
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            conn.execute(
+                """
+                INSERT INTO idf_profiles(
+                    scope, name, profile_version, status, active,
+                    doc_count, unique_terms, total_tokens,
+                    min_documents, min_unique_terms, min_total_tokens,
+                    corpus_signature, profile_json, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope, name, profile_version) DO UPDATE SET
+                    status = excluded.status,
+                    active = excluded.active,
+                    doc_count = excluded.doc_count,
+                    unique_terms = excluded.unique_terms,
+                    total_tokens = excluded.total_tokens,
+                    min_documents = excluded.min_documents,
+                    min_unique_terms = excluded.min_unique_terms,
+                    min_total_tokens = excluded.min_total_tokens,
+                    corpus_signature = excluded.corpus_signature,
+                    profile_json = excluded.profile_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    scope,
+                    name,
+                    IDF_PROFILE_VERSION,
+                    str(payload.get("status", "cold")),
+                    1 if active else 0,
+                    int(payload.get("doc_count", 0) or 0),
+                    int(payload.get("unique_terms", 0) or 0),
+                    int(payload.get("total_tokens", 0) or 0),
+                    int(payload.get("min_documents", 0) or 0),
+                    int(payload.get("min_unique_terms", 0) or 0),
+                    int(payload.get("min_total_tokens", 0) or 0),
+                    corpus_signature,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    now_iso(),
+                ),
+            )
+    except Exception:
+        return
+
+
+def _build_idf_profile_if_ready(
+    scope: str,
+    name: str,
+    records: list[dict[str, Any]],
+    thresholds: dict[str, int],
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    salience, reason = load_optional_agent_salience()
+    builder = getattr(salience, "build_idf_profile", None) if salience is not None else None
+    if not callable(builder):
+        return _idf_profile_diagnostic(
+            scope=scope,
+            name=name,
+            thresholds=thresholds,
+            status="unavailable",
+            active=False,
+            doc_count=0,
+            unique_terms=0,
+            total_tokens=0,
+            profile={"reason": reason} if reason else None,
+        )
+    documents = [str(record.get("text", "")) for record in records]
+    domain_value = None if scope == "project" else name
+    built = builder(
+        documents,
+        domain=domain_value,
+        min_documents=int(thresholds.get("min_documents", 0)),
+        min_unique_terms=int(thresholds.get("min_unique_terms", 0)),
+        min_total_tokens=int(thresholds.get("min_total_tokens", 0)),
+    )
+    payload = _idf_profile_to_dict(built)
+    status = str(payload.get("status", "cold"))
+    active = bool(payload.get("ready", False))
+    if force and documents:
+        status = "ready"
+        active = True
+        payload["status"] = "ready"
+        payload["ready"] = True
+    return _idf_profile_diagnostic(
+        scope=scope,
+        name=name,
+        thresholds=thresholds,
+        status=status,
+        active=active,
+        doc_count=int(payload.get("doc_count", len(documents)) or 0),
+        unique_terms=int(payload.get("unique_terms", 0) or 0),
+        total_tokens=int(payload.get("total_tokens", 0) or 0),
+        profile=payload,
+    )
+
+
+def _idf_public_view(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload)
+    out.pop("profile", None)
+    return out
+
+
+def _ensure_idf_profiles(trigger: str = "doctor") -> dict[str, Any]:
+    mode = idf_mode()
+    force = mode == "force"
+    project_thresholds = idf_thresholds("project")
+    domain_thresholds = idf_thresholds("domain")
+    quick_project = _idf_quick_stats()
+    project_name = "default"
+    state: dict[str, Any] = {
+        "mode": mode,
+        "available": False,
+        "project": _idf_profile_diagnostic(
+            scope="project",
+            name=project_name,
+            thresholds=project_thresholds,
+            status="cold",
+            active=False,
+            doc_count=int(quick_project.get("doc_count", 0)),
+            unique_terms=0,
+            total_tokens=int(quick_project.get("total_tokens", 0)),
+        ),
+        "domains": {},
+        "warnings": [],
+        "recommendations": [],
+    }
+
+    salience, reason = load_optional_agent_salience()
+    idf_available = salience is not None and callable(getattr(salience, "build_idf_profile", None))
+    state["available"] = bool(idf_available)
+    wants_full_refresh = trigger in {"doctor", "salience_check", "maintenance"}
+
+    if mode == "off":
+        cached_project = _load_cached_idf_profile("project", project_name)
+        if cached_project is not None:
+            state["project"] = _idf_profile_diagnostic(
+                scope="project",
+                name=project_name,
+                thresholds=project_thresholds,
+                status="disabled",
+                active=False,
+                doc_count=int(cached_project.get("doc_count", 0)),
+                unique_terms=int(cached_project.get("unique_terms", 0)),
+                total_tokens=int(cached_project.get("total_tokens", 0)),
+                corpus_signature=normalize_optional_string(cached_project.get("corpus_signature")),
+                updated_at=normalize_optional_string(cached_project.get("updated_at")),
+                profile=cached_project.get("profile"),
+            )
+        else:
+            state["project"] = _idf_profile_diagnostic(
+                scope="project",
+                name=project_name,
+                thresholds=project_thresholds,
+                status="disabled",
+                active=False,
+                doc_count=int(quick_project.get("doc_count", 0)),
+                unique_terms=0,
+                total_tokens=int(quick_project.get("total_tokens", 0)),
+            )
+        for domain_name, quick in sorted(_idf_domain_quick_stats().items()):
+            cached_domain = _load_cached_idf_profile("domain", domain_name)
+            state["domains"][domain_name] = _idf_profile_diagnostic(
+                scope="domain",
+                name=domain_name,
+                thresholds=domain_thresholds,
+                status="disabled",
+                active=False,
+                doc_count=int((cached_domain or quick).get("doc_count", 0)),
+                unique_terms=int((cached_domain or {}).get("unique_terms", 0)),
+                total_tokens=int((cached_domain or quick).get("total_tokens", 0)),
+                corpus_signature=normalize_optional_string((cached_domain or {}).get("corpus_signature")),
+                updated_at=normalize_optional_string((cached_domain or {}).get("updated_at")),
+                profile=(cached_domain or {}).get("profile") if cached_domain else None,
+            )
+        return state
+
+    if not idf_available:
+        state["project"] = _idf_profile_diagnostic(
+            scope="project",
+            name=project_name,
+            thresholds=project_thresholds,
+            status="unavailable",
+            active=False,
+            doc_count=int(quick_project.get("doc_count", 0)),
+            unique_terms=0,
+            total_tokens=int(quick_project.get("total_tokens", 0)),
+        )
+        if mode != "off":
+            state["warnings"].append(
+                "Agent Salience IDF helpers unavailable; install or point AGENT_SALIENCE_HOME to enable IDF activation."
+            )
+        if reason and mode != "off":
+            state["warnings"].append(str(reason))
+        return state
+
+    should_build_project = force or wants_full_refresh
+    if not should_build_project:
+        should_build_project = (
+            int(quick_project.get("doc_count", 0)) >= int(project_thresholds["min_documents"])
+            and int(quick_project.get("total_tokens", 0)) >= int(project_thresholds["min_total_tokens"])
+        )
+    if should_build_project:
+        project_records = _idf_corpus_records()
+        project_signature = _idf_corpus_signature(project_records)
+        cached_project = _load_cached_idf_profile("project", project_name)
+        if cached_project is not None and normalize_optional_string(cached_project.get("corpus_signature")) == project_signature:
+            state["project"] = _idf_profile_diagnostic(
+                scope="project",
+                name=project_name,
+                thresholds=project_thresholds,
+                status=str(cached_project.get("status", "cold")),
+                active=bool(cached_project.get("active", False)),
+                doc_count=int(cached_project.get("doc_count", 0)),
+                unique_terms=int(cached_project.get("unique_terms", 0)),
+                total_tokens=int(cached_project.get("total_tokens", 0)),
+                corpus_signature=project_signature,
+                updated_at=normalize_optional_string(cached_project.get("updated_at")),
+                profile=cached_project.get("profile"),
+            )
+        else:
+            built = _build_idf_profile_if_ready(
+                "project",
+                project_name,
+                project_records,
+                project_thresholds,
+                force=force,
+            )
+            built["corpus_signature"] = project_signature
+            built["updated_at"] = now_iso()
+            _save_idf_profile("project", project_name, built.get("profile") or {}, project_signature, bool(built.get("active")))
+            state["project"] = built
+    else:
+        cached_project = _load_cached_idf_profile("project", project_name)
+        if cached_project is not None:
+            state["project"] = _idf_profile_diagnostic(
+                scope="project",
+                name=project_name,
+                thresholds=project_thresholds,
+                status="cold",
+                active=False,
+                doc_count=int(quick_project.get("doc_count", 0)),
+                unique_terms=int(cached_project.get("unique_terms", 0)),
+                total_tokens=int(quick_project.get("total_tokens", 0)),
+                corpus_signature=normalize_optional_string(cached_project.get("corpus_signature")),
+                updated_at=normalize_optional_string(cached_project.get("updated_at")),
+                profile=cached_project.get("profile"),
+            )
+        else:
+            state["project"] = _idf_profile_diagnostic(
+                scope="project",
+                name=project_name,
+                thresholds=project_thresholds,
+                status="cold",
+                active=False,
+                doc_count=int(quick_project.get("doc_count", 0)),
+                unique_terms=0,
+                total_tokens=int(quick_project.get("total_tokens", 0)),
+            )
+
+    domain_quick = _idf_domain_quick_stats()
+    for domain_name, quick in sorted(domain_quick.items()):
+        should_build_domain = force or wants_full_refresh
+        if not should_build_domain:
+            should_build_domain = (
+                int(quick.get("doc_count", 0)) >= int(domain_thresholds["min_documents"])
+                and int(quick.get("total_tokens", 0)) >= int(domain_thresholds["min_total_tokens"])
+            )
+        if should_build_domain:
+            domain_records = _idf_corpus_records(domain=domain_name)
+            domain_signature = _idf_corpus_signature(domain_records)
+            cached_domain = _load_cached_idf_profile("domain", domain_name)
+            if cached_domain is not None and normalize_optional_string(cached_domain.get("corpus_signature")) == domain_signature:
+                state["domains"][domain_name] = _idf_profile_diagnostic(
+                    scope="domain",
+                    name=domain_name,
+                    thresholds=domain_thresholds,
+                    status=str(cached_domain.get("status", "cold")),
+                    active=bool(cached_domain.get("active", False)),
+                    doc_count=int(cached_domain.get("doc_count", 0)),
+                    unique_terms=int(cached_domain.get("unique_terms", 0)),
+                    total_tokens=int(cached_domain.get("total_tokens", 0)),
+                    corpus_signature=domain_signature,
+                    updated_at=normalize_optional_string(cached_domain.get("updated_at")),
+                    profile=cached_domain.get("profile"),
+                )
+            else:
+                built_domain = _build_idf_profile_if_ready(
+                    "domain",
+                    domain_name,
+                    domain_records,
+                    domain_thresholds,
+                    force=force,
+                )
+                built_domain["corpus_signature"] = domain_signature
+                built_domain["updated_at"] = now_iso()
+                _save_idf_profile(
+                    "domain",
+                    domain_name,
+                    built_domain.get("profile") or {},
+                    domain_signature,
+                    bool(built_domain.get("active")),
+                )
+                state["domains"][domain_name] = built_domain
+        else:
+            cached_domain = _load_cached_idf_profile("domain", domain_name)
+            if cached_domain is not None:
+                state["domains"][domain_name] = _idf_profile_diagnostic(
+                    scope="domain",
+                    name=domain_name,
+                    thresholds=domain_thresholds,
+                    status="cold",
+                    active=False,
+                    doc_count=int(quick.get("doc_count", 0)),
+                    unique_terms=int(cached_domain.get("unique_terms", 0)),
+                    total_tokens=int(quick.get("total_tokens", 0)),
+                    corpus_signature=normalize_optional_string(cached_domain.get("corpus_signature")),
+                    updated_at=normalize_optional_string(cached_domain.get("updated_at")),
+                    profile=cached_domain.get("profile"),
+                )
+            else:
+                state["domains"][domain_name] = _idf_profile_diagnostic(
+                    scope="domain",
+                    name=domain_name,
+                    thresholds=domain_thresholds,
+                    status="cold",
+                    active=False,
+                    doc_count=int(quick.get("doc_count", 0)),
+                    unique_terms=0,
+                    total_tokens=int(quick.get("total_tokens", 0)),
+                )
+
+    if mode == "auto" and state["project"].get("status") == "cold":
+        remaining = state["project"].get("remaining", {})
+        state["recommendations"].append(
+            "Project IDF is cold; remaining documents="
+            f"{int(remaining.get('documents', 0))}, unique_terms={int(remaining.get('unique_terms', 0))}, "
+            f"total_tokens={int(remaining.get('total_tokens', 0))}."
+        )
+    return state
+
+
+def _resolve_idf_profile_for_memory_or_query(
+    domain: str | None = None,
+    *,
+    idf_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    state = idf_state if isinstance(idf_state, dict) else _ensure_idf_profiles(trigger="salience_check")
+    wanted_domain = normalize_optional_string(domain)
+    selected: dict[str, Any] | None = None
+    scope = "project"
+    name = "default"
+    domain_info = None
+    if wanted_domain and isinstance(state.get("domains"), dict):
+        maybe_domain = state["domains"].get(wanted_domain)
+        if isinstance(maybe_domain, dict):
+            domain_info = maybe_domain
+    project_info = state.get("project") if isinstance(state.get("project"), dict) else None
+
+    # Prefer active domain IDF when requested.
+    if isinstance(domain_info, dict) and bool(domain_info.get("active")) and isinstance(domain_info.get("profile"), dict):
+        selected = domain_info
+        scope = "domain"
+        name = wanted_domain or "default"
+    # Otherwise use active project IDF when available.
+    elif isinstance(project_info, dict) and bool(project_info.get("active")) and isinstance(project_info.get("profile"), dict):
+        selected = project_info
+        scope = "project"
+        name = "default"
+    # If neither is active, return the requested domain diagnostics when present, else project diagnostics.
+    elif isinstance(domain_info, dict):
+        selected = domain_info
+        scope = "domain"
+        name = wanted_domain or "default"
+    elif isinstance(project_info, dict):
+        selected = project_info
+        scope = "project"
+        name = "default"
+    status = str((selected or {}).get("status", "cold"))
+    active = bool((selected or {}).get("active", False))
+    profile = (selected or {}).get("profile")
+    if not active or not isinstance(profile, dict):
+        profile = None
+    return {
+        "mode": str(state.get("mode", idf_mode())),
+        "available": bool(state.get("available", False)),
+        "scope": scope,
+        "name": name,
+        "status": status,
+        "active": active and profile is not None,
+        "profile": profile,
+    }
+
+
+def _refresh_idf_profiles_safely(trigger: str = "write") -> None:
+    try:
+        _ensure_idf_profiles(trigger=trigger)
+    except Exception:
+        return
+
+
 def _salience_source(module: Any) -> str | None:
     module_file = str(getattr(module, "__file__", "") or "")
     if not module_file:
@@ -5035,16 +6650,76 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
             events_size = int(events_file.stat().st_size)
         except OSError:
             events_size = 0
-    rows = read_event_rows(include_archive=False) if event_logging_enabled() else []
-    rows.sort(key=lambda row: (str(row.get("ts", "")), str(row.get("id", ""))))
-    last_event = rows[-1] if rows else {}
-    last_event_iso = str(last_event.get("ts", "")).strip() or None
-    last_event_kind = str(last_event.get("event", "")).strip() or None
+    event_count = 0
+    recent_event_count = 0
+    missing_event_columns: list[str] = []
+    events_fts_enabled = False
+    last_event_iso: str | None = None
+    last_event_kind: str | None = None
+    recent_cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+    if backend == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                row = conn.execute("SELECT COUNT(*) FROM events").fetchone()
+                event_count = int(row[0]) if row else 0
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM events WHERE COALESCE(ts, created_at) >= ?",
+                    (recent_cutoff,),
+                ).fetchone()
+                recent_event_count = int(row[0]) if row else 0
+                latest = conn.execute(
+                    """
+                    SELECT action, event_type, COALESCE(ts, created_at) AS stamp
+                    FROM events
+                    ORDER BY COALESCE(ts, created_at) DESC, rowid DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if latest:
+                    last_event_iso = str(latest["stamp"] or "").strip() or None
+                    last_event_kind = str(latest["action"] or latest["event_type"] or "").strip() or None
+                event_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+                required_event_cols = {
+                    "event_id",
+                    "ts",
+                    "action",
+                    "memory_id",
+                    "source_id",
+                    "target_id",
+                    "relation",
+                    "query_text",
+                    "result_count",
+                    "success",
+                    "agent_id",
+                    "role",
+                    "domain",
+                    "kind",
+                    "summary",
+                    "salience_text",
+                    "include_in_salience",
+                    "data_json",
+                }
+                missing_event_columns = sorted(required_event_cols - event_cols)
+            events_fts_enabled = _sqlite_events_fts_flag()
+        except Exception:
+            event_count = 0
+            recent_event_count = 0
+    else:
+        rows = _legacy_event_rows(include_archive=False) if (event_logging_enabled() or query_logging_enabled()) else []
+        event_count = len(rows)
+        recent_event_count = sum(1 for row in rows if str(row.get("ts") or "") >= recent_cutoff)
+        latest = rows[0] if rows else {}
+        last_event_iso = str(latest.get("ts") or "").strip() or None
+        last_event_kind = str(latest.get("action") or latest.get("event_type") or "").strip() or None
 
     if not event_logging_enabled():
         warnings.append("MNEMO_LOG_EVENTS=0; event history is not being recorded")
     elif backend == "json" and not events_exists:
         warnings.append("events log file not found yet; no events recorded")
+    if missing_event_columns:
+        warnings.append(f"events table missing typed columns: {', '.join(missing_event_columns)}")
 
     drift = memory_drift_compute(store=store)
     if float(drift.get("value", 0.0)) >= 0.7:
@@ -5059,6 +6734,18 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "version": str(getattr(salience_module, "__version__", "")) if salience_loaded else None,
         "source": _salience_source(salience_module) if salience_loaded else None,
     }
+    idf_state = _ensure_idf_profiles(trigger="doctor")
+    idf_project = _idf_public_view(idf_state.get("project", {})) if isinstance(idf_state.get("project"), dict) else {}
+    idf_domains: dict[str, dict[str, Any]] = {}
+    if isinstance(idf_state.get("domains"), dict):
+        for domain_name, domain_info in sorted(idf_state["domains"].items()):
+            if isinstance(domain_info, dict):
+                idf_domains[domain_name] = _idf_public_view(domain_info)
+    idf_warnings = [str(item) for item in idf_state.get("warnings", []) if str(item).strip()]
+    idf_recommendations = [str(item) for item in idf_state.get("recommendations", []) if str(item).strip()]
+    for warning in idf_warnings:
+        if warning not in warnings:
+            warnings.append(warning)
 
     profile = mcp_profile()
     visible = exposed_tools(profile)
@@ -5130,6 +6817,11 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         recommendations.append("Record a starter memory with mnemo_record to seed project context.")
     if backend == "sqlite" and not fts_available:
         recommendations.append("SQLite FTS5 is unavailable; lexical search is active.")
+    if backend == "sqlite" and not events_fts_enabled:
+        recommendations.append("SQLite events FTS5 is unavailable; event search uses lexical fallback.")
+    for recommendation in idf_recommendations:
+        if recommendation not in recommendations:
+            recommendations.append(recommendation)
 
     memory_file_payload = {
         "path": str(mem_file),
@@ -5146,6 +6838,10 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "size_bytes": events_size,
         "last_event_iso": last_event_iso,
         "last_event_kind": last_event_kind,
+        "event_count": event_count,
+        "recent_event_count": recent_event_count,
+        "events_fts_enabled": events_fts_enabled,
+        "missing_event_columns": missing_event_columns,
     }
     archive_payload = {
         "memory_archive_path": str(memory_archive),
@@ -5165,14 +6861,17 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         if salience_loaded
         else "not loaded"
     )
+    idf_domains_ready = sum(1 for info in idf_domains.values() if bool(info.get("active")))
     backend_exists = sqlite_exists if backend == "sqlite" else mem_exists
     backend_file_name = "mnemo.sqlite" if backend == "sqlite" else "memory.json"
     backend_size = sqlite_size if backend == "sqlite" else memory_file_payload["size_bytes"]
     summary_lines = [
         f"Mnemo {SERVER_VERSION} - {backend_file_name} {'exists' if backend_exists else 'missing'} ({backend_size} bytes, {memory_file_payload['memory_count']} memories)",
         f"Last write: {memory_file_payload['last_write_iso']}  Last id: {memory_file_payload['last_memory_id']}",
+        f"Events: {event_count} total, {recent_event_count} in last 24h, events_fts={'on' if events_fts_enabled else 'off'}",
         f"Kinds: {kind_summary}",
         f"Drift: {drift_value:.2f} ({drift_interp})  Salience: {salience_text}  Search: {search_backend}",
+        f"IDF: project={idf_project.get('status', 'cold')} active={'yes' if idf_project.get('active') else 'no'} domains_ready={idf_domains_ready} mode={idf_state.get('mode', idf_mode())}",
         f"Warnings: {warning_summary}",
     ]
 
@@ -5198,6 +6897,10 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "sqlite_size_bytes": sqlite_size,
         "memory_json_exists": mem_exists,
         "memory_count": memory_count,
+        "event_count": event_count,
+        "recent_event_count": recent_event_count,
+        "events_fts_enabled": events_fts_enabled,
+        "missing_event_columns": missing_event_columns,
         "count_by_kind": count_by_kind,
         "count_by_authority": count_by_authority,
         "count_by_retention": count_by_retention,
@@ -5219,6 +6922,14 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "archive": archive_payload,
         "drift": drift,
         "salience": salience_payload,
+        "idf": {
+            "mode": str(idf_state.get("mode", idf_mode())),
+            "available": bool(idf_state.get("available", False)),
+            "project": idf_project,
+            "domains": idf_domains,
+            "warnings": idf_warnings,
+            "recommendations": idf_recommendations,
+        },
         "warnings": warnings,
         "recommendations": recommendations,
     }
@@ -5247,6 +6958,10 @@ GATEWAY_ACTIONS: dict[str, Any] = {
     "update": update_memory,
     "delete": delete_memory,
     "recent": recent_memories,
+    "recent_events": recent_events,
+    "search_events": search_events,
+    "get_event": get_event,
+    "memory_events": memory_events,
     "compact_context": compact_context,
     "inspect": memory_inspect,
     "maintenance": memory_maintenance,
@@ -5254,7 +6969,7 @@ GATEWAY_ACTIONS: dict[str, Any] = {
     "consolidate_full": memory_consolidate_full_gateway,
     "lookup_symbol": lookup_symbol,
 }
-# v0.12.0: backfill_signatures and consolidate_full are available both as
+# v0.13.0: backfill_signatures and consolidate_full are available both as
 # maintenance sub-actions and as top-level gateway aliases for schema discoverability.
 
 
@@ -5304,6 +7019,7 @@ TOOLS = [
         "description": (
             "Mnemo project-memory gateway; not Copilot native memory. "
             "Actions: doctor, record, search, recall, get, link, export, "
+            "recent_events, search_events, get_event, memory_events, "
             "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures), "
             "inspect, lookup_symbol, salience_check, update, delete, recent."
         ),
@@ -5459,8 +7175,9 @@ def handle_request(message: dict[str, Any]) -> None:
                 "instructions": (
                     "Use the single mnemo gateway tool with action plus optional params. "
                     "Common actions: doctor, search, record, recall, get, link, export, "
-                    "compact_context, inspect, maintenance, salience_check, update, delete, "
-                    "recent, lookup_symbol. Do not look for individual mnemo_* tools; "
+                    "recent_events, search_events, get_event, memory_events, compact_context, "
+                    "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
+                    "Do not look for individual mnemo_* tools; "
                     "they are gateway actions now."
                 ),
             },
@@ -5530,4 +7247,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

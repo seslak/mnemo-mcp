@@ -18,7 +18,7 @@ Every call uses this shape:
 
 ### `doctor`
 
-Returns server, storage, schema, FTS, signature, export, and salience diagnostics.
+Returns server, storage, schema, FTS, signature, export, salience, event-history, and IDF diagnostics.
 
 ```json
 {"action":"doctor"}
@@ -134,6 +134,30 @@ Runs optional Agent Salience diagnostics when `agent-salience` is importable.
 
 The action is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, then scores bounded survivors.
 
+When local IDF profiles are active, `salience_check` passes `mode="auto"` and the active project/domain `idf_profile` into Agent Salience scoring.
+
+Active-IDF scoring uses an IDF-dominant mix:
+
+- `idf_cosine: 0.55`
+- `idf_jaccard: 0.35`
+- `cosine: 0.05`
+- `jaccard: 0.05`
+
+This adds weighted Jaccard/Tanimoto (`idf_jaccard`) to reduce common-word overlap false positives.
+
+Diagnostics include:
+
+- `idf_used`
+- `idf_scope_used`
+- `idf_profile_status`
+- `score_breakdown.cosine`
+- `score_breakdown.jaccard`
+- `score_breakdown.idf_cosine`
+- `score_breakdown.idf_jaccard`
+- `score_weights`
+
+When IDF is cold, disabled, or unavailable, lexical scoring remains active and `idf_used` stays false.
+
 ### `maintenance`
 
 Runs maintenance sub-actions.
@@ -212,6 +236,38 @@ Returns the most recently recorded memories.
 
 ```json
 {"action":"recent","params":{"limit":10}}
+```
+
+### `recent_events`
+
+Returns newest event rows first.
+
+```json
+{"action":"recent_events","params":{"limit":20,"action":"optional","kind":"optional","domain":"optional"}}
+```
+
+### `search_events`
+
+Searches event history across action, memory id, query text, summaries, salience text, and identity fields.
+
+```json
+{"action":"search_events","params":{"query":"IBAN validation","limit":20,"action":"optional","domain":"optional"}}
+```
+
+### `get_event`
+
+Returns one event by id.
+
+```json
+{"action":"get_event","params":{"event_id":"evt_..."}}
+```
+
+### `memory_events`
+
+Returns events related to one memory id.
+
+```json
+{"action":"memory_events","params":{"memory_id":"mem_...","limit":50}}
 ```
 
 ### `update`

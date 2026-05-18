@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.13.2
+
+### Added
+
+- IDF scoring closure with weighted Jaccard/Tanimoto (`idf_jaccard`) support through Agent Salience scoring.
+- Extended salience diagnostics fields:
+  - `idf_scope_used`
+  - `idf_profile_status`
+  - `score_breakdown` (`cosine`, `jaccard`, `idf_cosine`, `idf_jaccard`)
+  - `score_weights`
+
+### Changed
+
+- Active-IDF scoring is now IDF-dominant:
+  - `idf_cosine: 0.55`
+  - `idf_jaccard: 0.35`
+  - `cosine: 0.05`
+  - `jaccard: 0.05`
+- `salience_check` and query-based recall keep candidate generation unchanged, but now reduce common-word false positives by combining `idf_cosine` + `idf_jaccard`.
+
+### Compatibility
+
+- IDF activation thresholds and lazy auto-refresh triggers remain unchanged.
+- Cold/off/unavailable IDF behavior remains safe and lexical fallback remains active.
+- Full LSH/MinHash bucket indexing remains intentionally unimplemented.
+
+## 0.13.1
+
+### Added
+
+- Automatic IDF activation controls with environment configuration:
+  - `MNEMO_IDF_MODE=auto|off|force`
+  - `MNEMO_IDF_MIN_DOCUMENTS`
+  - `MNEMO_IDF_MIN_UNIQUE_TERMS`
+  - `MNEMO_IDF_MIN_TOTAL_TOKENS`
+  - `MNEMO_IDF_DOMAIN_MIN_DOCUMENTS`
+  - `MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS`
+  - `MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS`
+  - `MNEMO_IDF_MIN_TEXT_TOKENS`
+- SQLite persistence for IDF profile state via `idf_profiles` table.
+- Doctor `structuredContent.idf` payload with project/domain maturity, status, warnings, and recommendations.
+
+### Changed
+
+- `salience_check` now resolves project/domain IDF profiles and uses Agent Salience scoring in `mode="auto"` when an active profile is available.
+- IDF profile refresh now runs automatically on:
+  - `doctor`
+  - `salience_check`
+  - successful write paths (`record`, `update`, `delete`)
+  - material maintenance writes (`import_json`, `consolidate`, `consolidate_full`, `backfill_signatures`)
+- Write-path IDF refresh is cheap-first and skips profile rebuild when corpus signatures are unchanged.
+
+### Compatibility
+
+- Mnemo remains dependency-free at runtime; Agent Salience integration is still optional.
+- Full LSH/MinHash bucket indexing remains intentionally unimplemented in this release.
+
+## 0.13.0
+
+### Added
+
+- New gateway actions for event history:
+  - `recent_events`
+  - `search_events`
+  - `get_event`
+  - `memory_events`
+- Typed SQLite event columns for salience-friendly event surfaces:
+  - `event_id`, `ts`, `action`, `memory_id`, `source_id`, `target_id`, `relation`, `query_text`, `result_count`, `success`, `agent_id`, `role`, `domain`, `kind`, `summary`, `salience_text`, `include_in_salience`, `data_json`
+- Event-query indexes:
+  - `idx_mnemo_events_ts`
+  - `idx_mnemo_events_action`
+  - `idx_mnemo_events_memory_id`
+  - `idx_mnemo_events_domain`
+  - `idx_mnemo_events_success`
+  - `idx_mnemo_events_include_salience`
+- Optional `events_fts` support with lexical fallback in `search_events`.
+
+### Changed
+
+- `mnemo` action `doctor` now reports event diagnostics including `event_count`, `recent_event_count`, `events_fts_enabled`, and missing typed-event-column warnings.
+- Query and lifecycle events now populate typed event fields while preserving legacy JSON payload compatibility.
+
 ## 0.12.0
 
 ### Added

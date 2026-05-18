@@ -17,14 +17,53 @@ Primary tables:
 - `memories`
 - `links`
 - `events`
+- `idf_profiles`
 - `meta`
 - optional FTS5 table `memories_fts`
+- optional FTS5 table `events_fts`
 
 Lifecycle and query events are stored in SQLite in SQLite mode.
 
+## Event typed columns (0.13.0)
+
+The `events` table includes typed columns for event-history APIs:
+
+- `event_id`, `ts`, `action`, `memory_id`
+- `source_id`, `target_id`, `relation`
+- `query_text`, `result_count`, `success`
+- `agent_id`, `role`, `domain`, `kind`
+- `summary`, `salience_text`, `include_in_salience`
+- `data_json` (raw payload)
+
+Migration is idempotent: older SQLite files with only legacy event columns are upgraded automatically.
+
+## IDF profile table (0.13.1)
+
+Mnemo persists project/domain IDF profile state in `idf_profiles`:
+
+- `scope` (`project` or `domain`)
+- `name` (`default` for project scope, domain name for domain scope)
+- `profile_version`
+- `status` (`cold`, `ready`, `disabled`, `unavailable`)
+- `active`
+- `doc_count`, `unique_terms`, `total_tokens`
+- threshold columns (`min_documents`, `min_unique_terms`, `min_total_tokens`)
+- `corpus_signature`
+- `profile_json` (serialized Agent Salience IDF payload)
+- `updated_at`
+
+Rows are keyed by `(scope, name, profile_version)` and refreshed only when corpus signatures change.
+
+When profile status is `ready`, Mnemo scoring paths can use:
+
+- `idf_cosine` (IDF-weighted cosine)
+- `idf_jaccard` (IDF-weighted Jaccard/Tanimoto)
+
+This patch does not alter candidate generation; it changes scoring composition only.
+
 ## Signature columns
 
-Mnemo 0.12.0 adds deterministic signature columns to `memories`:
+Mnemo adds deterministic signature columns to `memories`:
 
 | Column | Meaning |
 |---|---|
@@ -42,7 +81,7 @@ Mnemo 0.12.0 adds deterministic signature columns to `memories`:
 
 ## Migration and backfill
 
-SQLite schema migration is idempotent. Existing v0.11.x stores load under v0.12.0. Rows without signatures remain usable and can be backfilled.
+SQLite schema migration is idempotent. Existing v0.11.x stores load under modern releases. Rows without signatures remain usable and can be backfilled.
 
 Dry run:
 

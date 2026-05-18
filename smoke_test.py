@@ -121,7 +121,12 @@ def main() -> int:
             doctor = call_mnemo(proc, 13, "doctor", {})
             consolidate = call_mnemo(proc, 14, "maintenance", {"action": "consolidate"})
             capped_search = call_mnemo(proc, 15, "search", {"query": "validation handoff", "max_tokens": 30})
-            shutdown = rpc(proc, {"jsonrpc": "2.0", "id": 16, "method": "shutdown"})
+            recent_events = call_mnemo(proc, 16, "recent_events", {"limit": 10})
+            searched_events = call_mnemo(proc, 17, "search_events", {"query": "validation handoff", "limit": 10})
+            first_event_id = recent_events["result"]["structuredContent"]["events"][0]["event_id"]
+            event_detail = call_mnemo(proc, 18, "get_event", {"event_id": first_event_id})
+            memory_events = call_mnemo(proc, 19, "memory_events", {"memory_id": memory_id, "limit": 20})
+            shutdown = rpc(proc, {"jsonrpc": "2.0", "id": 20, "method": "shutdown"})
         finally:
             try:
                 proc.wait(timeout=5)
@@ -156,11 +161,20 @@ def main() -> int:
     assert "archive" in doctor_structured
     assert "drift" in doctor_structured
     assert "salience" in doctor_structured
+    assert "idf" in doctor_structured
     assert "warnings" in doctor_structured
     assert 0.0 <= float(doctor_structured["drift"]["value"]) <= 1.0
     assert consolidate["result"]["isError"] is False
     assert consolidate["result"]["structuredContent"]["applied"] is False
     assert capped_search["result"]["structuredContent"]["truncated"] is True
+    assert recent_events["result"]["isError"] is False
+    assert recent_events["result"]["structuredContent"]["events"]
+    assert searched_events["result"]["isError"] is False
+    assert searched_events["result"]["structuredContent"]["events"]
+    assert event_detail["result"]["isError"] is False
+    assert event_detail["result"]["structuredContent"]["event"]["event_id"] == first_event_id
+    assert memory_events["result"]["isError"] is False
+    assert memory_events["result"]["structuredContent"]["events"]
     assert shutdown["result"] == {}
     print("OK: mnemo MCP server smoke test passed")
     return 0
