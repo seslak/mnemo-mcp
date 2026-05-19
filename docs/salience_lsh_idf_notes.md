@@ -88,8 +88,17 @@ Each threshold set is AND-gated:
 
 This patch does not change candidate generation. It closes scoring behavior only.
 
-## Alias-map stance
+## Alias stance
 
-Alias maps are not owned by Mnemo or Agent Salience. They are policy artifacts maintained by the coordinator/router layer.
+Alias knowledge is owned by Mnemo SQLite state in this release.
 
-Mnemo may store evidence for alias suggestions as `agent_feedback`, `decision`, or `hippocampus_entry`, but it should not silently activate aliases.
+- proposal evidence comes from miss and `alias_hint` events
+- proposal rows live in `alias_proposals` (+ `alias_proposal_events`)
+- approved runtime vocabulary lives in `alias_concepts` + `alias_terms`
+- runtime query paths consume active aliases automatically
+
+For proposal quality:
+
+- active domain/project IDF is expected for high-confidence `propose_aliases` output
+- low-IDF/common terms should be penalized
+- IDF-cold corpora should be treated as low-confidence and reviewed conservatively

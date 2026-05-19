@@ -8,7 +8,7 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.13.2**
+Current version: **0.13.4**
 
 Runtime requirements:
 
@@ -28,10 +28,11 @@ Mnemo is local-first. It does not require a cloud service, vector database, exte
 - Structured memory layers for agentic systems
 - Signature-at-write-time duplicate detection and consolidation support
 - Candidate-based consolidation by default, with full O(n²) scan gated behind explicit confirmation
-- Maintenance actions for log compaction, consolidation, JSON import, and signature backfill
+- Maintenance actions for log compaction, consolidation, JSON import, signature backfill, and alias proposal/curation lifecycle
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
 - Automatic local IDF activation when project/domain corpus maturity thresholds are met
+- SQLite-backed alias proposals, approved alias lifecycle, and runtime alias consumption
 - Lightweight symbol lookup under a configured workspace root
 
 ## Non-goals
@@ -131,6 +132,7 @@ In SQLite mode, lifecycle/query events are stored in the SQLite `events` table. 
 | `MNEMO_LOG_QUERIES` | In JSON mode, set to `0` to disable `queries.jsonl`. In SQLite mode, query events are stored in SQLite. Default: `1`. |
 | `MNEMO_LOG_ARCHIVE` | Set to `0` to disable permanent archiving of rotated query/event logs. Default: `1`. |
 | `MNEMO_CONSOLIDATE_THRESHOLD` | Near-duplicate consolidation threshold. Default: `0.7`. |
+| `MNEMO_MISS_TOP_SCORE_THRESHOLD` | Miss threshold used by search-like event tagging. Default: `0.15`. |
 | `MNEMO_SYMBOL_TTL_SECONDS` | Symbol-index walk TTL. Default: `5`. |
 | `MNEMO_MAX_FILES_SCANNED` | Max files scanned by `lookup_symbol`. Default: `5000`. |
 | `MNEMO_MAX_TOTAL_BYTES` | Max total bytes scanned by `lookup_symbol`. Default: `52428800`. |
@@ -171,6 +173,7 @@ Supported top-level actions:
 - `search`
 - `salience_check`
 - `record`
+- `alias_hint`
 - `link`
 - `recall`
 - `get`
@@ -211,13 +214,13 @@ Supported top-level actions:
 
 ### `doctor`
 
-Returns storage, schema, health, export, FTS, signature, salience, and IDF diagnostics.
+Returns storage, schema, health, export, FTS, signature, salience, IDF, event-history, and alias diagnostics.
 
 ```json
 {"action":"doctor"}
 ```
 
-In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, FTS status, signature warnings, and `idf` activation status.
+In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, FTS status, signature warnings, and `idf` activation status, plus SQLite alias table/proposal counts.
 
 ### `record`
 
@@ -245,9 +248,17 @@ Structured memory aliases are accepted by the generic record action:
 {"action":"record","params":{"kind":"agent_feedback","text":"Prefer middleware-first auth checks.","feedback_type":"good_pattern","agent_id":"spec_auth","domain":"auth"}}
 ```
 
+### `alias_hint`
+
+Records explicit alias evidence linking failed wording to successful canonical wording. Alias hints feed the same proposal pipeline as repeated miss events.
+
+```json
+{"action":"alias_hint","params":{"domain":"agentic","canonical":"memory recall pipeline","candidate_alias":"hippocampus bridge","original_query":"hippocampus bridge","successful_query":"memory recall pipeline","confidence":"high","include_in_salience":true}}
+```
+
 ### `search`
 
-Searches project memory with bounded output.
+Searches project memory with bounded output. Active approved aliases from SQLite can expand query wording and contribute bounded alias diagnostics.
 
 ```json
 {"action":"search","params":{"query":"validation commands before handoff","limit":5,"phase":"implementation","max_tokens":2000}}
@@ -255,7 +266,7 @@ Searches project memory with bounded output.
 
 ### `recall`
 
-Returns startup or specialist recall bundles.
+Returns startup or specialist recall bundles. Query-based recall consumes active approved aliases from SQLite when available.
 
 ```json
 {"action":"recall","params":{"mode":"startup","role":"coordinator","agent_id":"coord_1","query":"release handoff","recent_logs":20}}
@@ -310,7 +321,7 @@ Default outputs include:
 
 ### `compact_context`
 
-Builds a prompt-ready memory context block.
+Builds a prompt-ready memory context block. Query-based context compaction consumes active approved aliases from SQLite when available.
 
 ```json
 {"action":"compact_context","params":{"query":"change the auth flow","limit":8,"phase":"implementation","max_tokens":2000}}
@@ -318,7 +329,20 @@ Builds a prompt-ready memory context block.
 
 ### `maintenance`
 
-Maintenance actions include `compact_logs`, `consolidate`, `consolidate_full`, `import_json`, and `backfill_signatures`.
+Maintenance actions include:
+
+- `compact_logs`
+- `consolidate`
+- `consolidate_full`
+- `import_json`
+- `backfill_signatures`
+- `propose_aliases`
+- `list_alias_proposals`
+- `approve_alias`
+- `reject_alias_proposal`
+- `list_aliases`
+- `disable_alias`
+- `disable_alias_concept`
 
 ```json
 {"action":"maintenance","params":{"action":"compact_logs","older_than_count":20,"max_logs":50,"dry_run":true}}
@@ -338,6 +362,29 @@ Maintenance actions include `compact_logs`, `consolidate`, `consolidate_full`, `
 
 ```json
 {"action":"maintenance","params":{"action":"consolidate_full","confirm_full_scan":true,"dry_run":true}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"propose_aliases","window_days":30,"min_recurrence":3,"include_hints":true,"dry_run":true}}
+```
+
+`propose_aliases` supports dry-run preview and SQLite persistence:
+
+- `dry_run=true`: returns proposals without persisting them
+- `dry_run=false`: persists pending proposals in SQLite (`alias_proposals`, `alias_proposal_events`)
+
+Proposals returned from `dry_run=true` are preview-only. Approval/rejection by `proposal_id` requires a `dry_run=false` persistence pass first.
+
+```json
+{"action":"maintenance","params":{"action":"list_alias_proposals","status":"pending","domain":"agentic","limit":50}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"approve_alias","proposal_id":"alias-prop-...","approved_by":"coordinator"}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"reject_alias_proposal","proposal_id":"alias-prop-...","reason":"generic wording"}}
 ```
 
 The default `consolidate` action is candidate-based. The O(n²) full scan is only available through `consolidate_full` with `confirm_full_scan:true`.
@@ -504,6 +551,18 @@ All activation thresholds are AND-gated: document count, unique terms, and total
 When active, IDF is a scoring aid. It contributes through both `idf_cosine` and IDF-weighted Jaccard/Tanimoto (`idf_jaccard`) so common-token-only overlap does not create meaningful similarity. It does not replace signatures, lexical ranking, FTS, or baseline cosine/Jaccard primitives.
 
 Full LSH/MinHash buckets are still not implemented in this release. See [`docs/salience_lsh_idf_notes.md`](docs/salience_lsh_idf_notes.md).
+
+## Alias runtime boundary
+
+Aliases are dynamic project/domain retrieval knowledge stored in Mnemo SQLite, not static JSON configuration.
+
+- Mnemo passively logs miss events and `alias_hint` evidence.
+- `maintenance(action="propose_aliases")` proposes alias candidates and can persist pending proposals.
+- Curation uses `list_alias_proposals`, `approve_alias`, and `reject_alias_proposal`.
+- Runtime query paths (`search`, `recall`, `salience_check`, `compact_context`) consume active aliases automatically.
+- SQLite inspection views include `v_alias_vocabulary`, `v_alias_pending_proposals`, and `v_alias_concept_counts`.
+
+See [`docs/alias_proposals.md`](docs/alias_proposals.md) for proposal scoring and curation details.
 
 ## Copilot compatibility
 

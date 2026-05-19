@@ -18,24 +18,49 @@ Primary tables:
 - `links`
 - `events`
 - `idf_profiles`
+- `alias_concepts`
+- `alias_terms`
+- `alias_proposals`
+- `alias_proposal_events`
 - `meta`
 - optional FTS5 table `memories_fts`
 - optional FTS5 table `events_fts`
 
 Lifecycle and query events are stored in SQLite in SQLite mode.
 
-## Event typed columns (0.13.0)
+## Alias tables and views (0.13.4)
+
+Alias knowledge is stored as dynamic SQLite state:
+
+- `alias_concepts`: canonical concept rows with scope/status/weight
+- `alias_terms`: active and disabled alias terms per concept
+- `alias_proposals`: pending/approved/rejected proposal lifecycle rows
+- `alias_proposal_events`: proposal-to-evidence event links
+
+Inspection views:
+
+- `v_alias_vocabulary`
+- `v_alias_pending_proposals`
+- `v_alias_concept_counts`
+
+Alias lifecycle is curated through maintenance actions (`propose_aliases`, `list_alias_proposals`, `approve_alias`, `reject_alias_proposal`, `list_aliases`, `disable_alias`, `disable_alias_concept`) instead of editing repository files.
+
+## Event typed columns (0.13.3)
 
 The `events` table includes typed columns for event-history APIs:
 
 - `event_id`, `ts`, `action`, `memory_id`
 - `source_id`, `target_id`, `relation`
-- `query_text`, `result_count`, `success`
+- `query_text`, `result_count`, `top_score`, `success`
 - `agent_id`, `role`, `domain`, `kind`
 - `summary`, `salience_text`, `include_in_salience`
 - `data_json` (raw payload)
 
 Migration is idempotent: older SQLite files with only legacy event columns are upgraded automatically.
+
+Legacy rows keep `top_score=NULL` unless a numeric `top_score` (or fallback `score`) can be safely read from `data_json`.
+
+Search-like actions (`mnemo_search`, `mnemo_recall`, `mnemo_salience_check`) emit miss-aware query events, and `alias_hint` events are stored in the same `events` table for alias proposal workflows.
 
 ## IDF profile table (0.13.1)
 

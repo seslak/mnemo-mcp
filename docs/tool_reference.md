@@ -61,6 +61,19 @@ Record-time duplicate behavior:
 3. shingle-overlap survivors get full salience/fallback scoring
 4. no automatic delete/merge occurs
 
+### `alias_hint`
+
+Records explicit alias evidence from failed wording to successful canonical wording.
+
+```json
+{"action":"alias_hint","params":{"domain":"agentic","canonical":"memory recall pipeline","candidate_alias":"hippocampus bridge","original_query":"hippocampus bridge","successful_query":"memory recall pipeline","confidence":"high","include_in_salience":true}}
+```
+
+Notes:
+
+- `confidence` must be `low`, `medium`, or `high`
+- this records evidence only; no alias activation occurs
+
 ### `search`
 
 Searches project memories relevant to a query.
@@ -68,6 +81,11 @@ Searches project memories relevant to a query.
 ```json
 {"action":"search","params":{"query":"SQLite signature backfill","limit":5}}
 ```
+
+Miss tagging:
+
+- search-like events include typed `result_count`, `success`, and `top_score`
+- miss is recorded when `result_count == 0` or `top_score < MNEMO_MISS_TOP_SCORE_THRESHOLD` (default `0.15`)
 
 ### `recall`
 
@@ -80,6 +98,8 @@ Returns bounded startup or agent-context bundles.
 ```json
 {"action":"recall","params":{"mode":"agent","agent_id":"spec_auth","domain":"auth","task":"review middleware"}}
 ```
+
+When `query`/`task` is present, recall writes miss-aware query events using returned score evidence where available.
 
 ### `get`
 
@@ -133,6 +153,11 @@ Runs optional Agent Salience diagnostics when `agent-salience` is importable.
 ```
 
 The action is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, then scores bounded survivors.
+
+Event tagging:
+
+- when no match triggers the supplied threshold, `success=0` is recorded
+- `top_score` stores the best scored candidate (or `0.0`)
 
 When local IDF profiles are active, `salience_check` passes `mode="auto"` and the active project/domain `idf_profile` into Agent Salience scoring.
 
@@ -202,6 +227,74 @@ Backfills missing or outdated v0.12.0 signatures.
 
 `doctor` warns when more than 10% of active records are unsigned/outdated.
 
+#### `propose_aliases`
+
+Generates structured alias proposals from recent miss evidence and optional `alias_hint` events.
+
+```json
+{"action":"maintenance","params":{"action":"propose_aliases","window_days":30,"domain":"agentic","min_recurrence":3,"limit":20,"dry_run":true,"include_hints":true,"min_loose_score":0.20,"max_candidates_per_cluster":5}}
+```
+
+Output status values:
+
+- `ok`
+- `idf_cold`
+- `no_misses`
+- `no_proposals`
+
+Persistence behavior:
+
+- `dry_run=true`: returns proposals without writing
+- `dry_run=false`: persists pending proposals in SQLite
+
+#### `list_alias_proposals`
+
+Lists proposal rows from `alias_proposals`.
+
+```json
+{"action":"maintenance","params":{"action":"list_alias_proposals","status":"pending","domain":"agentic","limit":50}}
+```
+
+#### `approve_alias`
+
+Creates/updates `alias_concepts` + `alias_terms` and marks proposal approved when `proposal_id` is supplied.
+
+```json
+{"action":"maintenance","params":{"action":"approve_alias","proposal_id":"alias-prop-...","approved_by":"coordinator"}}
+```
+
+#### `reject_alias_proposal`
+
+Marks a proposal rejected without deleting evidence.
+
+```json
+{"action":"maintenance","params":{"action":"reject_alias_proposal","proposal_id":"alias-prop-...","reason":"generic wording"}}
+```
+
+#### `list_aliases`
+
+Lists active vocabulary rows.
+
+```json
+{"action":"maintenance","params":{"action":"list_aliases","domain":"agentic","language":"en","status":"active","limit":200}}
+```
+
+#### `disable_alias`
+
+Disables one alias term without deleting it.
+
+```json
+{"action":"maintenance","params":{"action":"disable_alias","alias_id":"alias-term-...","reason":"deprecated"}}
+```
+
+#### `disable_alias_concept`
+
+Disables one alias concept; runtime ignores disabled concepts.
+
+```json
+{"action":"maintenance","params":{"action":"disable_alias_concept","concept_id":"alias-concept-...","reason":"deprecated"}}
+```
+
 #### `import_json`
 
 Imports JSON memories and computes signatures during import.
@@ -241,6 +334,8 @@ Returns the most recently recorded memories.
 ### `recent_events`
 
 Returns newest event rows first.
+
+Typed query metadata includes `result_count`, `success`, and `top_score` when available.
 
 ```json
 {"action":"recent_events","params":{"limit":20,"action":"optional","kind":"optional","domain":"optional"}}

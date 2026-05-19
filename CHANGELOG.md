@@ -1,5 +1,77 @@
 # Changelog
 
+## 0.13.4
+
+### Added
+
+- First-class alias SQLite schema:
+  - `alias_concepts`
+  - `alias_terms`
+  - `alias_proposals`
+  - `alias_proposal_events`
+- Alias inspection views:
+  - `v_alias_vocabulary`
+  - `v_alias_pending_proposals`
+  - `v_alias_concept_counts`
+- Alias maintenance lifecycle actions:
+  - `maintenance(action="list_alias_proposals")`
+  - `maintenance(action="approve_alias")`
+  - `maintenance(action="reject_alias_proposal")`
+  - `maintenance(action="list_aliases")`
+  - `maintenance(action="disable_alias")`
+  - `maintenance(action="disable_alias_concept")`
+- `doctor` alias diagnostics in `structuredContent.aliases` with concept/term/proposal counts and view status.
+
+### Changed
+
+- `maintenance(action="propose_aliases")` now persists pending proposals into SQLite when `dry_run=false`.
+- `propose_aliases` now links supporting miss/hint events in `alias_proposal_events`.
+- Query-based runtime paths now consume active aliases from SQLite automatically:
+  - `search`
+  - `recall`
+  - `salience_check`
+  - `compact_context`
+- Runtime scoring now includes a bounded alias concept boost and alias diagnostics:
+  - `aliases_used`
+  - `alias_concepts_matched`
+  - `alias_terms_matched`
+  - `alias_candidate_expansion_count`
+  - `alias_concept_score`
+
+### Removed
+
+- Runtime dependency on `.agentic/vocabulary/aliases.json`.
+- Runtime dependency on `.agentic/vocabulary/aliases.example.json`.
+
+## 0.13.3
+
+### Added
+
+- Miss-corpus event tagging for search-like actions (`search`, `recall`, `salience_check`) using:
+  - `result_count == 0`, or
+  - `top_score < MNEMO_MISS_TOP_SCORE_THRESHOLD` (default `0.15`)
+- New typed SQLite event column:
+  - `top_score`
+- New top-level gateway action:
+  - `alias_hint` for explicit failed-query to canonical-query alias evidence
+- New maintenance sub-action:
+  - `maintenance(action="propose_aliases")`
+- New workflow prompt:
+  - `workflow.alias-curation.prompt.md` in the agentic prompt library
+
+### Changed
+
+- Query-event writes now populate typed `events.top_score` from payload `top_score` (fallback `score`).
+- `recall` and `salience_check` now emit query events with miss/success metadata suitable for proposal mining.
+- `maintenance(action="propose_aliases")` now mines repeated miss events and optional `alias_hint` events, clusters misses, applies bounded loose matching, and scores proposals with IDF-aware evidence when active.
+
+### Compatibility and policy boundaries
+
+- Event schema migration is idempotent; legacy rows keep `top_score=NULL` unless recoverable from event JSON payloads.
+- Mnemo does not auto-activate aliases.
+- Mnemo does not populate generic vocabulary packs.
+- IDF-cold/unavailable states return conservative proposal outcomes (`idf_cold` / reduced confidence).
+
 ## 0.13.2
 
 ### Added

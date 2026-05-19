@@ -45,6 +45,7 @@ ENV_KEYS = [
     "MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS",
     "MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS",
     "MNEMO_IDF_MIN_TEXT_TOKENS",
+    "MNEMO_MISS_TOP_SCORE_THRESHOLD",
     "AGENT_SALIENCE_HOME",
 ]
 
@@ -82,6 +83,7 @@ class MnemoTestCase(unittest.TestCase):
         os.environ.pop("MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS", None)
         os.environ.pop("MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS", None)
         os.environ.pop("MNEMO_IDF_MIN_TEXT_TOKENS", None)
+        os.environ.pop("MNEMO_MISS_TOP_SCORE_THRESHOLD", None)
         os.environ.pop("AGENT_SALIENCE_HOME", None)
         server._SYMBOL_CACHE.clear()
 
@@ -2158,6 +2160,7 @@ class SqliteStoreTests(MnemoTestCase):
             "relation",
             "query_text",
             "result_count",
+            "top_score",
             "success",
             "agent_id",
             "role",
@@ -2243,7 +2246,7 @@ class SqliteStoreTests(MnemoTestCase):
         try:
             row = conn.execute(
                 """
-                SELECT action, query_text, result_count, success, salience_text, include_in_salience
+                SELECT action, query_text, result_count, success, top_score, salience_text, include_in_salience
                 FROM events
                 WHERE event_type = 'query'
                 ORDER BY rowid DESC
@@ -2262,8 +2265,9 @@ class SqliteStoreTests(MnemoTestCase):
         self.assertIn("typed population marker", str(row[1]))
         self.assertGreaterEqual(int(row[2]), 0)
         self.assertIn(int(row[3]), {0, 1})
-        self.assertTrue(str(row[4]))
-        self.assertIn(int(row[5]), {0, 1})
+        self.assertGreaterEqual(float(row[4]), 0.0)
+        self.assertTrue(str(row[5]))
+        self.assertIn(int(row[6]), {0, 1})
         self.assertIsNotNone(create_row)
         assert create_row is not None
         self.assertEqual(str(create_row[0]), "note")
@@ -3188,12 +3192,38 @@ class MaintenanceActionEnumTests(MnemoTestCase):
         mnemo_tool = next((t for t in tools if t["name"] == "mnemo"), None)
         self.assertIsNotNone(mnemo_tool)
         description = str(mnemo_tool.get("description", ""))
-        # All five maintenance actions must be documented
-        for action in ("compact_logs", "consolidate", "consolidate_full", "import_json", "backfill_signatures"):
+        # All maintenance actions must be documented
+        for action in (
+            "compact_logs",
+            "consolidate",
+            "consolidate_full",
+            "import_json",
+            "backfill_signatures",
+            "propose_aliases",
+            "list_alias_proposals",
+            "approve_alias",
+            "reject_alias_proposal",
+            "list_aliases",
+            "disable_alias",
+            "disable_alias_concept",
+        ):
             self.assertIn(action, description, f"action '{action}' missing from tool description")
 
     def test_valid_maintenance_actions_accepted(self) -> None:
-        for action in ("compact_logs", "consolidate", "consolidate_full", "import_json", "backfill_signatures"):
+        for action in (
+            "compact_logs",
+            "consolidate",
+            "consolidate_full",
+            "import_json",
+            "backfill_signatures",
+            "propose_aliases",
+            "list_alias_proposals",
+            "approve_alias",
+            "reject_alias_proposal",
+            "list_aliases",
+            "disable_alias",
+            "disable_alias_concept",
+        ):
             # compact_logs and consolidate/consolidate_full should not return "action must be one of"
             if action == "import_json":
                 # Needs a path arg; will error on missing path, not on invalid action
@@ -3214,6 +3244,657 @@ class MaintenanceActionEnumTests(MnemoTestCase):
         result = server.memory_maintenance({"action": "nonexistent_action_xyz"})
         self.assertTrue(result["isError"])
         self.assertIn("action must be one of", result["content"][0]["text"])
+
+
+class MissTrackingAndAliasProposalTests(MnemoTestCase):
+    class _FakeIdfProfile:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        def to_dict(self) -> dict:
+            return dict(self._payload)
+
+    class _FakeBreakdown:
+        def __init__(self, final: float) -> None:
+            self.cosine = final
+            self.jaccard = final
+            self.idf_cosine = 0.0
+            self.idf_jaccard = 0.0
+            self.repetition = 0.0
+            self.recency = 0.0
+            self.novelty = 0.0
+            self.drift = 0.0
+            self.final = final
+            self.weights = {"cosine": 0.7, "jaccard": 0.3, "idf_cosine": 0.0, "idf_jaccard": 0.0}
+            self.idf_status = "ready"
+            self.idf_used = False
+
+        def to_dict(self) -> dict:
+            return {
+                "cosine": self.cosine,
+                "jaccard": self.jaccard,
+                "idf_cosine": self.idf_cosine,
+                "idf_jaccard": self.idf_jaccard,
+                "repetition": self.repetition,
+                "recency": self.recency,
+                "novelty": self.novelty,
+                "drift": self.drift,
+                "final": self.final,
+                "weights": dict(self.weights),
+                "idf_status": self.idf_status,
+                "idf_used": self.idf_used,
+            }
+
+    class _FakeSalience:
+        __version__ = "0.3.alias-fake"
+        __file__ = "fake_agent_salience.py"
+
+        def __init__(self, signal_final: float = 0.05) -> None:
+            self.signal_final = signal_final
+
+        @staticmethod
+        def _tokens(text: str) -> list[str]:
+            return [token for token in str(text).lower().split() if token]
+
+        def build_idf_profile(
+            self,
+            documents,
+            *,
+            domain=None,
+            min_documents=200,
+            min_unique_terms=1000,
+            min_total_tokens=10000,
+        ):
+            import math
+
+            docs = [self._tokens(doc) for doc in documents if str(doc).strip()]
+            doc_count = len(docs)
+            total_tokens = sum(len(doc) for doc in docs)
+            doc_freq: dict[str, int] = {}
+            for doc in docs:
+                for token in set(doc):
+                    doc_freq[token] = doc_freq.get(token, 0) + 1
+            unique_terms = len(doc_freq)
+            idf_values = {
+                token: math.log((1.0 + doc_count) / (1.0 + freq)) + 1.0 for token, freq in doc_freq.items()
+            }
+            ready = (
+                doc_count >= int(min_documents)
+                and unique_terms >= int(min_unique_terms)
+                and total_tokens >= int(min_total_tokens)
+            )
+            payload = {
+                "domain": domain,
+                "doc_count": doc_count,
+                "unique_terms": unique_terms,
+                "total_tokens": total_tokens,
+                "status": "ready" if ready else "cold",
+                "ready": ready,
+                "idf": idf_values,
+                "min_documents": int(min_documents),
+                "min_unique_terms": int(min_unique_terms),
+                "min_total_tokens": int(min_total_tokens),
+                "version": 1,
+            }
+            return MissTrackingAndAliasProposalTests._FakeIdfProfile(payload)
+
+        def signal_score(self, left: str, right: str, **kwargs):  # noqa: ARG002
+            return MissTrackingAndAliasProposalTests._FakeBreakdown(self.signal_final)
+
+        def drift_score(self, left: str, right: str) -> float:  # noqa: ARG002
+            return 0.0
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _set_low_idf_thresholds(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS"] = "1"
+
+    def _latest_event_row(self, action: str) -> sqlite3.Row | None:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            return conn.execute(
+                "SELECT * FROM events WHERE action = ? ORDER BY rowid DESC LIMIT 1",
+                (action,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def _weak_search_match(self, score: float = 0.05) -> list[dict]:
+        return [
+            {
+                "id": "mem_weak",
+                "kind": "note",
+                "text": "weak lexical candidate",
+                "source": "test",
+                "score": score,
+                "superseded_by": None,
+                "deleted_at": None,
+                "deletion_reason": None,
+            }
+        ]
+
+    def test_search_zero_results_writes_miss_event(self) -> None:
+        with mock.patch("server.search_rank", return_value=[]):
+            result = server.search_memories({"query": "no hit query", "domain": "agentic", "limit": 5})
+        self.assertFalse(result["isError"], result)
+        row = self._latest_event_row("mnemo_search")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(int(row["success"]), 0)
+        self.assertEqual(int(row["include_in_salience"]), 1)
+        self.assertEqual(int(row["result_count"]), 0)
+        self.assertEqual(float(row["top_score"]), 0.0)
+
+    def test_search_weak_top_score_marks_miss(self) -> None:
+        with mock.patch("server.search_rank", return_value=self._weak_search_match(0.05)):
+            result = server.search_memories({"query": "weak top score", "domain": "agentic", "limit": 5})
+        self.assertFalse(result["isError"], result)
+        row = self._latest_event_row("mnemo_search")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(int(row["success"]), 0)
+        self.assertEqual(int(row["include_in_salience"]), 1)
+        self.assertLess(float(row["top_score"]), 0.15)
+
+    def test_search_strong_top_score_marks_success(self) -> None:
+        with mock.patch("server.search_rank", return_value=self._weak_search_match(0.85)):
+            result = server.search_memories({"query": "strong top score", "domain": "agentic", "limit": 5})
+        self.assertFalse(result["isError"], result)
+        row = self._latest_event_row("mnemo_search")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(int(row["success"]), 1)
+        self.assertGreaterEqual(float(row["top_score"]), 0.15)
+
+    def test_salience_check_miss_writes_top_score_and_miss_flags(self) -> None:
+        fake = self._FakeSalience(signal_final=0.05)
+        self.record("auth middleware marker for salience miss test", kind="note", domain="agentic")
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            result = server.memory_salience_check({"text": "auth middleware marker", "domain": "agentic", "threshold": 0.80})
+        self.assertFalse(result["isError"], result)
+        row = self._latest_event_row("mnemo_salience_check")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(int(row["success"]), 0)
+        self.assertEqual(int(row["include_in_salience"]), 1)
+        self.assertEqual(int(row["result_count"]), 0)
+        self.assertGreaterEqual(float(row["top_score"]), 0.0)
+
+    def test_recall_query_miss_writes_miss_event(self) -> None:
+        result = server.memory_recall(
+            {"mode": "agent", "query": "missing recall phrase", "task": "missing recall phrase", "domain": "agentic"}
+        )
+        self.assertFalse(result["isError"], result)
+        row = self._latest_event_row("mnemo_recall")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(int(row["success"]), 0)
+        self.assertEqual(int(row["include_in_salience"]), 1)
+        self.assertEqual(int(row["result_count"]), 0)
+        self.assertEqual(float(row["top_score"]), 0.0)
+
+    def test_alias_hint_event_recorded_and_counted_by_proposals(self) -> None:
+        write = server.memory_alias_hint(
+            {
+                "domain": "agentic",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "original_query": "hippocampus bridge",
+                "successful_query": "memory recall pipeline",
+                "confidence": "high",
+                "include_in_salience": True,
+            }
+        )
+        self.assertFalse(write["isError"], write)
+        result = server.memory_maintenance({"action": "propose_aliases", "window_days": 30, "include_hints": True})
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertGreaterEqual(int(structured["hint_event_count"]), 1)
+
+    def test_propose_aliases_empty_corpus_returns_no_misses(self) -> None:
+        result = server.memory_maintenance({"action": "propose_aliases", "window_days": 30})
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertEqual(structured["status"], "no_misses")
+        self.assertEqual(int(structured["miss_event_count"]), 0)
+        self.assertEqual(int(structured["cluster_count"]), 0)
+
+    def test_repeated_miss_queries_produce_proposal_with_active_idf(self) -> None:
+        self._set_low_idf_thresholds()
+        fake = self._FakeSalience(signal_final=0.05)
+        self.record(
+            "hippocampus recall bridge canonical memory entry for alias proposal",
+            kind="note",
+            domain="agentic",
+        )
+        for idx in range(6):
+            self.record(
+                f"router budget ledger filler document {idx}",
+                kind="note",
+                domain="agentic",
+            )
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            with mock.patch("server.search_rank", return_value=self._weak_search_match(0.05)):
+                for idx in range(3):
+                    server.search_memories({"query": "hippocampus recall bridge", "domain": "agentic", "limit": 5, "client_nonce": idx})
+            result = server.memory_maintenance(
+                {
+                    "action": "propose_aliases",
+                    "window_days": 30,
+                    "domain": "agentic",
+                    "min_recurrence": 3,
+                    "include_hints": False,
+                }
+            )
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertEqual(structured["status"], "ok")
+        self.assertGreaterEqual(len(structured["proposals"]), 1)
+
+    def test_low_idf_common_terms_are_not_proposed(self) -> None:
+        self._set_low_idf_thresholds()
+        fake = self._FakeSalience(signal_final=0.05)
+        for idx in range(5):
+            self.record(
+                f"and tool common filler sequence {idx} repeated and tool baseline",
+                kind="note",
+                domain="agentic",
+            )
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            with mock.patch("server.search_rank", return_value=self._weak_search_match(0.05)):
+                for idx in range(4):
+                    server.search_memories({"query": "and tool", "domain": "agentic", "limit": 5, "client_nonce": idx})
+            result = server.memory_maintenance(
+                {
+                    "action": "propose_aliases",
+                    "window_days": 30,
+                    "domain": "agentic",
+                    "min_recurrence": 3,
+                }
+            )
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertEqual(structured["status"], "no_proposals")
+        self.assertEqual(structured["proposals"], [])
+
+    def test_alias_hint_bonus_outweighs_passive_miss_cluster(self) -> None:
+        self._set_low_idf_thresholds()
+        fake = self._FakeSalience(signal_final=0.05)
+        self.record("hippocampus recall bridge canonical memory entry", kind="note", domain="agentic")
+        self.record("cache ledger invalidation canonical memory entry", kind="note", domain="agentic")
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            with mock.patch("server.search_rank", return_value=self._weak_search_match(0.05)):
+                for idx in range(3):
+                    server.search_memories({"query": "hippocampus recall bridge", "domain": "agentic", "limit": 5, "client_nonce": idx})
+                for idx in range(3):
+                    server.search_memories({"query": "cache ledger invalidation", "domain": "agentic", "limit": 5, "client_nonce": 100 + idx})
+            hint = server.memory_alias_hint(
+                {
+                    "domain": "agentic",
+                    "canonical": "memory recall pipeline",
+                    "candidate_alias": "hippocampus recall bridge",
+                    "original_query": "hippocampus recall bridge",
+                    "successful_query": "memory recall pipeline",
+                    "confidence": "high",
+                    "include_in_salience": True,
+                }
+            )
+            self.assertFalse(hint["isError"], hint)
+            result = server.memory_maintenance(
+                {
+                    "action": "propose_aliases",
+                    "window_days": 30,
+                    "domain": "agentic",
+                    "min_recurrence": 3,
+                    "include_hints": True,
+                }
+            )
+        self.assertFalse(result["isError"], result)
+        proposals = result["structuredContent"]["proposals"]
+        self.assertGreaterEqual(len(proposals), 2)
+        score_by_alias = {str(item["candidate_alias"]).lower(): float(item["score"]) for item in proposals}
+        hinted_key = next((key for key in score_by_alias if "hippocampus recall bridge" in key), None)
+        passive_key = next((key for key in score_by_alias if "cache ledger invalidation" in key), None)
+        self.assertIsNotNone(hinted_key)
+        self.assertIsNotNone(passive_key)
+        assert hinted_key is not None and passive_key is not None
+        self.assertGreater(
+            score_by_alias[hinted_key],
+            score_by_alias[passive_key],
+        )
+
+    def test_propose_aliases_dry_run_does_not_persist_proposals(self) -> None:
+        self._set_low_idf_thresholds()
+        fake = self._FakeSalience(signal_final=0.05)
+        self.record("memory recall hippocampus bridge reference", kind="note", domain="agentic")
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            with mock.patch("server.search_rank", return_value=self._weak_search_match(0.05)):
+                for idx in range(3):
+                    server.search_memories({"query": "hippocampus recall bridge", "domain": "agentic", "client_nonce": idx})
+            result = server.memory_maintenance(
+                {
+                    "action": "propose_aliases",
+                    "window_days": 30,
+                    "domain": "agentic",
+                    "dry_run": True,
+                }
+            )
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["persisted_count"], 0)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            count = int(conn.execute("SELECT COUNT(*) FROM alias_proposals").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertEqual(count, 0)
+
+    def test_alias_curation_workflow_prompt_exists(self) -> None:
+        current = Path(__file__).resolve()
+        found: Path | None = None
+        for parent in [current.parent, *current.parents]:
+            direct = parent / ".github" / "prompts" / "workflow.alias-curation.prompt.md"
+            if direct.exists():
+                found = direct
+                break
+            nested = parent / "agentic" / ".github" / "prompts" / "workflow.alias-curation.prompt.md"
+            if nested.exists():
+                found = nested
+                break
+        self.assertIsNotNone(found, "workflow.alias-curation.prompt.md was not found in prompt library")
+        assert found is not None
+        text = found.read_text(encoding="utf-8")
+        self.assertIn("propose_aliases", text)
+        self.assertIn("list_alias_proposals", text)
+        self.assertIn("approve_alias", text)
+        self.assertIn("reject_alias_proposal", text)
+        self.assertNotIn("prepare a patch for `.agentic/vocabulary/aliases.json`", text)
+        self.assertIn("Do not touch `.agentic/vocabulary/aliases.json`", text)
+        self.assertIn(".agentic/vocabulary/aliases.example.json", text)
+
+
+class AliasSqliteLifecycleTests(MnemoTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _set_low_idf_thresholds(self) -> None:
+        os.environ["MNEMO_IDF_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_MIN_TOTAL_TOKENS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_DOCUMENTS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS"] = "1"
+        os.environ["MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS"] = "1"
+
+    def _weak_search_match(self, score: float = 0.05) -> list[dict]:
+        return [
+            {
+                "id": "mem_weak",
+                "kind": "note",
+                "text": "weak lexical candidate",
+                "source": "test",
+                "score": score,
+                "superseded_by": None,
+                "deleted_at": None,
+                "deletion_reason": None,
+            }
+        ]
+
+    def _seed_alias_proposal_evidence(self, *, with_hint: bool = False) -> None:
+        self._set_low_idf_thresholds()
+        self.record(
+            "hippocampus recall bridge canonical memory entry for alias proposal",
+            kind="note",
+            domain="agentic",
+        )
+        for idx in range(5):
+            self.record(f"idf maturity filler memory {idx} for alias lifecycle tests", kind="note", domain="agentic")
+        with mock.patch("server.search_rank", return_value=self._weak_search_match(0.05)):
+            for idx in range(3):
+                server.search_memories(
+                    {
+                        "query": "hippocampus recall bridge",
+                        "domain": "agentic",
+                        "limit": 5,
+                        "client_nonce": idx,
+                    }
+                )
+        if with_hint:
+            write = server.memory_alias_hint(
+                {
+                    "domain": "agentic",
+                    "canonical": "memory recall pipeline",
+                    "candidate_alias": "hippocampus recall bridge",
+                    "original_query": "hippocampus recall bridge",
+                    "successful_query": "memory recall pipeline",
+                    "confidence": "high",
+                    "include_in_salience": True,
+                }
+            )
+            self.assertFalse(write["isError"], write)
+
+    def _insert_proposal(self, proposal_id: str, *, status: str = "pending", domain: str = "agentic") -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            now = server.now_iso()
+            conn.execute(
+                """
+                INSERT INTO alias_proposals(
+                    proposal_id, domain, language, canonical, candidate_alias, normalized_alias,
+                    score, status, recommendation, evidence_json, created_at, updated_at
+                ) VALUES(?, ?, 'en', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    proposal_id,
+                    domain,
+                    "memory recall pipeline",
+                    "hippocampus bridge",
+                    server._normalize_alias_term("hippocampus bridge"),
+                    0.82,
+                    status,
+                    "review",
+                    json.dumps({"source": "unit-test"}),
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_alias_schema_tables_indexes_and_views_exist(self) -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+            views = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='view'")}
+        finally:
+            conn.close()
+        for table in ("alias_concepts", "alias_terms", "alias_proposals", "alias_proposal_events"):
+            self.assertIn(table, tables)
+        for index in (
+            "idx_alias_terms_norm",
+            "idx_alias_terms_domain_norm",
+            "idx_alias_terms_concept",
+            "idx_alias_concepts_domain",
+            "idx_alias_proposals_status",
+            "idx_alias_proposals_domain_status",
+        ):
+            self.assertIn(index, indexes)
+        for view in ("v_alias_vocabulary", "v_alias_pending_proposals", "v_alias_concept_counts"):
+            self.assertIn(view, views)
+
+    def test_propose_aliases_dry_run_false_persists_and_links_events(self) -> None:
+        self._seed_alias_proposal_evidence(with_hint=True)
+        fake = MissTrackingAndAliasProposalTests._FakeSalience(signal_final=0.05)
+        with mock.patch("server.load_optional_agent_salience", return_value=(fake, None)):
+            result = server.memory_maintenance(
+                {
+                    "action": "propose_aliases",
+                    "window_days": 30,
+                    "domain": "agentic",
+                    "include_hints": True,
+                    "dry_run": False,
+                }
+            )
+        self.assertFalse(result["isError"], result)
+        structured = result["structuredContent"]
+        self.assertGreaterEqual(int(structured["persisted_count"]), 1)
+        self.assertFalse(bool(structured["dry_run"]))
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.row_factory = sqlite3.Row
+            proposal_rows = conn.execute("SELECT * FROM alias_proposals").fetchall()
+            link_count = int(conn.execute("SELECT COUNT(*) FROM alias_proposal_events").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertGreaterEqual(len(proposal_rows), 1)
+        self.assertGreaterEqual(link_count, 1)
+        for row in proposal_rows:
+            self.assertEqual(str(row["status"]), "pending")
+            json.loads(str(row["evidence_json"]))
+
+    def test_approve_alias_marks_proposal_and_prevents_duplicate_alias_term(self) -> None:
+        self._insert_proposal("alias-prop-unit-approve")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "proposal_id": "alias-prop-unit-approve",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        payload = approved["structuredContent"]
+        self.assertEqual(payload["proposal"]["status"], "approved")
+        concept_id = str(payload["concept"]["concept_id"])
+        alias_id = str(payload["alias"]["alias_id"])
+        self.assertTrue(concept_id)
+        self.assertTrue(alias_id)
+        again = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "proposal_id": "alias-prop-unit-approve",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(again["isError"], again)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            count = int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM alias_terms
+                    WHERE concept_id = ? AND normalized_term = ?
+                    """,
+                    (concept_id, server._normalize_alias_term("hippocampus bridge")),
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)
+
+    def test_reject_alias_proposal_marks_rejected(self) -> None:
+        self._insert_proposal("alias-prop-unit-reject")
+        rejected = server.memory_maintenance(
+            {
+                "action": "reject_alias_proposal",
+                "proposal_id": "alias-prop-unit-reject",
+                "reason": "generic wording",
+            }
+        )
+        self.assertFalse(rejected["isError"], rejected)
+        payload = rejected["structuredContent"]["proposal"]
+        self.assertEqual(payload["status"], "rejected")
+        self.assertTrue(str(payload.get("evidence_json", "")).strip())
+
+    def test_list_alias_proposals_filters_status_and_domain(self) -> None:
+        self._insert_proposal("alias-prop-pending-auth", domain="auth")
+        self._insert_proposal("alias-prop-rejected-agentic", status="rejected", domain="agentic")
+        pending_auth = server.memory_maintenance(
+            {"action": "list_alias_proposals", "status": "pending", "domain": "auth", "limit": 20}
+        )
+        self.assertFalse(pending_auth["isError"], pending_auth)
+        rows = pending_auth["structuredContent"]["proposals"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["proposal_id"], "alias-prop-pending-auth")
+        rejected = server.memory_maintenance({"action": "list_alias_proposals", "status": "rejected", "limit": 20})
+        self.assertFalse(rejected["isError"], rejected)
+        self.assertTrue(any(row["proposal_id"] == "alias-prop-rejected-agentic" for row in rejected["structuredContent"]["proposals"]))
+
+    def test_runtime_alias_search_and_disable_alias(self) -> None:
+        memory = self.record("memory recall pipeline implementation details", kind="note", domain="agentic")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        alias_id = approved["structuredContent"]["alias"]["alias_id"]
+        search_with_alias = server.search_memories({"query": "hippocampus bridge", "domain": "agentic", "limit": 5})
+        self.assertFalse(search_with_alias["isError"], search_with_alias)
+        structured = search_with_alias["structuredContent"]
+        self.assertTrue(structured["aliases_used"])
+        self.assertGreaterEqual(float(structured["alias_concept_score"]), 0.1)
+        ids = [item["id"] for item in structured["matches"]]
+        self.assertIn(memory["id"], ids)
+        disabled = server.memory_maintenance({"action": "disable_alias", "alias_id": alias_id, "reason": "deprecated"})
+        self.assertFalse(disabled["isError"], disabled)
+        active_aliases = server.memory_maintenance({"action": "list_aliases", "domain": "agentic", "status": "active"})
+        self.assertFalse(active_aliases["isError"], active_aliases)
+        self.assertFalse(any(row["alias_id"] == alias_id for row in active_aliases["structuredContent"]["aliases"]))
+        search_after_disable = server.search_memories({"query": "hippocampus bridge", "domain": "agentic", "limit": 5})
+        self.assertFalse(search_after_disable["isError"], search_after_disable)
+        self.assertFalse(search_after_disable["structuredContent"]["aliases_used"])
+
+    def test_doctor_reports_alias_counts_and_no_alias_json_path(self) -> None:
+        self._insert_proposal("alias-prop-pending-doctor", status="pending")
+        self._insert_proposal("alias-prop-rejected-doctor", status="rejected")
+        server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        doctor = server.mnemo_doctor({})
+        self.assertFalse(doctor["isError"], doctor)
+        structured = doctor["structuredContent"]
+        aliases = structured["aliases"]
+        self.assertTrue(aliases["available"])
+        self.assertGreaterEqual(int(aliases["active_concept_count"]), 1)
+        self.assertGreaterEqual(int(aliases["active_alias_count"]), 1)
+        self.assertGreaterEqual(int(aliases["pending_proposal_count"]), 1)
+        self.assertGreaterEqual(int(aliases["rejected_proposal_count"]), 1)
+        text = doctor["content"][0]["text"]
+        self.assertIn("Aliases: active_concepts=", text)
+        self.assertNotIn("aliases.json", text)
+        self.assertNotIn("aliases.example.json", text)
+
+    def test_server_runtime_has_no_aliases_json_reference(self) -> None:
+        server_text = Path(server.__file__).read_text(encoding="utf-8")
+        self.assertNotIn(".agentic/vocabulary/aliases.json", server_text)
+        self.assertNotIn(".agentic/vocabulary/aliases.example.json", server_text)
 
 
 class SmallBenchmarkTests(MnemoTestCase):

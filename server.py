@@ -32,6 +32,7 @@ Environment variables:
 - MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS: domain corpus unique-terms threshold. Defaults to 300.
 - MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS: domain corpus token threshold. Defaults to 3000.
 - MNEMO_IDF_MIN_TEXT_TOKENS: per-memory minimum tokens for IDF corpus inclusion. Defaults to 5.
+- MNEMO_MISS_TOP_SCORE_THRESHOLD: query miss threshold for top score. Defaults to 0.15.
 - AGENT_SALIENCE_HOME: optional path to local agent-salience checkout for diagnostics when not installed.
 """
 
@@ -56,7 +57,7 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.13.2"
+SERVER_VERSION = "0.13.4"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
@@ -166,6 +167,28 @@ _SQLITE_BOOTSTRAPPED: set[str] = set()
 _SQLITE_FTS_CANDIDATE_LIMIT = 500
 DEFAULT_EVENT_LIMIT = 20
 MAX_EVENT_LIMIT = 200
+DEFAULT_ALIAS_PROPOSAL_WINDOW_DAYS = 30
+DEFAULT_ALIAS_PROPOSAL_MIN_RECURRENCE = 3
+DEFAULT_ALIAS_PROPOSAL_LIMIT = 20
+DEFAULT_ALIAS_PROPOSAL_MIN_LOOSE_SCORE = 0.20
+DEFAULT_ALIAS_PROPOSAL_MAX_CANDIDATES_PER_CLUSTER = 5
+MAX_ALIAS_PROPOSAL_EVENT_SCAN = 4000
+ALIAS_CLUSTER_SHINGLE_OVERLAP_THRESHOLD = 0.35
+DEFAULT_ALIAS_LANGUAGE = "en"
+DEFAULT_ALIAS_PROPOSAL_LIST_LIMIT = 50
+DEFAULT_ALIAS_LIST_LIMIT = 200
+ALIAS_CONCEPT_BASE_BOOST = 0.10
+ALIAS_CONCEPT_MAX_BOOST = 0.18
+MISS_EVENT_ACTIONS = {
+    "mnemo_search",
+    "search",
+    "mnemo_recall",
+    "recall",
+    "mnemo_salience_check",
+    "salience_check",
+    "mnemo_compact_context",
+    "mnemo_recent",
+}
 EVENT_SALIENCE_ACTIONS = {
     "create",
     "update",
@@ -178,6 +201,7 @@ EVENT_SALIENCE_ACTIONS = {
     "mnemo_compact_context",
     "mnemo_recent",
     "mnemo_recall",
+    "alias_hint",
     "mnemo_get",
     "mnemo_lookup_symbol",
     "mnemo_maintenance",
@@ -477,6 +501,15 @@ def max_total_bytes() -> int:
 
 def max_file_bytes() -> int:
     return positive_int_env("MNEMO_MAX_FILE_BYTES", 1024 * 1024)
+
+
+def miss_top_score_threshold() -> float:
+    raw = str(os.environ.get("MNEMO_MISS_TOP_SCORE_THRESHOLD", "0.15")).strip() or "0.15"
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.15
+    return max(0.0, min(value, 1.0))
 
 
 def idf_mode() -> str:
@@ -1061,6 +1094,15 @@ def _event_int_value(value: Any) -> int | None:
         return None
 
 
+def _event_float_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _event_query_text(payload: dict[str, Any]) -> str | None:
     query_text = normalize_optional_string(payload.get("query_text"))
     if query_text:
@@ -1068,9 +1110,23 @@ def _event_query_text(payload: dict[str, Any]) -> str | None:
     query_text = normalize_optional_string(payload.get("query"))
     if query_text:
         return query_text
+    query_text = normalize_optional_string(payload.get("original_query"))
+    if query_text:
+        return query_text
+    query_text = normalize_optional_string(payload.get("successful_query"))
+    if query_text:
+        return query_text
+    query_text = normalize_optional_string(payload.get("candidate_alias"))
+    if query_text:
+        return query_text
     args = payload.get("args")
     if isinstance(args, dict):
-        return normalize_optional_string(args.get("query"))
+        query_text = normalize_optional_string(args.get("query"))
+        if query_text:
+            return query_text
+        query_text = normalize_optional_string(args.get("task"))
+        if query_text:
+            return query_text
     return None
 
 
@@ -1184,6 +1240,9 @@ def _event_record_fields(
     result_count = _event_int_value(payload.get("result_count"))
     if result_count is None:
         result_count = _event_int_value(payload.get("n_results"))
+    top_score = _event_float_value(payload.get("top_score"))
+    if top_score is None:
+        top_score = _event_float_value(payload.get("score"))
     success = _event_int_value(payload.get("success"))
     if success is None:
         success = 1
@@ -1215,6 +1274,7 @@ def _event_record_fields(
         "relation": relation,
         "query_text": query_text,
         "result_count": result_count,
+        "top_score": top_score,
         "success": success,
         "agent_id": agent_id,
         "role": role,
@@ -1426,6 +1486,70 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alias_concepts (
+            concept_id TEXT PRIMARY KEY,
+            canonical TEXT NOT NULL,
+            domain TEXT,
+            language TEXT DEFAULT 'en',
+            status TEXT NOT NULL DEFAULT 'active',
+            weight REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            source TEXT,
+            notes TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alias_terms (
+            alias_id TEXT PRIMARY KEY,
+            concept_id TEXT NOT NULL,
+            term TEXT NOT NULL,
+            normalized_term TEXT NOT NULL,
+            language TEXT DEFAULT 'en',
+            domain TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            weight REAL NOT NULL DEFAULT 1.0,
+            source TEXT,
+            approved_by TEXT,
+            approved_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (concept_id) REFERENCES alias_concepts(concept_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alias_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            domain TEXT,
+            language TEXT DEFAULT 'en',
+            canonical TEXT,
+            candidate_alias TEXT NOT NULL,
+            normalized_alias TEXT NOT NULL,
+            score REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            recommendation TEXT,
+            evidence_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alias_proposal_events (
+            proposal_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            relation TEXT NOT NULL,
+            PRIMARY KEY (proposal_id, event_id)
+        )
+        """
+    )
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)",
         "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
@@ -1446,8 +1570,70 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_idf_profiles_scope_name ON idf_profiles(scope, name)",
         "CREATE INDEX IF NOT EXISTS idx_idf_profiles_updated_at ON idf_profiles(updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_alias_terms_norm ON alias_terms(normalized_term)",
+        "CREATE INDEX IF NOT EXISTS idx_alias_terms_domain_norm ON alias_terms(domain, normalized_term)",
+        "CREATE INDEX IF NOT EXISTS idx_alias_terms_concept ON alias_terms(concept_id)",
+        "CREATE INDEX IF NOT EXISTS idx_alias_concepts_domain ON alias_concepts(domain, status)",
+        "CREATE INDEX IF NOT EXISTS idx_alias_proposals_status ON alias_proposals(status, score)",
+        "CREATE INDEX IF NOT EXISTS idx_alias_proposals_domain_status ON alias_proposals(domain, status, score)",
     ):
         conn.execute(statement)
+    conn.execute(
+        """
+        CREATE VIEW IF NOT EXISTS v_alias_vocabulary AS
+        SELECT
+            c.domain AS domain,
+            c.language AS language,
+            c.concept_id AS concept_id,
+            c.canonical AS canonical,
+            t.term AS alias,
+            t.normalized_term AS normalized_term,
+            t.status AS status,
+            t.weight AS weight,
+            t.approved_at AS approved_at,
+            t.approved_by AS approved_by,
+            t.source AS source,
+            t.updated_at AS updated_at
+        FROM alias_terms t
+        JOIN alias_concepts c ON c.concept_id = t.concept_id
+        ORDER BY c.domain, c.language, c.concept_id, t.term
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIEW IF NOT EXISTS v_alias_pending_proposals AS
+        SELECT
+            domain,
+            language,
+            canonical,
+            candidate_alias,
+            normalized_alias,
+            score,
+            status,
+            recommendation,
+            created_at,
+            updated_at
+        FROM alias_proposals
+        WHERE status = 'pending'
+        ORDER BY score DESC, created_at DESC
+        """
+    )
+    conn.execute(
+        """
+        CREATE VIEW IF NOT EXISTS v_alias_concept_counts AS
+        SELECT
+            c.domain AS domain,
+            c.language AS language,
+            c.concept_id AS concept_id,
+            c.canonical AS canonical,
+            c.status AS status,
+            COUNT(t.alias_id) AS alias_count
+        FROM alias_concepts c
+        LEFT JOIN alias_terms t ON t.concept_id = c.concept_id
+        GROUP BY c.domain, c.language, c.concept_id, c.canonical, c.status
+        ORDER BY c.domain, c.language, alias_count DESC
+        """
+    )
     # Idempotent column migrations for v0.12.0 signature columns
     _v12_signature_columns = [
         ("normalized_hash", "TEXT"),
@@ -1472,6 +1658,7 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         ("relation", "TEXT"),
         ("query_text", "TEXT"),
         ("result_count", "INTEGER"),
+        ("top_score", "REAL"),
         ("success", "INTEGER"),
         ("agent_id", "TEXT"),
         ("role", "TEXT"),
@@ -1490,6 +1677,29 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE events SET action = COALESCE(NULLIF(action, ''), event_type) WHERE action IS NULL OR action = ''"
     )
+    # Opportunistic backfill from payload JSON when a numeric top score is present.
+    try:
+        conn.execute(
+            """
+            UPDATE events
+            SET top_score = CAST(json_extract(data_json, '$.top_score') AS REAL)
+            WHERE top_score IS NULL
+              AND json_valid(data_json) = 1
+              AND json_type(data_json, '$.top_score') IN ('integer', 'real')
+            """
+        )
+        conn.execute(
+            """
+            UPDATE events
+            SET top_score = CAST(json_extract(data_json, '$.score') AS REAL)
+            WHERE top_score IS NULL
+              AND json_valid(data_json) = 1
+              AND json_type(data_json, '$.score') IN ('integer', 'real')
+            """
+        )
+    except sqlite3.OperationalError:
+        # SQLite build without JSON1; leave top_score NULL for legacy rows.
+        pass
     conn.execute("UPDATE events SET success = 1 WHERE success IS NULL")
     conn.execute("UPDATE events SET include_in_salience = 0 WHERE include_in_salience IS NULL")
     for statement in (
@@ -1643,11 +1853,11 @@ def _sqlite_insert_event(
         """
         INSERT OR IGNORE INTO events(
             id, event_id, memory_id, event_type, action, source_id, target_id, relation,
-            query_text, result_count, success, agent_id, role, domain, kind, summary,
+            query_text, result_count, top_score, success, agent_id, role, domain, kind, summary,
             salience_text, include_in_salience, data_json, created_at, ts
         ) VALUES(
             :id, :event_id, :memory_id, :event_type, :action, :source_id, :target_id, :relation,
-            :query_text, :result_count, :success, :agent_id, :role, :domain, :kind, :summary,
+            :query_text, :result_count, :top_score, :success, :agent_id, :role, :domain, :kind, :summary,
             :salience_text, :include_in_salience, :data_json, :created_at, :ts
         )
         """,
@@ -2357,12 +2567,20 @@ def rank_memories_for_query(
     *,
     phase: str | None = None,
     query_text: str = "",
+    alias_runtime: dict[str, Any] | None = None,
 ) -> list[tuple[float, dict[str, Any]]]:
     ranked: list[tuple[float, dict[str, Any]]] = []
     for memory in memories:
-        score = score_memory(query_tokens, memory, phase)
+        base_score = score_memory(query_tokens, memory, phase)
+        alias_concept_score, alias_concepts = _alias_concept_score_for_memory(memory, alias_runtime)
+        score = base_score + alias_concept_score
+        candidate_memory = memory
+        if alias_concept_score > 0.0:
+            candidate_memory = dict(memory)
+            candidate_memory["_alias_concept_score"] = alias_concept_score
+            candidate_memory["_alias_concepts"] = alias_concepts
         if score > 0 or not query_text:
-            ranked.append((score, memory))
+            ranked.append((score, candidate_memory))
     ranked.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
     return ranked
 
@@ -2518,6 +2736,9 @@ def _sqlite_fts_candidate_ids_for_memory(memory: dict[str, Any], *, limit: int, 
 
 def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str, Any]]:
     query = str(args.get("query", "")).strip()
+    expanded_query = normalize_optional_string(args.get("_expanded_query"))
+    query_for_retrieval = expanded_query or query
+    alias_runtime = args.get("_alias_runtime") if isinstance(args.get("_alias_runtime"), dict) else None
     include_deleted = parse_bool(args.get("include_deleted"), default=False)
     include_superseded = parse_bool(args.get("include_superseded"), default=False)
     limit = int(args.get("limit", 5))
@@ -2531,12 +2752,12 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
     if phase is None:
         _, phase = resolve_phase(args, query)
 
-    query_tokens = tokenize(query)
+    query_tokens = tokenize(query_for_retrieval)
     candidates: list[dict[str, Any]] = []
-    if store_backend() == "sqlite" and query and _sqlite_fts_flag():
+    if store_backend() == "sqlite" and query_for_retrieval and _sqlite_fts_flag():
         candidates = _sqlite_fts_candidate_memories(
             args,
-            query,
+            query_for_retrieval,
             include_deleted=include_deleted,
             include_superseded=include_superseded,
             limit=limit,
@@ -2549,7 +2770,13 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
             include_deleted=include_deleted,
             include_superseded=include_superseded,
         )
-    ranked = rank_memories_for_query(candidates, query_tokens, phase=phase, query_text=query)
+    ranked = rank_memories_for_query(
+        candidates,
+        query_tokens,
+        phase=phase,
+        query_text=query_for_retrieval,
+        alias_runtime=alias_runtime,
+    )
     return [memory_to_match(memory, score) for score, memory in ranked[:limit]]
 
 
@@ -2568,6 +2795,7 @@ def memory_to_match(memory: dict[str, Any], score: float) -> dict[str, Any]:
     max_chars = max_chars_per_item()
     text_value = str(memory.get("text", ""))
     clipped_text = text_value[:max_chars]
+    matched_alias_concepts = memory.get("_alias_concepts") if isinstance(memory.get("_alias_concepts"), list) else []
     return {
         "id": memory.get("id"),
         "kind": memory.get("kind"),
@@ -2595,6 +2823,8 @@ def memory_to_match(memory: dict[str, Any], score: float) -> dict[str, Any]:
         "deleted_at": memory.get("deleted_at"),
         "deletion_reason": memory.get("deletion_reason"),
         "superseded_by": memory.get("superseded_by"),
+        "alias_concept_score": round(float(memory.get("_alias_concept_score") or 0.0), 3),
+        "alias_concepts": [str(item) for item in matched_alias_concepts if str(item).strip()],
     }
 
 
@@ -2645,6 +2875,11 @@ def memory_bundle_item(memory: dict[str, Any], max_chars: int = 300, score: floa
         item["metadata"] = metadata
     if score is not None:
         item["score"] = round(float(score), 3)
+    alias_concept_score = float(memory.get("_alias_concept_score") or 0.0)
+    if alias_concept_score > 0:
+        item["alias_concept_score"] = round(alias_concept_score, 3)
+        alias_concepts = memory.get("_alias_concepts") if isinstance(memory.get("_alias_concepts"), list) else []
+        item["alias_concepts"] = [str(value) for value in alias_concepts if str(value).strip()]
     return item
 
 
@@ -2653,9 +2888,16 @@ def rank_against_query(
     query: str,
     salience_module: Any | None = None,
     idf_profile: dict[str, Any] | None = None,
+    alias_runtime: dict[str, Any] | None = None,
 ) -> float:
-    if not query.strip():
+    runtime = alias_runtime if isinstance(alias_runtime, dict) else {}
+    query_text = str(query).strip()
+    if not query_text:
         return 0.0
+    effective_query = str(runtime.get("expanded_query") or query_text).strip() or query_text
+    alias_map = runtime.get("alias_map") if isinstance(runtime.get("alias_map"), dict) else {}
+    alias_concept_score, _alias_concepts = _alias_concept_score_for_memory(memory, runtime)
+    base_score = 0.0
     if salience_module is not None:
         try:
             kwargs: dict[str, Any] = {}
@@ -2665,12 +2907,21 @@ def rank_against_query(
                     "idf_profile": idf_profile,
                     "weights": dict(IDF_ACTIVE_WEIGHTS),
                 }
-            breakdown = salience_module.signal_score(query, str(memory.get("text", "")), **kwargs)
-            return max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+            if alias_map:
+                kwargs["alias_map"] = dict(alias_map)
+            try:
+                breakdown = salience_module.signal_score(effective_query, str(memory.get("text", "")), **kwargs)
+            except TypeError:
+                kwargs.pop("alias_map", None)
+                breakdown = salience_module.signal_score(effective_query, str(memory.get("text", "")), **kwargs)
+            base_score = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
         except Exception:
-            pass
-    tokens = tokenize(query)
-    return max(0.0, float(score_memory(tokens, memory, phase=None)))
+            base_score = 0.0
+    if base_score <= 0.0:
+        tokens = tokenize(effective_query)
+        base_score = max(0.0, float(score_memory(tokens, memory, phase=None)))
+    final_score = max(0.0, min(1.0, base_score + alias_concept_score))
+    return final_score
 
 
 def select_memories_by_query(
@@ -2679,12 +2930,19 @@ def select_memories_by_query(
     limit: int,
     salience_module: Any | None = None,
     idf_profile: dict[str, Any] | None = None,
+    alias_runtime: dict[str, Any] | None = None,
 ) -> list[tuple[float, dict[str, Any]]]:
     scored: list[tuple[float, dict[str, Any]]] = []
     for memory in memories:
-        score = rank_against_query(memory, query, salience_module, idf_profile)
+        score = rank_against_query(memory, query, salience_module, idf_profile, alias_runtime)
+        alias_concept_score, alias_concepts = _alias_concept_score_for_memory(memory, alias_runtime)
+        candidate = memory
+        if alias_concept_score > 0.0:
+            candidate = dict(memory)
+            candidate["_alias_concept_score"] = alias_concept_score
+            candidate["_alias_concepts"] = alias_concepts
         if score > 0.0 or not query.strip():
-            scored.append((score, memory))
+            scored.append((score, candidate))
     scored.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
     return scored[:limit]
 
@@ -2762,18 +3020,77 @@ def append_query_log(
     args: dict[str, Any],
     matches: list[dict[str, Any]],
     phase: str | None = None,
+    *,
+    query_text: str | None = None,
+    domain: str | None = None,
+    result_count: int | None = None,
+    top_score: float | None = None,
+    success: int | None = None,
+    include_in_salience: bool | None = None,
+    summary: str | None = None,
+    action: str | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     if not query_logging_enabled():
         return
-    top_score = float(matches[0].get("score", 0.0)) if matches else 0.0
+    derived_top_score = top_score
+    if derived_top_score is None:
+        if matches:
+            derived_top_score = _event_float_value(matches[0].get("score"))
+        if derived_top_score is None:
+            derived_top_score = 0.0
+    if result_count is None:
+        n_results = len(matches)
+    else:
+        try:
+            n_results = max(0, int(result_count))
+        except (TypeError, ValueError):
+            n_results = len(matches)
+    derived_success = success
+    if derived_success is None:
+        threshold = miss_top_score_threshold()
+        derived_success = 0 if n_results == 0 or float(derived_top_score) < threshold else 1
+    derived_include = include_in_salience
+    if derived_include is None and int(derived_success) == 0:
+        derived_include = True
+
+    top_ids: list[str] = []
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        identifier = match.get("id")
+        if not identifier:
+            identifier = match.get("memory_id")
+        if identifier:
+            top_ids.append(str(identifier))
+
     row = {
         "ts": now_iso(),
         "tool": tool,
         "args": args,
-        "top_ids": [str(match.get("id")) for match in matches if match.get("id")],
-        "top_score": top_score,
-        "n_results": len(matches),
+        "top_ids": top_ids,
+        "top_score": float(derived_top_score),
+        "n_results": n_results,
+        "result_count": n_results,
+        "success": int(derived_success),
     }
+    resolved_query_text = normalize_optional_string(query_text) or normalize_optional_string(args.get("query"))
+    if resolved_query_text is not None:
+        row["query_text"] = resolved_query_text
+    resolved_domain = normalize_optional_string(domain) or normalize_optional_string(args.get("domain"))
+    if resolved_domain is not None:
+        row["domain"] = resolved_domain
+    if summary is not None:
+        row["summary"] = str(summary)
+    if action is not None:
+        row["action"] = str(action)
+    if derived_include is not None:
+        row["include_in_salience"] = bool(derived_include)
+    if extra:
+        for key, value in extra.items():
+            if key in row:
+                continue
+            row[str(key)] = value
     if phase is not None or tool in {"mnemo_search", "mnemo_compact_context"}:
         row["phase"] = phase
 
@@ -2912,6 +3229,7 @@ def _event_output_row(record: dict[str, Any]) -> dict[str, Any]:
         "relation": normalize_optional_string(record.get("relation")),
         "query_text": normalize_optional_string(record.get("query_text")),
         "result_count": _event_int_value(record.get("result_count")),
+        "top_score": _event_float_value(record.get("top_score")),
         "success": _event_int_value(record.get("success")),
         "include_in_salience": _event_int_value(record.get("include_in_salience")),
     }
@@ -2955,6 +3273,7 @@ def _sqlite_event_row_to_record(row: sqlite3.Row) -> dict[str, Any]:
         "relation",
         "query_text",
         "result_count",
+        "top_score",
         "success",
         "agent_id",
         "role",
@@ -3227,9 +3546,16 @@ def search_events(args: dict[str, Any]) -> dict[str, Any]:
 def search_memories(args: dict[str, Any]) -> dict[str, Any]:
     try:
         query = str(args.get("query", "")).strip()
+        domain = normalize_optional_string(args.get("domain"))
+        language = _normalize_alias_language(args.get("language"))
+        alias_runtime = _expand_query_with_aliases(query, domain=domain, language=language)
+        search_args = dict(args)
+        search_args["_alias_runtime"] = alias_runtime
+        search_args["_expanded_query"] = str(alias_runtime.get("expanded_query") or query)
         phase_label, phase = resolve_phase(args, query)
-        matches = search_rank(args, phase)
+        matches = search_rank(search_args, phase)
         matches, cap_warnings = cap_match_items(matches)
+        alias_diag = _alias_diagnostics_payload(alias_runtime, matches)
     except Exception as exc:
         return tool_error(str(exc))
     append_query_log("mnemo_search", args, matches, phase_label)
@@ -3246,6 +3572,7 @@ def search_memories(args: dict[str, Any]) -> dict[str, Any]:
                 "truncated": truncated,
                 "est_tokens": est_tokens,
                 "warnings": [],
+                **alias_diag,
             },
         )
 
@@ -3264,6 +3591,7 @@ def search_memories(args: dict[str, Any]) -> dict[str, Any]:
             "truncated": truncated,
             "est_tokens": est_tokens,
             "warnings": cap_warnings,
+            **alias_diag,
         },
     )
 
@@ -3300,8 +3628,13 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     )
     active_idf_profile = dict(idf_selection["profile"]) if isinstance(idf_selection.get("profile"), dict) else None
     use_idf = bool(idf_selection.get("active")) and active_idf_profile is not None
+    query_domain = normalize_optional_string(args.get("domain"))
+    query_language = _normalize_alias_language(args.get("language"))
+    alias_runtime = _expand_query_with_aliases(text, domain=query_domain, language=query_language)
+    expanded_text = str(alias_runtime.get("expanded_query") or text)
+    alias_map = alias_runtime.get("alias_map") if isinstance(alias_runtime.get("alias_map"), dict) else {}
 
-    input_sig = _build_memory_signature(text)
+    input_sig = _build_memory_signature(expanded_text)
     input_shingles = _load_json_string_list(input_sig.get("shingle_hashes_json"))
     input_token_count = int(input_sig.get("token_count") or 0)
 
@@ -3370,17 +3703,25 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
     for memory, overlap in scored_candidates[:max_scored]:
         memory_text = str(memory.get("text", ""))
+        kwargs: dict[str, Any] = {}
         if use_idf and active_idf_profile is not None:
-            breakdown = salience.signal_score(
-                text,
-                memory_text,
-                mode="auto",
-                idf_profile=active_idf_profile,
-                weights=dict(IDF_ACTIVE_WEIGHTS),
+            kwargs.update(
+                {
+                    "mode": "auto",
+                    "idf_profile": active_idf_profile,
+                    "weights": dict(IDF_ACTIVE_WEIGHTS),
+                }
             )
-        else:
-            breakdown = salience.signal_score(text, memory_text)
-        score = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+        if alias_map:
+            kwargs["alias_map"] = dict(alias_map)
+        try:
+            breakdown = salience.signal_score(expanded_text, memory_text, **kwargs)
+        except TypeError:
+            kwargs.pop("alias_map", None)
+            breakdown = salience.signal_score(expanded_text, memory_text, **kwargs)
+        base_score = max(0.0, min(1.0, float(getattr(breakdown, "final", 0.0))))
+        alias_concept_score, alias_concepts = _alias_concept_score_for_memory(memory, alias_runtime)
+        score = max(0.0, min(1.0, base_score + alias_concept_score))
         triggered = score >= threshold
         matches.append(
             {
@@ -3388,6 +3729,9 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
                 "kind": str(memory.get("kind", "")),
                 "text_preview": memory_text[:200],
                 "score": round(score, 3),
+                "base_score": round(base_score, 3),
+                "alias_concept_score": round(alias_concept_score, 3),
+                "alias_concepts": alias_concepts,
                 "triggered": triggered,
                 "margin": round(score - threshold, 3),
                 "shingle_overlap": round(overlap, 4),
@@ -3422,6 +3766,7 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     triggered_count = sum(1 for item in top_matches if item["triggered"])
     idf_used = any(bool((item.get("breakdown") or {}).get("idf_used")) for item in top_matches)
     top_breakdown = (top_matches[0].get("breakdown") if top_matches else {}) if top_matches else {}
+    alias_diag = _alias_diagnostics_payload(alias_runtime, top_matches)
     explanation = (
         f"{triggered_count}/{len(top_matches)} top matches met threshold {threshold:.2f}."
         if top_matches
@@ -3458,6 +3803,7 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
             "status": str(idf_selection.get("status", "cold")),
             "active": bool(idf_selection.get("active", False)),
         },
+        **alias_diag,
         "warnings": warnings,
         "explanation": explanation,
     }
@@ -3468,11 +3814,38 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         f"Candidate source: {candidate_source}",
         f"Scored candidates: {structured['scored_count']}",
         f"IDF: status={structured['idf_status']} used={'yes' if structured['idf_used'] else 'no'} scope={structured['idf_scope_used']} mode={structured['idf']['mode']}",
+        f"Aliases: used={'yes' if structured['aliases_used'] else 'no'} concepts={len(structured['alias_concepts_matched'])} expansions={int(structured['alias_candidate_expansion_count'])}",
         f"Triggered matches: {triggered_count}/{len(top_matches)}",
         explanation,
     ]
     if warnings:
         lines.append("Warnings: " + "; ".join(warnings))
+    top_score = max((float(item.get("score") or 0.0) for item in top_matches), default=0.0)
+    event_matches = [{"id": item.get("memory_id"), "score": item.get("score", 0.0)} for item in top_matches]
+    miss = triggered_count == 0
+    append_query_log(
+        "mnemo_salience_check",
+        args,
+        event_matches,
+        query_text=text,
+        domain=normalize_optional_string(args.get("domain")),
+        result_count=triggered_count,
+        top_score=top_score,
+        success=0 if miss else 1,
+        include_in_salience=True if miss else None,
+        summary=(
+            f"mnemo_salience_check: threshold={threshold:.2f} triggered={triggered_count} "
+            f"scored={len(top_matches)} top_score={top_score:.3f}"
+        ),
+        action="mnemo_salience_check",
+        extra={
+            "threshold": threshold,
+            "scored_count": len(top_matches),
+            "candidate_source": candidate_source,
+            "aliases_used": bool(alias_diag.get("aliases_used")),
+            "alias_candidate_expansion_count": int(alias_diag.get("alias_candidate_expansion_count", 0)),
+        },
+    )
     return text_result("\n".join(lines), structured)
 
 def record_memory(args: dict[str, Any]) -> dict[str, Any]:
@@ -4026,13 +4399,19 @@ def recent_memories(args: dict[str, Any]) -> dict[str, Any]:
 def compact_context(args: dict[str, Any]) -> dict[str, Any]:
     try:
         query = str(args.get("query", "")).strip()
+        domain = normalize_optional_string(args.get("domain"))
+        language = _normalize_alias_language(args.get("language"))
+        alias_runtime = _expand_query_with_aliases(query, domain=domain, language=language)
         limit = int(args.get("limit", 8))
         limit = max(1, min(limit, 20))
         search_args = dict(args)
         search_args["query"] = query
         search_args["limit"] = limit
+        search_args["_alias_runtime"] = alias_runtime
+        search_args["_expanded_query"] = str(alias_runtime.get("expanded_query") or query)
         phase_label, phase = resolve_phase(search_args, query)
         matches = search_rank(search_args, phase)
+        alias_diag = _alias_diagnostics_payload(alias_runtime, matches)
     except Exception as exc:
         return tool_error(str(exc))
 
@@ -4049,6 +4428,7 @@ def compact_context(args: dict[str, Any]) -> dict[str, Any]:
                 "inferred_phase": phase_label,
                 "truncated": truncated,
                 "est_tokens": est_tokens,
+                **alias_diag,
             },
         )
 
@@ -4078,6 +4458,7 @@ def compact_context(args: dict[str, Any]) -> dict[str, Any]:
             "inferred_phase": phase_label,
             "truncated": truncated,
             "est_tokens": est_tokens,
+            **alias_diag,
         },
     )
 
@@ -4923,9 +5304,1471 @@ def _consolidate_full_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _safe_int(value: Any, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _safe_float(value: Any, default: float, *, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+def _normalize_alias_term(text: Any) -> str:
+    value = normalize_optional_string(text)
+    if not value:
+        return ""
+    return normalize_text(value)
+
+
+def _normalize_alias_language(language: Any) -> str:
+    value = normalize_optional_string(language)
+    if not value:
+        return DEFAULT_ALIAS_LANGUAGE
+    return value.lower()
+
+
+def _load_active_alias_terms(domain: str | None = None, language: str | None = None) -> list[dict[str, Any]]:
+    if store_backend() != "sqlite":
+        return []
+    wanted_domain = normalize_optional_string(domain)
+    wanted_language = _normalize_alias_language(language)
+    sql = (
+        "SELECT "
+        "c.concept_id AS concept_id, "
+        "c.canonical AS canonical, "
+        "c.domain AS concept_domain, "
+        "c.language AS concept_language, "
+        "c.weight AS concept_weight, "
+        "t.alias_id AS alias_id, "
+        "t.term AS term, "
+        "t.normalized_term AS normalized_term, "
+        "t.domain AS term_domain, "
+        "t.language AS term_language, "
+        "t.weight AS term_weight "
+        "FROM alias_terms t "
+        "JOIN alias_concepts c ON c.concept_id = t.concept_id "
+        "WHERE c.status = 'active' AND t.status = 'active' "
+        "AND COALESCE(NULLIF(c.language, ''), ?) = ? "
+        "AND COALESCE(NULLIF(t.language, ''), ?) = ?"
+    )
+    params: list[Any] = [DEFAULT_ALIAS_LANGUAGE, wanted_language, DEFAULT_ALIAS_LANGUAGE, wanted_language]
+    if wanted_domain is not None:
+        sql += " AND (COALESCE(NULLIF(c.domain, ''), '') = '' OR c.domain = ?)"
+        params.append(wanted_domain)
+        sql += " AND (COALESCE(NULLIF(t.domain, ''), '') = '' OR t.domain = ?)"
+        params.append(wanted_domain)
+    sql += " ORDER BY c.canonical, t.term"
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "concept_id": str(row["concept_id"]),
+                "canonical": str(row["canonical"] or ""),
+                "concept_domain": normalize_optional_string(row["concept_domain"]),
+                "concept_language": _normalize_alias_language(row["concept_language"]),
+                "concept_weight": float(row["concept_weight"] or 1.0),
+                "alias_id": str(row["alias_id"] or ""),
+                "term": str(row["term"] or ""),
+                "normalized_term": _normalize_alias_term(row["normalized_term"] or row["term"]),
+                "term_domain": normalize_optional_string(row["term_domain"]),
+                "term_language": _normalize_alias_language(row["term_language"]),
+                "term_weight": float(row["term_weight"] or 1.0),
+            }
+        )
+    return out
+
+
+def _build_alias_map_from_rows(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+    alias_map_sets: dict[str, set[str]] = {}
+    for row in rows:
+        canonical = normalize_optional_string(row.get("canonical"))
+        if not canonical:
+            continue
+        bucket = alias_map_sets.setdefault(canonical, set())
+        bucket.add(canonical)
+        term = normalize_optional_string(row.get("term"))
+        if term:
+            bucket.add(term)
+    return {canonical: sorted(list(terms), key=lambda item: item.lower()) for canonical, terms in alias_map_sets.items()}
+
+
+def _build_alias_map_for_agent_salience(domain: str | None = None, language: str | None = None) -> dict[str, list[str]]:
+    rows = _load_active_alias_terms(domain=domain, language=language)
+    return _build_alias_map_from_rows(rows)
+
+
+def _normalized_term_in_text(normalized_text: str, normalized_term: str) -> bool:
+    if not normalized_text or not normalized_term:
+        return False
+    return f" {normalized_term} " in f" {normalized_text} "
+
+
+def _match_alias_concepts(
+    text: str,
+    domain: str | None = None,
+    language: str | None = None,
+    *,
+    alias_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    normalized_text = _normalize_alias_term(text)
+    rows = alias_rows if alias_rows is not None else _load_active_alias_terms(domain=domain, language=language)
+    if not normalized_text or not rows:
+        return {
+            "concept_ids": [],
+            "concepts": [],
+            "terms": [],
+            "concept_terms": {},
+        }
+
+    concept_ids: list[str] = []
+    concepts: list[str] = []
+    terms: list[str] = []
+    concept_terms: dict[str, list[str]] = {}
+    concept_seen: set[str] = set()
+    term_seen: set[str] = set()
+    for row in rows:
+        concept_id = str(row.get("concept_id") or "").strip()
+        canonical = normalize_optional_string(row.get("canonical")) or concept_id
+        term_value = normalize_optional_string(row.get("term"))
+        normalized_term = _normalize_alias_term(row.get("normalized_term") or term_value)
+        canonical_term = _normalize_alias_term(canonical)
+        matched_term = None
+        if normalized_term and _normalized_term_in_text(normalized_text, normalized_term):
+            matched_term = term_value or normalized_term
+        elif canonical_term and _normalized_term_in_text(normalized_text, canonical_term):
+            matched_term = canonical
+        if matched_term is None:
+            continue
+        if concept_id and concept_id not in concept_seen:
+            concept_seen.add(concept_id)
+            concept_ids.append(concept_id)
+            concepts.append(canonical)
+        norm_match = _normalize_alias_term(matched_term)
+        if norm_match and norm_match not in term_seen:
+            term_seen.add(norm_match)
+            terms.append(matched_term)
+        if concept_id:
+            bucket = concept_terms.setdefault(concept_id, [])
+            if matched_term not in bucket:
+                bucket.append(matched_term)
+    return {
+        "concept_ids": concept_ids,
+        "concepts": concepts,
+        "terms": terms,
+        "concept_terms": concept_terms,
+    }
+
+
+def _expand_query_with_aliases(
+    query_text: str,
+    domain: str | None = None,
+    language: str | None = None,
+) -> dict[str, Any]:
+    wanted_language = _normalize_alias_language(language)
+    query_value = str(query_text or "").strip()
+    rows = _load_active_alias_terms(domain=domain, language=wanted_language)
+    alias_map = _build_alias_map_from_rows(rows)
+    matched = _match_alias_concepts(query_value, domain=domain, language=wanted_language, alias_rows=rows)
+    query_concept_ids = [str(item) for item in matched.get("concept_ids", []) if str(item).strip()]
+    normalized_query = _normalize_alias_term(query_value)
+
+    concept_terms: dict[str, list[str]] = {}
+    concept_names: dict[str, str] = {}
+    concept_weights: dict[str, float] = {}
+    for row in rows:
+        concept_id = str(row.get("concept_id") or "").strip()
+        if not concept_id:
+            continue
+        canonical = normalize_optional_string(row.get("canonical")) or concept_id
+        concept_names[concept_id] = canonical
+        concept_weights[concept_id] = max(
+            concept_weights.get(concept_id, 0.0),
+            float(row.get("concept_weight") or 1.0),
+            float(row.get("term_weight") or 1.0),
+        )
+        bucket = concept_terms.setdefault(concept_id, [])
+        if canonical not in bucket:
+            bucket.append(canonical)
+        term = normalize_optional_string(row.get("term"))
+        if term and term not in bucket:
+            bucket.append(term)
+
+    expansion_terms: list[str] = []
+    seen_norm_terms: set[str] = set()
+    for concept_id in query_concept_ids:
+        for term in concept_terms.get(concept_id, []):
+            norm = _normalize_alias_term(term)
+            if not norm:
+                continue
+            if _normalized_term_in_text(normalized_query, norm):
+                continue
+            if norm in seen_norm_terms:
+                continue
+            seen_norm_terms.add(norm)
+            expansion_terms.append(term)
+    expanded_query = query_value
+    if expansion_terms:
+        expanded_query = (query_value + " " + " ".join(expansion_terms)).strip()
+    return {
+        "available": store_backend() == "sqlite",
+        "domain": normalize_optional_string(domain),
+        "language": wanted_language,
+        "query_text": query_value,
+        "normalized_query": normalized_query,
+        "expanded_query": expanded_query,
+        "alias_map": alias_map,
+        "alias_rows": rows,
+        "query_concept_ids": query_concept_ids,
+        "query_concepts": [concept_names.get(concept_id, concept_id) for concept_id in query_concept_ids],
+        "query_terms_matched": [str(item) for item in matched.get("terms", []) if str(item).strip()],
+        "concept_terms": concept_terms,
+        "concept_names": concept_names,
+        "concept_weights": concept_weights,
+        "expansion_terms": expansion_terms,
+        "alias_candidate_expansion_count": len(expansion_terms),
+        "aliases_used": bool(query_concept_ids),
+    }
+
+
+def _alias_concept_score_for_memory(memory: dict[str, Any], alias_runtime: dict[str, Any] | None) -> tuple[float, list[str]]:
+    runtime = alias_runtime if isinstance(alias_runtime, dict) else {}
+    concept_ids = [str(item) for item in runtime.get("query_concept_ids", []) if str(item).strip()]
+    if not concept_ids:
+        return 0.0, []
+    concept_terms = runtime.get("concept_terms")
+    if not isinstance(concept_terms, dict) or not concept_terms:
+        return 0.0, []
+    normalized_text = _normalize_alias_term(str(memory.get("text", "")))
+    if not normalized_text:
+        return 0.0, []
+    matched_concepts: list[str] = []
+    for concept_id in concept_ids:
+        terms = concept_terms.get(concept_id, [])
+        if not isinstance(terms, list):
+            continue
+        for term in terms:
+            if _normalized_term_in_text(normalized_text, _normalize_alias_term(term)):
+                matched_concepts.append(concept_id)
+                break
+    if not matched_concepts:
+        return 0.0, []
+    weights = runtime.get("concept_weights")
+    avg_weight = 1.0
+    if isinstance(weights, dict):
+        weight_values = [float(weights.get(concept_id, 1.0)) for concept_id in matched_concepts]
+        if weight_values:
+            avg_weight = sum(weight_values) / float(len(weight_values))
+    score = ALIAS_CONCEPT_BASE_BOOST + (0.02 * max(0, len(matched_concepts) - 1))
+    score *= max(0.5, min(1.5, avg_weight))
+    bounded_score = max(0.0, min(ALIAS_CONCEPT_MAX_BOOST, score))
+    unique_concepts = sorted(set(matched_concepts))
+    return bounded_score, unique_concepts
+
+
+def _alias_diagnostics_payload(alias_runtime: dict[str, Any] | None, matches: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    runtime = alias_runtime if isinstance(alias_runtime, dict) else {}
+    concepts = [str(item) for item in runtime.get("query_concepts", []) if str(item).strip()]
+    terms = [str(item) for item in runtime.get("query_terms_matched", []) if str(item).strip()]
+    expansion_count = int(runtime.get("alias_candidate_expansion_count") or 0)
+    alias_concept_score = 0.0
+    if isinstance(matches, list):
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            alias_concept_score = max(alias_concept_score, float(item.get("alias_concept_score") or 0.0))
+    return {
+        "aliases_used": bool(runtime.get("aliases_used", False)),
+        "alias_concepts_matched": concepts,
+        "alias_terms_matched": terms,
+        "alias_candidate_expansion_count": expansion_count,
+        "alias_concept_score": round(alias_concept_score, 3),
+    }
+
+
+def _event_time_within_window(record: dict[str, Any], cutoff: datetime) -> bool:
+    stamp = str(record.get("ts") or record.get("created_at") or "").strip()
+    if not stamp:
+        return False
+    try:
+        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return when >= cutoff
+    except ValueError:
+        return stamp >= cutoff.isoformat().replace("+00:00", "Z")
+
+
+def _load_recent_alias_source_events(
+    *,
+    window_days: int,
+    domain: str | None,
+    include_hints: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, window_days))
+    misses: list[dict[str, Any]] = []
+    hints: list[dict[str, Any]] = []
+    wanted_domain = normalize_optional_string(domain)
+    if store_backend() == "sqlite":
+        cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            miss_actions = sorted(MISS_EVENT_ACTIONS)
+            placeholders = ",".join("?" for _ in miss_actions)
+            miss_sql = (
+                "SELECT * FROM events WHERE COALESCE(ts, created_at) >= ? "
+                "AND success = 0 AND include_in_salience = 1 "
+                "AND TRIM(COALESCE(query_text, '')) != '' "
+                f"AND COALESCE(action, event_type) IN ({placeholders})"
+            )
+            miss_params: list[Any] = [cutoff_iso, *miss_actions]
+            if wanted_domain is not None:
+                miss_sql += " AND domain = ?"
+                miss_params.append(wanted_domain)
+            miss_sql += " ORDER BY COALESCE(ts, created_at) DESC, rowid DESC LIMIT ?"
+            miss_params.append(MAX_ALIAS_PROPOSAL_EVENT_SCAN)
+            miss_rows = conn.execute(miss_sql, miss_params).fetchall()
+            misses = [_sqlite_event_row_to_record(row) for row in miss_rows]
+
+            if include_hints:
+                hint_sql = (
+                    "SELECT * FROM events WHERE COALESCE(ts, created_at) >= ? "
+                    "AND COALESCE(action, event_type) = 'alias_hint'"
+                )
+                hint_params: list[Any] = [cutoff_iso]
+                if wanted_domain is not None:
+                    hint_sql += " AND domain = ?"
+                    hint_params.append(wanted_domain)
+                hint_sql += " ORDER BY COALESCE(ts, created_at) DESC, rowid DESC LIMIT ?"
+                hint_params.append(MAX_ALIAS_PROPOSAL_EVENT_SCAN)
+                hint_rows = conn.execute(hint_sql, hint_params).fetchall()
+                hints = [_sqlite_event_row_to_record(row) for row in hint_rows]
+        return misses, hints
+
+    rows = _legacy_event_rows(include_archive=False)
+    for row in rows:
+        action = str(row.get("action") or row.get("event_type") or "").strip()
+        if not _event_time_within_window(row, cutoff):
+            continue
+        row_domain = normalize_optional_string(row.get("domain"))
+        if wanted_domain is not None and row_domain != wanted_domain:
+            continue
+        if action in MISS_EVENT_ACTIONS:
+            if _event_int_value(row.get("success")) != 0:
+                continue
+            if _event_int_value(row.get("include_in_salience")) != 1:
+                continue
+            if not normalize_optional_string(row.get("query_text")):
+                continue
+            misses.append(row)
+        elif include_hints and action == "alias_hint":
+            hints.append(row)
+    misses = misses[:MAX_ALIAS_PROPOSAL_EVENT_SCAN]
+    hints = hints[:MAX_ALIAS_PROPOSAL_EVENT_SCAN]
+    return misses, hints
+
+
+def _cluster_miss_events(miss_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    exact: dict[str, dict[str, Any]] = {}
+    for event in miss_events:
+        query = normalize_optional_string(event.get("query_text"))
+        if not query:
+            continue
+        key = normalize_text(query)
+        cluster = exact.setdefault(
+            key,
+            {
+                "norm_key": key,
+                "miss_events": [],
+                "hints": [],
+                "query_counts": {},
+                "domain_counts": {},
+                "representative": query,
+                "rep_shingles": _build_min_k_shingle_hashes(_normalize_for_signature(query)),
+                "rep_tokens": set(_normalize_for_signature(query)),
+            },
+        )
+        cluster["miss_events"].append(event)
+        cluster["query_counts"][query] = int(cluster["query_counts"].get(query, 0)) + 1
+        domain = normalize_optional_string(event.get("domain"))
+        if domain:
+            cluster["domain_counts"][domain] = int(cluster["domain_counts"].get(domain, 0)) + 1
+
+    ordered = sorted(
+        exact.values(),
+        key=lambda item: (-len(item["miss_events"]), str(item["representative"]).lower(), str(item["norm_key"])),
+    )
+    merged: list[dict[str, Any]] = []
+    for cluster in ordered:
+        best_index = -1
+        best_overlap = 0.0
+        for index, existing in enumerate(merged):
+            overlap = _signature_overlap(cluster["rep_shingles"], existing["rep_shingles"])
+            if overlap >= ALIAS_CLUSTER_SHINGLE_OVERLAP_THRESHOLD and overlap > best_overlap:
+                best_overlap = overlap
+                best_index = index
+        if best_index < 0:
+            merged.append(cluster)
+            continue
+        target = merged[best_index]
+        target["miss_events"].extend(cluster["miss_events"])
+        for query, count in cluster["query_counts"].items():
+            target["query_counts"][query] = int(target["query_counts"].get(query, 0)) + int(count)
+        for domain, count in cluster["domain_counts"].items():
+            target["domain_counts"][domain] = int(target["domain_counts"].get(domain, 0)) + int(count)
+        if len(cluster["miss_events"]) > len(target["miss_events"]):
+            target["representative"] = cluster["representative"]
+            target["rep_shingles"] = cluster["rep_shingles"]
+            target["rep_tokens"] = cluster["rep_tokens"]
+    for cluster in merged:
+        top_queries = sorted(
+            cluster["query_counts"].items(),
+            key=lambda item: (-int(item[1]), str(item[0]).lower()),
+        )
+        if top_queries:
+            cluster["representative"] = str(top_queries[0][0])
+            cluster["rep_shingles"] = _build_min_k_shingle_hashes(_normalize_for_signature(cluster["representative"]))
+            cluster["rep_tokens"] = set(_normalize_for_signature(cluster["representative"]))
+    return merged
+
+
+def _hint_text_for_matching(hint: dict[str, Any]) -> str:
+    payload = _event_payload_from_record(hint)
+    for key in ("original_query", "candidate_alias", "query_text", "query", "successful_query", "canonical"):
+        value = normalize_optional_string(payload.get(key))
+        if value:
+            return value
+        value = normalize_optional_string(hint.get(key))
+        if value:
+            return value
+    return ""
+
+
+def _hint_confidence(hint: dict[str, Any]) -> str:
+    payload = _event_payload_from_record(hint)
+    value = normalize_optional_string(payload.get("confidence"))
+    if value is None:
+        value = normalize_optional_string(hint.get("confidence"))
+    normalized = (value or "medium").strip().lower()
+    return normalized if normalized in {"low", "medium", "high"} else "medium"
+
+
+def _attach_alias_hints(
+    clusters: list[dict[str, Any]],
+    hints: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    out = list(clusters)
+    for hint in hints:
+        text = _hint_text_for_matching(hint)
+        if not text:
+            continue
+        normalized = normalize_text(text)
+        hint_tokens = set(_normalize_for_signature(text))
+        best_index = -1
+        best_score = 0.0
+        for index, cluster in enumerate(out):
+            score = 0.0
+            if normalized == normalize_text(str(cluster.get("representative") or "")):
+                score = 1.0
+            else:
+                cluster_tokens = cluster.get("rep_tokens") if isinstance(cluster.get("rep_tokens"), set) else set()
+                score = _jaccard_similarity_fallback(hint_tokens, cluster_tokens)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index >= 0 and best_score >= 0.20:
+            out[best_index]["hints"].append(hint)
+            hint_domain = normalize_optional_string(hint.get("domain")) or normalize_optional_string(
+                _event_payload_from_record(hint).get("domain")
+            )
+            if hint_domain:
+                out[best_index]["domain_counts"][hint_domain] = int(
+                    out[best_index]["domain_counts"].get(hint_domain, 0)
+                ) + 1
+            continue
+        hint_domain = normalize_optional_string(hint.get("domain")) or normalize_optional_string(
+            _event_payload_from_record(hint).get("domain")
+        )
+        domain_counts = {hint_domain: 1} if hint_domain else {}
+        out.append(
+            {
+                "norm_key": normalized,
+                "miss_events": [],
+                "hints": [hint],
+                "query_counts": {text: 1},
+                "domain_counts": domain_counts,
+                "representative": text,
+                "rep_shingles": _build_min_k_shingle_hashes(_normalize_for_signature(text)),
+                "rep_tokens": hint_tokens,
+            }
+        )
+    return out
+
+
+def _event_payload_from_record(record: dict[str, Any]) -> dict[str, Any]:
+    payload = record.get("data")
+    if isinstance(payload, dict):
+        return dict(payload)
+    raw = record.get("data_json")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return dict(parsed)
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _alias_candidate_memories(
+    query_text: str,
+    *,
+    domain: str | None,
+    max_candidates_per_cluster: int,
+    min_loose_score: float,
+) -> list[tuple[float, dict[str, Any]]]:
+    if not query_text.strip():
+        return []
+    candidate_limit = max(50, min(500, max_candidates_per_cluster * 25))
+    args: dict[str, Any] = {}
+    if domain is not None:
+        args["domain"] = domain
+    candidates: list[dict[str, Any]] = []
+    if store_backend() == "sqlite" and _sqlite_fts_flag():
+        candidates = _sqlite_fts_candidate_memories(
+            args,
+            query_text,
+            include_deleted=False,
+            include_superseded=False,
+            limit=candidate_limit,
+        )[:candidate_limit]
+    if not candidates:
+        store = load_store()
+        visible = [
+            memory
+            for memory in store.get("memories", [])
+            if isinstance(memory, dict) and visible_memory(memory, False, False)
+        ]
+        if domain is not None:
+            visible = [memory for memory in visible if normalize_optional_string(memory.get("domain")) in {domain, None}]
+        wanted_terms = set(_build_top_terms(_normalize_for_signature(query_text), DEFAULT_TOP_TERMS))
+        ranked: list[tuple[int, str, str, dict[str, Any]]] = []
+        for memory in visible:
+            mem_terms = set(_memory_top_terms(memory))
+            overlap = len(wanted_terms & mem_terms) if wanted_terms and mem_terms else 0
+            if overlap > 0:
+                ranked.append((overlap, str(memory.get("created_at") or ""), str(memory.get("id") or ""), memory))
+        ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        candidates = [item[3] for item in ranked[:candidate_limit]]
+        if not candidates:
+            candidates = visible[-candidate_limit:]
+
+    query_tokens = set(_normalize_for_signature(query_text))
+    query_shingles = _build_min_k_shingle_hashes(_normalize_for_signature(query_text))
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for memory in candidates:
+        mem_terms = set(_memory_top_terms(memory, max_terms=64))
+        token_overlap = _jaccard_similarity_fallback(query_tokens, mem_terms) if query_tokens and mem_terms else 0.0
+        mem_shingles = _load_json_string_list(memory.get("shingle_hashes_json"))
+        if not mem_shingles:
+            mem_shingles = _build_min_k_shingle_hashes(_normalize_for_signature(str(memory.get("text", ""))))
+        shingle_overlap = _signature_overlap(query_shingles, mem_shingles) if query_shingles and mem_shingles else 0.0
+        loose = max(token_overlap, shingle_overlap)
+        if loose < min_loose_score:
+            continue
+        scored.append((loose, memory))
+    scored.sort(key=lambda item: (item[0], str(item[1].get("created_at", "")), str(item[1].get("id", ""))), reverse=True)
+    return scored[:max_candidates_per_cluster]
+
+
+def _idf_quantile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * quantile))))
+    return float(ordered[position])
+
+
+def _alias_idf_evidence(alias_text: str, idf_profile: dict[str, Any]) -> tuple[list[str], list[str], float]:
+    tokens = []
+    seen: set[str] = set()
+    for token in _normalize_for_signature(alias_text):
+        if len(token) < 2 or token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    idf_raw = idf_profile.get("idf")
+    idf_map: dict[str, float] = {}
+    if isinstance(idf_raw, dict):
+        for key, value in idf_raw.items():
+            try:
+                idf_map[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+    idf_values = list(idf_map.values())
+    if not tokens:
+        return [], [], 0.0
+    if not idf_values:
+        return [], tokens, 0.0
+    low_cutoff = _idf_quantile(idf_values, 0.25)
+    high_cutoff = _idf_quantile(idf_values, 0.75)
+    unknown = max(0.0, low_cutoff * 0.80)
+    idf_terms: list[str] = []
+    penalized_terms: list[str] = []
+    normalized_scores: list[float] = []
+    denom = max(1e-6, high_cutoff - low_cutoff)
+    for token in tokens:
+        weight = idf_map.get(token, unknown)
+        normalized_scores.append(max(0.0, min(1.0, (weight - low_cutoff) / denom)))
+        if token in idf_map and weight >= high_cutoff:
+            idf_terms.append(token)
+        if token not in idf_map or weight <= low_cutoff:
+            penalized_terms.append(token)
+    idf_strength = sum(normalized_scores) / len(normalized_scores) if normalized_scores else 0.0
+    return idf_terms, penalized_terms, idf_strength
+
+
+def _proposal_domain(cluster: dict[str, Any], explicit_domain: str | None) -> str | None:
+    if explicit_domain is not None:
+        return explicit_domain
+    counts = cluster.get("domain_counts", {})
+    if not isinstance(counts, dict) or not counts:
+        return None
+    ordered = sorted(counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
+    return normalize_optional_string(ordered[0][0])
+
+
+def _cluster_candidate_alias(cluster: dict[str, Any]) -> str:
+    hint_counts: dict[str, int] = {}
+    for hint in cluster.get("hints", []):
+        payload = _event_payload_from_record(hint)
+        candidate = normalize_optional_string(payload.get("candidate_alias")) or normalize_optional_string(hint.get("candidate_alias"))
+        if candidate:
+            hint_counts[candidate] = int(hint_counts.get(candidate, 0)) + 1
+    if hint_counts:
+        ordered = sorted(hint_counts.items(), key=lambda item: (-item[1], str(item[0]).lower()))
+        return str(ordered[0][0])
+    query_counts = cluster.get("query_counts", {})
+    if isinstance(query_counts, dict) and query_counts:
+        ordered = sorted(query_counts.items(), key=lambda item: (-int(item[1]), str(item[0]).lower()))
+        return str(ordered[0][0])
+    return str(cluster.get("representative") or "")
+
+
+def _cluster_canonical(cluster: dict[str, Any], loose_candidates: list[tuple[float, dict[str, Any]]]) -> str:
+    canonical_counts: dict[str, int] = {}
+    for hint in cluster.get("hints", []):
+        payload = _event_payload_from_record(hint)
+        canonical = normalize_optional_string(payload.get("canonical")) or normalize_optional_string(hint.get("canonical"))
+        if canonical:
+            canonical_counts[canonical] = int(canonical_counts.get(canonical, 0)) + 1
+    if canonical_counts:
+        ordered = sorted(canonical_counts.items(), key=lambda item: (-item[1], str(item[0]).lower()))
+        return str(ordered[0][0])
+    if loose_candidates:
+        top = loose_candidates[0][1]
+        metadata = top.get("metadata") if isinstance(top.get("metadata"), dict) else {}
+        title = normalize_optional_string(metadata.get("title")) if isinstance(metadata, dict) else None
+        if title:
+            return title
+        return memory_preview(top, max_chars=96)
+    return str(cluster.get("representative") or "")
+
+
+def _alias_event_id(record: dict[str, Any]) -> str | None:
+    event_id = normalize_optional_string(record.get("event_id"))
+    if event_id:
+        return event_id
+    event_id = normalize_optional_string(record.get("id"))
+    return event_id
+
+
+def _proposal_source_events(cluster: dict[str, Any]) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for event in cluster.get("miss_events", []):
+        if not isinstance(event, dict):
+            continue
+        event_id = _alias_event_id(event)
+        if event_id:
+            links.append({"event_id": event_id, "relation": "miss"})
+    for event in cluster.get("hints", []):
+        if not isinstance(event, dict):
+            continue
+        event_id = _alias_event_id(event)
+        if event_id:
+            links.append({"event_id": event_id, "relation": "hint"})
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in links:
+        key = (str(item.get("event_id") or ""), str(item.get("relation") or "evidence"))
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        deduped.append({"event_id": key[0], "relation": key[1]})
+    return deduped
+
+
+def _proposal_canonical_text(canonical: str, candidate_alias: str) -> str:
+    canonical_value = canonical.strip()
+    if canonical_value:
+        return canonical_value
+    return candidate_alias.strip()
+
+
+def _proposal_language(args: dict[str, Any]) -> str:
+    return _normalize_alias_language(args.get("language"))
+
+
+def _persist_alias_proposals(proposals: list[dict[str, Any]]) -> tuple[int, int]:
+    if not proposals:
+        return 0, 0
+    if store_backend() != "sqlite":
+        raise RuntimeError("propose_aliases persistence requires sqlite backend")
+    persisted = 0
+    links_written = 0
+    now = now_iso()
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        for proposal in proposals:
+            proposal_id = str(proposal.get("proposal_id") or "").strip()
+            if not proposal_id:
+                continue
+            domain = normalize_optional_string(proposal.get("domain"))
+            language = _normalize_alias_language(proposal.get("language"))
+            canonical = normalize_optional_string(proposal.get("canonical"))
+            candidate_alias = normalize_optional_string(proposal.get("candidate_alias"))
+            normalized_alias = _normalize_alias_term(candidate_alias)
+            if not candidate_alias or not normalized_alias:
+                continue
+            score = float(proposal.get("score") or 0.0)
+            recommendation = normalize_optional_string(proposal.get("recommendation")) or "review"
+            evidence = proposal.get("evidence")
+            evidence_json = json.dumps(evidence if isinstance(evidence, dict) else {}, ensure_ascii=False)
+            conn.execute(
+                """
+                INSERT INTO alias_proposals(
+                    proposal_id, domain, language, canonical, candidate_alias, normalized_alias,
+                    score, status, recommendation, evidence_json, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    domain=excluded.domain,
+                    language=excluded.language,
+                    canonical=excluded.canonical,
+                    candidate_alias=excluded.candidate_alias,
+                    normalized_alias=excluded.normalized_alias,
+                    score=excluded.score,
+                    recommendation=excluded.recommendation,
+                    evidence_json=excluded.evidence_json,
+                    status=CASE
+                        WHEN alias_proposals.status IN ('approved', 'rejected') THEN alias_proposals.status
+                        ELSE 'pending'
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    proposal_id,
+                    domain,
+                    language,
+                    canonical,
+                    candidate_alias,
+                    normalized_alias,
+                    score,
+                    recommendation,
+                    evidence_json,
+                    now,
+                    now,
+                ),
+            )
+            persisted += 1
+            source_events = proposal.get("source_events")
+            if not isinstance(source_events, list):
+                continue
+            for item in source_events:
+                if not isinstance(item, dict):
+                    continue
+                event_id = normalize_optional_string(item.get("event_id"))
+                relation = normalize_optional_string(item.get("relation")) or "evidence"
+                if not event_id:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO alias_proposal_events(proposal_id, event_id, relation) VALUES(?, ?, ?)",
+                    (proposal_id, event_id, relation),
+                )
+                links_written += 1
+    return persisted, links_written
+
+
+def _alias_concept_row(conn: sqlite3.Connection, concept_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM alias_concepts WHERE concept_id = ?", (concept_id,)).fetchone()
+
+
+def _alias_term_row(conn: sqlite3.Connection, alias_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM alias_terms WHERE alias_id = ?", (alias_id,)).fetchone()
+
+
+def _alias_row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {str(key): row[key] for key in row.keys()}
+
+
+def _alias_concept_id(canonical: str, domain: str | None, language: str) -> str:
+    base = f"{language}|{domain or '-'}|{_normalize_alias_term(canonical)}"
+    return "alias-concept-" + hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+
+
+def _find_existing_alias_term(
+    conn: sqlite3.Connection,
+    *,
+    concept_id: str,
+    normalized_term: str,
+    domain: str | None,
+    language: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM alias_terms
+        WHERE concept_id = ?
+          AND normalized_term = ?
+          AND COALESCE(NULLIF(domain, ''), '') = COALESCE(NULLIF(?, ''), '')
+          AND COALESCE(NULLIF(language, ''), ?) = ?
+        LIMIT 1
+        """,
+        (concept_id, normalized_term, domain, DEFAULT_ALIAS_LANGUAGE, language),
+    ).fetchone()
+
+
+def _list_alias_proposals_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    status = normalize_optional_string(args.get("status")) or "pending"
+    domain = normalize_optional_string(args.get("domain"))
+    limit = _safe_int(args.get("limit"), DEFAULT_ALIAS_PROPOSAL_LIST_LIMIT, minimum=1, maximum=500)
+    if store_backend() != "sqlite":
+        return tool_error("list_alias_proposals requires sqlite backend")
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        clauses = ["status = ?"]
+        params: list[Any] = [status]
+        if domain is not None:
+            clauses.append("domain = ?")
+            params.append(domain)
+        sql = "SELECT * FROM alias_proposals WHERE " + " AND ".join(clauses) + " ORDER BY score DESC, created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    proposals: list[dict[str, Any]] = []
+    for row in rows:
+        item = {str(key): row[key] for key in row.keys()}
+        evidence_raw = item.get("evidence_json")
+        if isinstance(evidence_raw, str):
+            try:
+                item["evidence"] = json.loads(evidence_raw)
+            except json.JSONDecodeError:
+                item["evidence"] = {"raw": evidence_raw}
+        proposals.append(item)
+    return text_result(
+        f"list_alias_proposals: status={status} domain={domain or '-'} count={len(proposals)}",
+        {
+            "action": "list_alias_proposals",
+            "status": status,
+            "domain": domain,
+            "proposals": proposals,
+            "count": len(proposals),
+        },
+    )
+
+
+def _approve_alias_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("approve_alias requires sqlite backend")
+    proposal_id = normalize_optional_string(args.get("proposal_id"))
+    concept_id = normalize_optional_string(args.get("concept_id"))
+    canonical = normalize_optional_string(args.get("canonical"))
+    candidate_alias = normalize_optional_string(args.get("candidate_alias"))
+    domain = normalize_optional_string(args.get("domain"))
+    language = _normalize_alias_language(args.get("language"))
+    approved_by = normalize_optional_string(args.get("approved_by"))
+    notes = normalize_optional_string(args.get("notes"))
+    now = now_iso()
+
+    proposal_row: sqlite3.Row | None = None
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        if proposal_id:
+            proposal_row = conn.execute(
+                "SELECT * FROM alias_proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if proposal_row is None:
+                return tool_error(f"proposal not found: {proposal_id}")
+            if canonical is None:
+                canonical = normalize_optional_string(proposal_row["canonical"])
+            if candidate_alias is None:
+                candidate_alias = normalize_optional_string(proposal_row["candidate_alias"])
+            if domain is None:
+                domain = normalize_optional_string(proposal_row["domain"])
+            if "language" not in args:
+                language = _normalize_alias_language(proposal_row["language"])
+        if not candidate_alias:
+            return tool_error("candidate_alias is required when proposal_id is not supplied")
+        normalized_alias = _normalize_alias_term(candidate_alias)
+        if not normalized_alias:
+            return tool_error("candidate_alias must contain at least one non-space token")
+        default_weight = 1.0
+        if proposal_row is not None:
+            default_weight = float(proposal_row["score"] or 1.0)
+        weight = _safe_float(args.get("weight"), default_weight, minimum=0.0, maximum=5.0)
+
+        if concept_id:
+            existing_concept = _alias_concept_row(conn, concept_id)
+        else:
+            existing_concept = None
+        if existing_concept is None:
+            if not canonical:
+                return tool_error("canonical is required when concept_id does not resolve an existing concept")
+            canonical_value = _proposal_canonical_text(canonical, candidate_alias)
+            concept_id = concept_id or _alias_concept_id(canonical_value, domain, language)
+            existing_concept = _alias_concept_row(conn, concept_id)
+            if existing_concept is None:
+                conn.execute(
+                    """
+                    INSERT INTO alias_concepts(
+                        concept_id, canonical, domain, language, status, weight,
+                        created_at, updated_at, source, notes
+                    ) VALUES(?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        concept_id,
+                        canonical_value,
+                        domain,
+                        language,
+                        weight if weight > 0 else 1.0,
+                        now,
+                        now,
+                        f"proposal:{proposal_id}" if proposal_id else "manual_approval",
+                        notes,
+                    ),
+                )
+            elif canonical:
+                conn.execute(
+                    """
+                    UPDATE alias_concepts
+                    SET canonical = ?, domain = COALESCE(?, domain), language = ?, status = 'active',
+                        weight = CASE WHEN ? > 0 THEN ? ELSE weight END,
+                        updated_at = ?, notes = COALESCE(?, notes)
+                    WHERE concept_id = ?
+                    """,
+                    (canonical, domain, language, weight, weight, now, notes, concept_id),
+                )
+        else:
+            concept_id = str(existing_concept["concept_id"])
+            if canonical:
+                conn.execute(
+                    """
+                    UPDATE alias_concepts
+                    SET canonical = ?, domain = COALESCE(?, domain), language = ?, status = 'active',
+                        weight = CASE WHEN ? > 0 THEN ? ELSE weight END,
+                        updated_at = ?, notes = COALESCE(?, notes)
+                    WHERE concept_id = ?
+                    """,
+                    (canonical, domain, language, weight, weight, now, notes, concept_id),
+                )
+
+        existing_alias = _find_existing_alias_term(
+            conn,
+            concept_id=concept_id,
+            normalized_term=normalized_alias,
+            domain=domain,
+            language=language,
+        )
+        if existing_alias is None:
+            alias_id = "alias-term-" + hashlib.sha1(
+                f"{concept_id}|{domain or '-'}|{language}|{normalized_alias}".encode("utf-8")
+            ).hexdigest()[:16]
+            conn.execute(
+                """
+                INSERT INTO alias_terms(
+                    alias_id, concept_id, term, normalized_term, language, domain, status, weight,
+                    source, approved_by, approved_at, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    alias_id,
+                    concept_id,
+                    candidate_alias,
+                    normalized_alias,
+                    language,
+                    domain,
+                    weight if weight > 0 else 1.0,
+                    f"proposal:{proposal_id}" if proposal_id else "manual_approval",
+                    approved_by,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            alias_id = str(existing_alias["alias_id"])
+            conn.execute(
+                """
+                UPDATE alias_terms
+                SET term = ?,
+                    language = ?,
+                    domain = COALESCE(?, domain),
+                    status = 'active',
+                    weight = CASE WHEN ? > 0 THEN ? ELSE weight END,
+                    source = ?,
+                    approved_by = COALESCE(?, approved_by),
+                    approved_at = COALESCE(approved_at, ?),
+                    updated_at = ?
+                WHERE alias_id = ?
+                """,
+                (
+                    candidate_alias,
+                    language,
+                    domain,
+                    weight,
+                    weight,
+                    f"proposal:{proposal_id}" if proposal_id else "manual_approval",
+                    approved_by,
+                    now,
+                    now,
+                    alias_id,
+                ),
+            )
+        if proposal_id:
+            conn.execute(
+                "UPDATE alias_proposals SET status = 'approved', updated_at = ? WHERE proposal_id = ?",
+                (now, proposal_id),
+            )
+        concept_row = _alias_concept_row(conn, concept_id)
+        alias_row = _alias_term_row(conn, alias_id)
+        proposal_out = None
+        if proposal_id:
+            proposal_out = conn.execute(
+                "SELECT * FROM alias_proposals WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+    return text_result(
+        f"approve_alias: concept_id={concept_id} alias_term={candidate_alias}",
+        {
+            "action": "approve_alias",
+            "concept": _alias_row_to_dict(concept_row),
+            "alias": _alias_row_to_dict(alias_row),
+            "proposal": _alias_row_to_dict(proposal_out),
+        },
+    )
+
+
+def _reject_alias_proposal_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("reject_alias_proposal requires sqlite backend")
+    proposal_id = normalize_optional_string(args.get("proposal_id"))
+    if not proposal_id:
+        return tool_error("proposal_id is required")
+    reason = normalize_optional_string(args.get("reason"))
+    now = now_iso()
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        exists = conn.execute(
+            "SELECT proposal_id FROM alias_proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if exists is None:
+            return tool_error(f"proposal not found: {proposal_id}")
+        conn.execute(
+            """
+            UPDATE alias_proposals
+            SET status = 'rejected',
+                recommendation = COALESCE(?, recommendation),
+                updated_at = ?
+            WHERE proposal_id = ?
+            """,
+            (reason, now, proposal_id),
+        )
+        row = conn.execute("SELECT * FROM alias_proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+    return text_result(
+        f"reject_alias_proposal: proposal_id={proposal_id}",
+        {
+            "action": "reject_alias_proposal",
+            "proposal": _alias_row_to_dict(row),
+        },
+    )
+
+
+def _list_aliases_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("list_aliases requires sqlite backend")
+    domain = normalize_optional_string(args.get("domain"))
+    language = normalize_optional_string(args.get("language"))
+    status = normalize_optional_string(args.get("status")) or "active"
+    concept_id = normalize_optional_string(args.get("concept_id"))
+    limit = _safe_int(args.get("limit"), DEFAULT_ALIAS_LIST_LIMIT, minimum=1, maximum=2000)
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        clauses = ["v.status = ?", "c.status = 'active'"]
+        params: list[Any] = [status]
+        if domain is not None:
+            clauses.append("(COALESCE(NULLIF(v.domain, ''), '') = '' OR v.domain = ?)")
+            params.append(domain)
+        if language is not None:
+            normalized_language = _normalize_alias_language(language)
+            clauses.append("COALESCE(NULLIF(v.language, ''), ?) = ?")
+            params.extend([DEFAULT_ALIAS_LANGUAGE, normalized_language])
+        if concept_id is not None:
+            clauses.append("v.concept_id = ?")
+            params.append(concept_id)
+        sql = (
+            "SELECT "
+            "v.domain AS domain, v.language AS language, v.concept_id AS concept_id, v.canonical AS canonical, "
+            "t.alias_id AS alias_id, v.alias AS alias, v.normalized_term AS normalized_term, "
+            "v.status AS status, v.weight AS weight, v.approved_at AS approved_at, v.approved_by AS approved_by, "
+            "v.source AS source, v.updated_at AS updated_at "
+            "FROM v_alias_vocabulary v "
+            "JOIN alias_concepts c ON c.concept_id = v.concept_id "
+            "JOIN alias_terms t ON t.concept_id = v.concept_id "
+            "  AND t.normalized_term = v.normalized_term "
+            "  AND t.term = v.alias "
+            "WHERE " + " AND ".join(clauses) + " "
+            "ORDER BY v.domain, v.language, v.concept_id, v.alias LIMIT ?"
+        )
+        params.append(limit)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    aliases = [{str(key): row[key] for key in row.keys()} for row in rows]
+    return text_result(
+        f"list_aliases: status={status} domain={domain or '-'} count={len(aliases)}",
+        {
+            "action": "list_aliases",
+            "domain": domain,
+            "language": language,
+            "status": status,
+            "aliases": aliases,
+            "count": len(aliases),
+        },
+    )
+
+
+def _disable_alias_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("disable_alias requires sqlite backend")
+    alias_id = normalize_optional_string(args.get("alias_id"))
+    concept_id = normalize_optional_string(args.get("concept_id"))
+    term = normalize_optional_string(args.get("term"))
+    reason = normalize_optional_string(args.get("reason"))
+    now = now_iso()
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        row: sqlite3.Row | None = None
+        if alias_id:
+            row = conn.execute("SELECT * FROM alias_terms WHERE alias_id = ?", (alias_id,)).fetchone()
+        elif concept_id and term:
+            row = conn.execute(
+                "SELECT * FROM alias_terms WHERE concept_id = ? AND normalized_term = ? LIMIT 1",
+                (concept_id, _normalize_alias_term(term)),
+            ).fetchone()
+        else:
+            return tool_error("disable_alias requires alias_id or concept_id + term")
+        if row is None:
+            return tool_error("alias term not found")
+        conn.execute(
+            "UPDATE alias_terms SET status = 'disabled', updated_at = ?, source = COALESCE(?, source) WHERE alias_id = ?",
+            (now, reason, str(row["alias_id"])),
+        )
+        out_row = conn.execute("SELECT * FROM alias_terms WHERE alias_id = ?", (str(row["alias_id"]),)).fetchone()
+    return text_result(
+        f"disable_alias: alias_id={str(row['alias_id'])}",
+        {
+            "action": "disable_alias",
+            "alias": _alias_row_to_dict(out_row),
+        },
+    )
+
+
+def _disable_alias_concept_maintenance(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("disable_alias_concept requires sqlite backend")
+    concept_id = normalize_optional_string(args.get("concept_id"))
+    if not concept_id:
+        return tool_error("concept_id is required")
+    reason = normalize_optional_string(args.get("reason"))
+    now = now_iso()
+    with _sqlite_session() as conn:
+        _sqlite_ensure_schema(conn)
+        _sqlite_bootstrap_if_needed(conn)
+        row = _alias_concept_row(conn, concept_id)
+        if row is None:
+            return tool_error(f"alias concept not found: {concept_id}")
+        conn.execute(
+            "UPDATE alias_concepts SET status = 'disabled', updated_at = ?, notes = COALESCE(?, notes) WHERE concept_id = ?",
+            (now, reason, concept_id),
+        )
+        out_row = _alias_concept_row(conn, concept_id)
+    return text_result(
+        f"disable_alias_concept: concept_id={concept_id}",
+        {
+            "action": "disable_alias_concept",
+            "concept": _alias_row_to_dict(out_row),
+        },
+    )
+
+
+def _propose_aliases_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
+    window_days = _safe_int(args.get("window_days"), DEFAULT_ALIAS_PROPOSAL_WINDOW_DAYS, minimum=1, maximum=365)
+    domain = normalize_optional_string(args.get("domain"))
+    language = _proposal_language(args)
+    min_recurrence = _safe_int(args.get("min_recurrence"), DEFAULT_ALIAS_PROPOSAL_MIN_RECURRENCE, minimum=1, maximum=100)
+    limit = _safe_int(args.get("limit"), DEFAULT_ALIAS_PROPOSAL_LIMIT, minimum=1, maximum=100)
+    include_hints = parse_bool(args.get("include_hints"), default=True)
+    min_loose_score = _safe_float(args.get("min_loose_score"), DEFAULT_ALIAS_PROPOSAL_MIN_LOOSE_SCORE, minimum=0.0, maximum=1.0)
+    max_candidates_per_cluster = _safe_int(
+        args.get("max_candidates_per_cluster"),
+        DEFAULT_ALIAS_PROPOSAL_MAX_CANDIDATES_PER_CLUSTER,
+        minimum=1,
+        maximum=20,
+    )
+    warnings: list[str] = []
+    if not dry_run and store_backend() != "sqlite":
+        return tool_error("propose_aliases persistence requires sqlite backend when dry_run=false")
+
+    try:
+        misses, hints = _load_recent_alias_source_events(
+            window_days=window_days,
+            domain=domain,
+            include_hints=include_hints,
+        )
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+    if not misses and not hints:
+        structured = {
+            "action": "propose_aliases",
+            "status": "no_misses",
+            "window_days": window_days,
+            "domain": domain,
+            "language": language,
+            "miss_event_count": 0,
+            "hint_event_count": 0,
+            "cluster_count": 0,
+            "idf": {"used": False, "scope": "none", "status": "unavailable"},
+            "proposals": [],
+            "dry_run": dry_run,
+            "persisted_count": 0,
+            "proposal_event_links_written": 0,
+            "warnings": warnings,
+        }
+        return text_result("propose_aliases: misses=0 clusters=0 proposals=0 idf=unavailable", structured)
+
+    clusters = _cluster_miss_events(misses)
+    if include_hints and hints:
+        clusters = _attach_alias_hints(clusters, hints)
+    clusters.sort(
+        key=lambda item: (-len(item.get("miss_events", [])), -len(item.get("hints", [])), str(item.get("representative", "")).lower())
+    )
+
+    idf_state = _ensure_idf_profiles(trigger="maintenance")
+    idf_selection = _resolve_idf_profile_for_memory_or_query(domain=domain, idf_state=idf_state)
+    idf_used = bool(idf_selection.get("active")) and isinstance(idf_selection.get("profile"), dict)
+    idf_scope = str(idf_selection.get("scope", "none")) if idf_used else "none"
+    idf_status = str(idf_selection.get("status", "cold"))
+    if not idf_used:
+        warnings.append(
+            "IDF profile is not active (cold/disabled/unavailable); alias proposals are withheld until IDF is ready."
+        )
+        structured = {
+            "action": "propose_aliases",
+            "status": "idf_cold",
+            "window_days": window_days,
+            "domain": domain,
+            "language": language,
+            "miss_event_count": len(misses),
+            "hint_event_count": len(hints),
+            "cluster_count": len(clusters),
+            "idf": {"used": False, "scope": "none", "status": idf_status},
+            "proposals": [],
+            "dry_run": dry_run,
+            "persisted_count": 0,
+            "proposal_event_links_written": 0,
+            "warnings": warnings,
+        }
+        return text_result(
+            f"propose_aliases: misses={len(misses)} clusters={len(clusters)} proposals=0 idf={idf_status}",
+            structured,
+        )
+
+    idf_profile = dict(idf_selection.get("profile") or {})
+    proposals: list[dict[str, Any]] = []
+    for cluster in clusters:
+        recurrence = len(cluster.get("miss_events", []))
+        strong_hint = any(_hint_confidence(hint) == "high" for hint in cluster.get("hints", []))
+        if recurrence < min_recurrence and not strong_hint:
+            continue
+        candidate_alias = _cluster_candidate_alias(cluster).strip()
+        if not candidate_alias:
+            continue
+        idf_terms, penalized_terms, idf_strength = _alias_idf_evidence(candidate_alias, idf_profile)
+        if not idf_terms:
+            continue
+        cluster_domain = _proposal_domain(cluster, domain)
+        try:
+            loose_candidates = _alias_candidate_memories(
+                str(cluster.get("representative") or candidate_alias),
+                domain=cluster_domain,
+                max_candidates_per_cluster=max_candidates_per_cluster,
+                min_loose_score=min_loose_score,
+            )
+        except Exception:
+            continue
+        if not loose_candidates:
+            continue
+        canonical = _cluster_canonical(cluster, loose_candidates).strip()
+        if not canonical:
+            continue
+        hint_count = len(cluster.get("hints", []))
+        hint_bonus = min(0.35, (0.18 * hint_count) + (0.22 if strong_hint else 0.0))
+        loose_top = float(loose_candidates[0][0])
+        domain_consistent = 0.0
+        if cluster_domain is not None:
+            domain_consistent = 1.0 if any(
+                normalize_optional_string(memory.get("domain")) in {cluster_domain, None}
+                for _score, memory in loose_candidates
+            ) else 0.0
+        generic_penalty = min(0.30, 0.06 * len(penalized_terms))
+        recurrence_score = min(1.0, float(recurrence) / float(max(1, min_recurrence)))
+        final_score = (
+            (0.34 * recurrence_score)
+            + (0.28 * loose_top)
+            + (0.22 * idf_strength)
+            + (0.08 * domain_consistent)
+            + hint_bonus
+            - generic_penalty
+        )
+        bounded_score = max(0.0, min(1.0, final_score))
+        miss_queries = sorted(
+            (str(query) for query in cluster.get("query_counts", {}).keys()),
+            key=lambda item: (-int(cluster.get("query_counts", {}).get(item, 0)), item.lower()),
+        )[:6]
+        hint_target_ids: list[str] = []
+        for hint in cluster.get("hints", []):
+            payload = _event_payload_from_record(hint)
+            for memory_id in normalize_linked_ids(payload.get("target_memory_ids", [])):
+                if memory_id not in hint_target_ids:
+                    hint_target_ids.append(memory_id)
+        target_memory_ids = list(hint_target_ids)
+        for _loose, memory in loose_candidates:
+            memory_id = str(memory.get("id") or "").strip()
+            if memory_id and memory_id not in target_memory_ids:
+                target_memory_ids.append(memory_id)
+        proposal_id = "alias-prop-" + hashlib.sha1(
+            f"{cluster_domain or '-'}|{canonical}|{candidate_alias}".encode("utf-8")
+        ).hexdigest()[:12]
+        proposals.append(
+            {
+                "proposal_id": proposal_id,
+                "domain": cluster_domain,
+                "language": language,
+                "canonical": canonical,
+                "candidate_alias": candidate_alias,
+                "normalized_alias": _normalize_alias_term(candidate_alias),
+                "score": round(bounded_score, 3),
+                "recommendation": "review",
+                "source_events": _proposal_source_events(cluster),
+                "evidence": {
+                    "recurrence": recurrence,
+                    "miss_queries": miss_queries,
+                    "hint_count": hint_count,
+                    "target_memory_ids": target_memory_ids[:12],
+                    "target_memory_previews": [memory_preview(memory, max_chars=120) for _score, memory in loose_candidates[:3]],
+                    "loose_scores": [round(float(score), 3) for score, _memory in loose_candidates],
+                    "idf_terms": idf_terms[:8],
+                    "penalized_terms": penalized_terms[:8],
+                },
+            }
+        )
+        if len(proposals) >= limit:
+            break
+
+    proposals.sort(key=lambda item: (float(item.get("score", 0.0)), str(item.get("proposal_id", ""))), reverse=True)
+    status = "ok" if proposals else "no_proposals"
+    persisted_count = 0
+    proposal_event_links_written = 0
+    persisted_error: str | None = None
+    if not dry_run and proposals:
+        try:
+            persisted_count, proposal_event_links_written = _persist_alias_proposals(proposals[:limit])
+        except Exception as exc:
+            persisted_error = f"{type(exc).__name__}: {exc}"
+    idf_payload = {"used": idf_used, "scope": idf_scope, "status": idf_status}
+    structured = {
+        "action": "propose_aliases",
+        "status": status,
+        "window_days": window_days,
+        "domain": domain,
+        "language": language,
+        "miss_event_count": len(misses),
+        "hint_event_count": len(hints),
+        "cluster_count": len(clusters),
+        "idf": idf_payload,
+        "dry_run": dry_run,
+        "persisted_count": persisted_count,
+        "proposal_event_links_written": proposal_event_links_written,
+        "proposals": proposals[:limit],
+        "warnings": warnings,
+    }
+    if persisted_error:
+        structured["status"] = "persist_error"
+        structured["persist_error"] = persisted_error
+        return text_result(
+            f"propose_aliases: misses={len(misses)} clusters={len(clusters)} proposals={len(proposals[:limit])} "
+            f"idf={idf_status} persist_error={persisted_error}",
+            structured,
+        )
+    top_lines = [
+        f"{item['candidate_alias']} -> {item['canonical']} ({float(item['score']):.2f})"
+        for item in proposals[:3]
+    ]
+    top_summary = "; ".join(top_lines) if top_lines else "none"
+    return text_result(
+        f"propose_aliases: misses={len(misses)} clusters={len(clusters)} proposals={len(proposals[:limit])} "
+        f"idf={idf_status} dry_run={'yes' if dry_run else 'no'} persisted={persisted_count} top={top_summary}",
+        structured,
+    )
+
+
 def memory_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     action = str(args.get("action", "")).strip().lower()
-    valid_actions = {"compact_logs", "consolidate", "consolidate_full", "import_json", "backfill_signatures"}
+    valid_actions = {
+        "compact_logs",
+        "consolidate",
+        "consolidate_full",
+        "import_json",
+        "backfill_signatures",
+        "propose_aliases",
+        "list_alias_proposals",
+        "approve_alias",
+        "reject_alias_proposal",
+        "list_aliases",
+        "disable_alias",
+        "disable_alias_concept",
+    }
     if action not in valid_actions:
         return tool_error(f"action must be one of: {', '.join(sorted(valid_actions))}")
     dry_run = parse_bool(args.get("dry_run"), default=True)
@@ -4935,6 +6778,20 @@ def memory_maintenance(args: dict[str, Any]) -> dict[str, Any]:
         return _import_json_maintenance(args, dry_run)
     if action == "backfill_signatures":
         return _backfill_signatures_maintenance(args, dry_run)
+    if action == "propose_aliases":
+        return _propose_aliases_maintenance(args, dry_run)
+    if action == "list_alias_proposals":
+        return _list_alias_proposals_maintenance(args)
+    if action == "approve_alias":
+        return _approve_alias_maintenance(args)
+    if action == "reject_alias_proposal":
+        return _reject_alias_proposal_maintenance(args)
+    if action == "list_aliases":
+        return _list_aliases_maintenance(args)
+    if action == "disable_alias":
+        return _disable_alias_maintenance(args)
+    if action == "disable_alias_concept":
+        return _disable_alias_concept_maintenance(args)
     if action == "consolidate_full":
         return _consolidate_full_maintenance(args)
     return _consolidate_maintenance(args, dry_run)
@@ -5038,6 +6895,7 @@ def _build_recall_bundle(
     include_recent_logs: bool,
     salience_module: Any | None,
     idf_profile: dict[str, Any] | None = None,
+    alias_runtime: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     visible = [
         memory
@@ -5076,6 +6934,7 @@ def _build_recall_bundle(
             max_blocks * 2,
             salience_module,
             idf_profile,
+            alias_runtime,
         )
         blocks_by_id: dict[str, dict[str, Any]] = {}
         for memory in linked_blocks:
@@ -5085,6 +6944,7 @@ def _build_recall_bundle(
                 break
             blocks_by_id.setdefault(str(memory.get("id")), memory)
         context_blocks = list(blocks_by_id.values())[:max_blocks]
+        block_scores = {str(memory.get("id")): float(score) for score, memory in scored_blocks}
 
         hippocampus = [memory for memory in visible if str(memory.get("kind", "")) == "hippocampus_entry"]
         scored_hippocampus = select_memories_by_query(
@@ -5093,8 +6953,10 @@ def _build_recall_bundle(
             max_hippocampus,
             salience_module,
             idf_profile,
+            alias_runtime,
         )
         hippocampus_entries = [memory for _, memory in scored_hippocampus]
+        hippocampus_scores = {str(memory.get("id")): float(score) for score, memory in scored_hippocampus}
 
         feedback = [
             memory
@@ -5112,6 +6974,16 @@ def _build_recall_bundle(
         ]
         feedback.sort(key=lambda memory: str(memory.get("created_at", "")), reverse=True)
         feedback = feedback[:max_feedback]
+        feedback_scores: dict[str, float] = {}
+        if query:
+            for memory in feedback:
+                feedback_scores[str(memory.get("id"))] = rank_against_query(
+                    memory,
+                    query,
+                    salience_module,
+                    idf_profile,
+                    alias_runtime,
+                )
 
         pinned: list[dict[str, Any]] = []
         if include_pinned:
@@ -5141,9 +7013,18 @@ def _build_recall_bundle(
             "role": startup_role,
             "agent_id": agent_id,
             "recent_logs": [memory_bundle_item(memory, max_chars=500) for memory in recent_logs],
-            "context_blocks": [memory_bundle_item(memory, max_chars=1200) for memory in context_blocks],
-            "hippocampus_entries": [memory_bundle_item(memory, max_chars=900) for memory in hippocampus_entries],
-            "agent_feedback": [memory_bundle_item(memory, max_chars=600) for memory in feedback],
+            "context_blocks": [
+                memory_bundle_item(memory, max_chars=1200, score=block_scores.get(str(memory.get("id"))))
+                for memory in context_blocks
+            ],
+            "hippocampus_entries": [
+                memory_bundle_item(memory, max_chars=900, score=hippocampus_scores.get(str(memory.get("id"))))
+                for memory in hippocampus_entries
+            ],
+            "agent_feedback": [
+                memory_bundle_item(memory, max_chars=600, score=feedback_scores.get(str(memory.get("id"))))
+                for memory in feedback
+            ],
             "pinned": [memory_bundle_item(memory, max_chars=700) for memory in pinned],
             "summary": summary,
             "warnings": warnings,
@@ -5159,11 +7040,19 @@ def _build_recall_bundle(
             score += 2.0
         if domain and str(memory.get("domain", "")).strip() == domain:
             score += 2.0
-        score += rank_against_query(memory, task, salience_module, idf_profile) if task else 0.0
+        score += rank_against_query(memory, task, salience_module, idf_profile, alias_runtime) if task else 0.0
+        if task and isinstance(alias_runtime, dict):
+            alias_boost, alias_concepts = _alias_concept_score_for_memory(memory, alias_runtime)
+            if alias_boost > 0.0:
+                enriched = dict(memory)
+                enriched["_alias_concept_score"] = alias_boost
+                enriched["_alias_concepts"] = alias_concepts
+                memory = enriched
         if score > 0:
             scored_feedback.append((score, memory))
     scored_feedback.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
     feedback = [memory for _, memory in scored_feedback[:max_feedback]]
+    feedback_scores = {str(memory.get("id")): float(score) for score, memory in scored_feedback[:max_feedback]}
 
     hippocampus_candidates = [
         memory
@@ -5181,6 +7070,7 @@ def _build_recall_bundle(
         max_hippocampus,
         salience_module,
         idf_profile,
+        alias_runtime,
     )
     hippocampus_entries = [memory for _, memory in scored_hippocampus]
 
@@ -5193,8 +7083,11 @@ def _build_recall_bundle(
         max_blocks,
         salience_module,
         idf_profile,
+        alias_runtime,
     )
     context_blocks = [memory for _, memory in scored_blocks]
+    block_scores = {str(memory.get("id")): float(score) for score, memory in scored_blocks}
+    hippocampus_scores = {str(memory.get("id")): float(score) for score, memory in scored_hippocampus}
 
     recent_logs: list[dict[str, Any]] = []
     if include_recent_logs:
@@ -5223,9 +7116,18 @@ def _build_recall_bundle(
         "role": role,
         "domain": domain,
         "task": task,
-        "agent_feedback": [memory_bundle_item(memory, max_chars=600) for memory in feedback],
-        "hippocampus_entries": [memory_bundle_item(memory, max_chars=900) for memory in hippocampus_entries],
-        "context_blocks": [memory_bundle_item(memory, max_chars=1200) for memory in context_blocks],
+        "agent_feedback": [
+            memory_bundle_item(memory, max_chars=600, score=feedback_scores.get(str(memory.get("id"))))
+            for memory in feedback
+        ],
+        "hippocampus_entries": [
+            memory_bundle_item(memory, max_chars=900, score=hippocampus_scores.get(str(memory.get("id"))))
+            for memory in hippocampus_entries
+        ],
+        "context_blocks": [
+            memory_bundle_item(memory, max_chars=1200, score=block_scores.get(str(memory.get("id"))))
+            for memory in context_blocks
+        ],
         "recent_logs": [memory_bundle_item(memory, max_chars=500) for memory in recent_logs],
         "warnings": warnings,
     }
@@ -5266,6 +7168,45 @@ def _apply_recall_output_caps(structured: dict[str, Any]) -> dict[str, Any]:
     return structured
 
 
+def _recall_event_metrics(structured: dict[str, Any], *, query_present: bool, threshold: float) -> dict[str, Any]:
+    relevant_sections = ("context_blocks", "hippocampus_entries", "agent_feedback", "recent_logs", "pinned")
+    result_count = 0
+    scores: list[float] = []
+    event_matches: list[dict[str, Any]] = []
+    for key in relevant_sections:
+        section = structured.get(key)
+        if not isinstance(section, list):
+            continue
+        for item in section:
+            if not isinstance(item, dict):
+                continue
+            result_count += 1
+            memory_id = normalize_optional_string(item.get("id"))
+            score = _event_float_value(item.get("score"))
+            if score is not None:
+                bounded_score = max(0.0, min(1.0, float(score)))
+                scores.append(bounded_score)
+                if memory_id:
+                    event_matches.append({"id": memory_id, "score": bounded_score})
+            elif memory_id:
+                event_matches.append({"id": memory_id, "score": 0.0})
+    top_score = max(scores) if scores else 0.0
+    if query_present:
+        if scores:
+            success = 1 if any(score >= threshold for score in scores) else 0
+        else:
+            success = 1 if result_count > 0 else 0
+    else:
+        success = 1 if result_count > 0 else 0
+    return {
+        "result_count": result_count,
+        "top_score": top_score,
+        "success": success,
+        "scores": scores,
+        "event_matches": event_matches,
+    }
+
+
 def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
     mode = normalize_optional_string(args.get("mode")) or "startup"
     if mode not in {"startup", "agent"}:
@@ -5294,6 +7235,9 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
         include_recent_logs = parse_bool(args.get("include_recent_logs"), default=False)
         if not query:
             query = task
+    query_text = query or task
+    language = _normalize_alias_language(args.get("language"))
+    alias_runtime = _expand_query_with_aliases(query_text, domain=domain, language=language)
 
     salience, _ = load_optional_agent_salience()
     recall_idf_profile: dict[str, Any] | None = None
@@ -5326,13 +7270,115 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
         include_recent_logs=include_recent_logs,
         salience_module=salience,
         idf_profile=recall_idf_profile,
+        alias_runtime=alias_runtime,
     )
     structured = _apply_recall_output_caps(structured)
     structured["idf_used"] = bool(recall_idf_profile)
     structured["idf_scope_used"] = str(idf_choice.get("scope", "none")) if recall_idf_profile else "none"
     structured["idf_profile_status"] = str(idf_choice.get("status", "not_requested"))
     structured["score_weights"] = dict(IDF_ACTIVE_WEIGHTS) if recall_idf_profile else {}
+    alias_items: list[dict[str, Any]] = []
+    for key in ("context_blocks", "hippocampus_entries", "agent_feedback", "recent_logs", "pinned"):
+        section = structured.get(key)
+        if isinstance(section, list):
+            alias_items.extend(item for item in section if isinstance(item, dict))
+    structured.update(_alias_diagnostics_payload(alias_runtime, alias_items))
+    recall_metrics = _recall_event_metrics(
+        structured,
+        query_present=bool(str(query_text).strip()),
+        threshold=miss_top_score_threshold(),
+    )
+    miss = int(recall_metrics["success"]) == 0
+    append_query_log(
+        "mnemo_recall",
+        args,
+        recall_metrics["event_matches"],
+        query_text=str(query_text).strip() or None,
+        domain=domain,
+        result_count=int(recall_metrics["result_count"]),
+        top_score=float(recall_metrics["top_score"]),
+        success=int(recall_metrics["success"]),
+        include_in_salience=True if miss else None,
+        summary=(
+            f"mnemo_recall: mode={mode} result_count={int(recall_metrics['result_count'])} "
+            f"top_score={float(recall_metrics['top_score']):.3f} success={int(recall_metrics['success'])}"
+        ),
+        action="mnemo_recall",
+        extra={
+            "mode": mode,
+            "query_present": bool(str(query_text).strip()),
+            "score_threshold": miss_top_score_threshold(),
+            "score_count": len(recall_metrics["scores"]),
+        },
+    )
     return text_result(summary, structured)
+
+
+def memory_alias_hint(args: dict[str, Any]) -> dict[str, Any]:
+    domain = normalize_optional_string(args.get("domain"))
+    canonical = normalize_optional_string(args.get("canonical"))
+    candidate_alias = normalize_optional_string(args.get("candidate_alias"))
+    original_query = normalize_optional_string(args.get("original_query"))
+    successful_query = normalize_optional_string(args.get("successful_query"))
+    evidence = normalize_optional_string(args.get("evidence"))
+    confidence = (normalize_optional_string(args.get("confidence")) or "medium").lower()
+    if confidence not in {"low", "medium", "high"}:
+        return tool_error("confidence must be one of: low, medium, high")
+    if not candidate_alias and not original_query:
+        return tool_error("candidate_alias or original_query is required")
+    if not canonical and not successful_query:
+        return tool_error("canonical or successful_query is required")
+
+    hint_query = original_query or candidate_alias or successful_query or canonical or ""
+    try:
+        target_memory_ids = normalize_linked_ids(args.get("target_memory_ids", []))
+    except ValueError as exc:
+        return tool_error(str(exc))
+    include_in_salience = parse_bool(args.get("include_in_salience"), default=True)
+    payload = {
+        "action": "alias_hint",
+        "domain": domain,
+        "canonical": canonical,
+        "candidate_alias": candidate_alias,
+        "original_query": original_query,
+        "successful_query": successful_query,
+        "target_memory_ids": target_memory_ids,
+        "evidence": evidence,
+        "confidence": confidence,
+        "include_in_salience": include_in_salience,
+    }
+    append_query_log(
+        "alias_hint",
+        args,
+        [],
+        query_text=hint_query or None,
+        domain=domain,
+        result_count=0,
+        top_score=0.0,
+        success=1,
+        include_in_salience=include_in_salience,
+        summary=(
+            f"alias_hint: candidate={candidate_alias or '-'} canonical={canonical or successful_query or '-'} "
+            f"confidence={confidence}"
+        ),
+        action="alias_hint",
+        extra=payload,
+    )
+    return text_result(
+        "Recorded alias_hint event.",
+        {
+            "action": "alias_hint",
+            "domain": domain,
+            "canonical": canonical,
+            "candidate_alias": candidate_alias,
+            "original_query": original_query,
+            "successful_query": successful_query,
+            "target_memory_ids": target_memory_ids,
+            "evidence": evidence,
+            "confidence": confidence,
+            "include_in_salience": include_in_salience,
+        },
+    )
 
 
 def _compact_logs_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
@@ -6691,6 +8737,7 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
                     "relation",
                     "query_text",
                     "result_count",
+                    "top_score",
                     "success",
                     "agent_id",
                     "role",
@@ -6746,6 +8793,59 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     for warning in idf_warnings:
         if warning not in warnings:
             warnings.append(warning)
+
+    aliases_payload: dict[str, Any] = {
+        "available": backend == "sqlite",
+        "concept_count": 0,
+        "active_concept_count": 0,
+        "alias_count": 0,
+        "active_alias_count": 0,
+        "pending_proposal_count": 0,
+        "rejected_proposal_count": 0,
+        "views_available": False,
+        "warnings": [],
+        "recommendations": [],
+    }
+    if backend == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                aliases_payload["concept_count"] = int(conn.execute("SELECT COUNT(*) FROM alias_concepts").fetchone()[0])
+                aliases_payload["active_concept_count"] = int(
+                    conn.execute("SELECT COUNT(*) FROM alias_concepts WHERE status = 'active'").fetchone()[0]
+                )
+                aliases_payload["alias_count"] = int(conn.execute("SELECT COUNT(*) FROM alias_terms").fetchone()[0])
+                aliases_payload["active_alias_count"] = int(
+                    conn.execute("SELECT COUNT(*) FROM alias_terms WHERE status = 'active'").fetchone()[0]
+                )
+                aliases_payload["pending_proposal_count"] = int(
+                    conn.execute("SELECT COUNT(*) FROM alias_proposals WHERE status = 'pending'").fetchone()[0]
+                )
+                aliases_payload["rejected_proposal_count"] = int(
+                    conn.execute("SELECT COUNT(*) FROM alias_proposals WHERE status = 'rejected'").fetchone()[0]
+                )
+                view_rows = conn.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                    WHERE type='view' AND name IN (
+                        'v_alias_vocabulary',
+                        'v_alias_pending_proposals',
+                        'v_alias_concept_counts'
+                    )
+                    """
+                ).fetchall()
+                aliases_payload["views_available"] = len(view_rows) == 3
+        except Exception as exc:
+            aliases_payload["warnings"].append(f"alias diagnostics unavailable: {type(exc).__name__}")
+        if int(aliases_payload.get("pending_proposal_count", 0)) > 0 and int(aliases_payload.get("active_alias_count", 0)) == 0:
+            aliases_payload["recommendations"].append(
+                "Review pending alias proposals and approve high-confidence items via maintenance approve_alias."
+            )
+        if not bool(aliases_payload.get("views_available")):
+            aliases_payload["warnings"].append("alias inspection views are unavailable")
+    else:
+        aliases_payload["warnings"].append("alias tables are only available in sqlite backend")
 
     profile = mcp_profile()
     visible = exposed_tools(profile)
@@ -6822,6 +8922,14 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     for recommendation in idf_recommendations:
         if recommendation not in recommendations:
             recommendations.append(recommendation)
+    for warning in aliases_payload.get("warnings", []):
+        warning_text = str(warning).strip()
+        if warning_text and warning_text not in warnings:
+            warnings.append(warning_text)
+    for recommendation in aliases_payload.get("recommendations", []):
+        recommendation_text = str(recommendation).strip()
+        if recommendation_text and recommendation_text not in recommendations:
+            recommendations.append(recommendation_text)
 
     memory_file_payload = {
         "path": str(mem_file),
@@ -6869,6 +8977,7 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         f"Mnemo {SERVER_VERSION} - {backend_file_name} {'exists' if backend_exists else 'missing'} ({backend_size} bytes, {memory_file_payload['memory_count']} memories)",
         f"Last write: {memory_file_payload['last_write_iso']}  Last id: {memory_file_payload['last_memory_id']}",
         f"Events: {event_count} total, {recent_event_count} in last 24h, events_fts={'on' if events_fts_enabled else 'off'}",
+        f"Aliases: active_concepts={int(aliases_payload.get('active_concept_count', 0))} active_aliases={int(aliases_payload.get('active_alias_count', 0))} pending_proposals={int(aliases_payload.get('pending_proposal_count', 0))}",
         f"Kinds: {kind_summary}",
         f"Drift: {drift_value:.2f} ({drift_interp})  Salience: {salience_text}  Search: {search_backend}",
         f"IDF: project={idf_project.get('status', 'cold')} active={'yes' if idf_project.get('active') else 'no'} domains_ready={idf_domains_ready} mode={idf_state.get('mode', idf_mode())}",
@@ -6922,6 +9031,7 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "archive": archive_payload,
         "drift": drift,
         "salience": salience_payload,
+        "aliases": aliases_payload,
         "idf": {
             "mode": str(idf_state.get("mode", idf_mode())),
             "available": bool(idf_state.get("available", False)),
@@ -6951,6 +9061,7 @@ GATEWAY_ACTIONS: dict[str, Any] = {
     "search": search_memories,
     "salience_check": memory_salience_check,
     "record": record_memory,
+    "alias_hint": memory_alias_hint,
     "link": memory_link,
     "recall": memory_recall,
     "get": memory_get,
@@ -7018,9 +9129,9 @@ TOOLS = [
         "title": "Mnemo Memory Gateway",
         "description": (
             "Mnemo project-memory gateway; not Copilot native memory. "
-            "Actions: doctor, record, search, recall, get, link, export, "
+            "Actions: doctor, record, alias_hint, search, recall, get, link, export, "
             "recent_events, search_events, get_event, memory_events, "
-            "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures), "
+            "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures, propose_aliases, list_alias_proposals, approve_alias, reject_alias_proposal, list_aliases, disable_alias, disable_alias_concept), "
             "inspect, lookup_symbol, salience_check, update, delete, recent."
         ),
         "inputSchema": {
@@ -7029,7 +9140,7 @@ TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": sorted(GATEWAY_ACTIONS),
-                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json, or the top-level aliases backfill_signatures and consolidate_full for those v0.12 actions.",
+                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept, or the top-level aliases backfill_signatures and consolidate_full for those v0.12 actions.",
                 },
                 "params": {
                     "type": "object",
@@ -7096,11 +9207,27 @@ _TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
         "include_archive": "When omitted, false is used.",
     },
     "mnemo_maintenance": {
-        "action": "Allowed values: compact_logs, consolidate, import_json.",
+        "action": "Allowed values: compact_logs, consolidate, consolidate_full, import_json, backfill_signatures, propose_aliases, list_alias_proposals, approve_alias, reject_alias_proposal, list_aliases, disable_alias, disable_alias_concept.",
         "older_than_count": "compact_logs: range 1-500. When omitted, 20 is used.",
         "max_logs": "compact_logs: range 1-200. When omitted, 50 is used.",
         "threshold": "Range 0.5-1.0. When omitted, env fallback 0.7 is used.",
         "dry_run": "When omitted, true is used.",
+        "window_days": "propose_aliases: range 1-365. When omitted, 30 is used.",
+        "min_recurrence": "propose_aliases: range 1-100. When omitted, 3 is used.",
+        "min_loose_score": "propose_aliases: range 0.0-1.0. When omitted, 0.20 is used.",
+        "max_candidates_per_cluster": "propose_aliases: range 1-20. When omitted, 5 is used.",
+        "status": "list_alias_proposals/list_aliases: optional filter, defaults to pending/active.",
+        "proposal_id": "approve_alias/reject_alias_proposal: proposal identifier.",
+        "canonical": "approve_alias: required if concept_id does not resolve an existing concept.",
+        "candidate_alias": "approve_alias: required when proposal_id is not supplied.",
+        "concept_id": "approve_alias/list_aliases/disable_alias/disable_alias_concept: concept identifier.",
+        "language": "Alias operations default to en.",
+        "weight": "approve_alias: optional weight override, defaults to proposal score or 1.0.",
+        "approved_by": "approve_alias: optional operator identity.",
+        "notes": "approve_alias: optional concept notes.",
+        "alias_id": "disable_alias: alias term identifier.",
+        "term": "disable_alias: required with concept_id when alias_id is omitted.",
+        "reason": "reject_alias_proposal/disable_alias/disable_alias_concept: optional reason text.",
     },
     "mnemo_export": {
         "format": "Allowed values: jsonl, json, markdown, hippocampus_markdown, agent_feedback_markdown, startup_context_markdown.",
@@ -7174,7 +9301,7 @@ def handle_request(message: dict[str, Any]) -> None:
                 },
                 "instructions": (
                     "Use the single mnemo gateway tool with action plus optional params. "
-                    "Common actions: doctor, search, record, recall, get, link, export, "
+                    "Common actions: doctor, search, record, alias_hint, recall, get, link, export, "
                     "recent_events, search_events, get_event, memory_events, compact_context, "
                     "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
                     "Do not look for individual mnemo_* tools; "
