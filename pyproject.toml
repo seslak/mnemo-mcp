@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemo-mcp"
-version = "0.13.4"
+version = "0.13.5"
 description = "Local-first SQLite-backed project memory MCP gateway for coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -36,4 +36,4 @@ Issues = "https://github.com/seslak/mnemo-mcp/issues"
 mnemo-mcp = "server:main"
 
 [tool.setuptools]
-py-modules = ["server", "salience_loader"]
+py-modules = ["server", "salience_loader", "git_context"]

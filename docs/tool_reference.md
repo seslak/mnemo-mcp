@@ -408,3 +408,30 @@ SQLite rows include deterministic signatures:
 ## Schema compatibility
 
 Mnemo exports a conservative MCP schema for Copilot-style clients. Advanced JSON Schema features are intentionally avoided; handlers enforce ranges, defaults, and validation.
+
+## Git-aware write metadata (0.13.5)
+
+`record` accepts an optional `touched_files` parameter when the caller knows which files the interaction or memory refers to:
+
+```json
+{
+  "action": "record",
+  "params": {
+    "kind": "context_block",
+    "text": "IBAN validation lives in payments/iban.py.",
+    "touched_files": ["payments/iban.py"]
+  }
+}
+```
+
+When git context is available, Mnemo stamps the new memory with `git_sha`, `git_branch`, and `git_dirty`, and stores file fingerprints in `memory_files`. The write still succeeds if git is unavailable or a file fingerprint cannot be resolved.
+
+Search and recall apply a freshness multiplier to already-scored candidates with file fingerprints:
+
+- legacy row / no git metadata: `1.0`
+- unchanged touched files: `1.0`
+- changed touched file: `0.7`
+- missing/deleted touched file: `0.3`
+
+This is a post-score retrieval adjustment only. It does not change IDF scoring, alias scoring, or candidate generation.
+

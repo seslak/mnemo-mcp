@@ -86,6 +86,8 @@ class MnemoTestCase(unittest.TestCase):
         os.environ.pop("MNEMO_MISS_TOP_SCORE_THRESHOLD", None)
         os.environ.pop("AGENT_SALIENCE_HOME", None)
         server._SYMBOL_CACHE.clear()
+        if hasattr(server, "_GIT_CONTEXT_CACHE"):
+            server._GIT_CONTEXT_CACHE.clear()
 
     def tearDown(self) -> None:
         for key, value in self._old_env.items():
@@ -94,6 +96,8 @@ class MnemoTestCase(unittest.TestCase):
             else:
                 os.environ[key] = value
         server._SYMBOL_CACHE.clear()
+        if hasattr(server, "_GIT_CONTEXT_CACHE"):
+            server._GIT_CONTEXT_CACHE.clear()
         self.tmp.cleanup()
 
     def read_store(self) -> dict:
@@ -1947,6 +1951,22 @@ class SqliteStoreTests(MnemoTestCase):
         with path.open("w", encoding="utf-8") as f:
             json.dump({"version": 1, "memories": memories}, f)
 
+    def _git_available(self) -> bool:
+        proc = subprocess.run(["git", "--version"], capture_output=True, text=True, check=False)
+        return proc.returncode == 0
+
+    def _run_git(self, args: list[str]) -> None:
+        proc = subprocess.run(["git", *args], cwd=str(self.workspace), capture_output=True, text=True, check=False)
+        if proc.returncode != 0:
+            raise AssertionError(f"git command failed: {' '.join(args)} :: {proc.stderr.strip()}")
+
+    def _init_git_repo(self) -> None:
+        if not self._git_available():
+            self.skipTest("git is not available")
+        self._run_git(["init"])
+        self._run_git(["config", "user.email", "mnemo-tests@example.com"])
+        self._run_git(["config", "user.name", "Mnemo Tests"])
+
     def test_sqlite_record_and_search(self) -> None:
         stored = self.record("sqlite marker alpha", kind="note")
         self.assertTrue(self.sqlite_file.exists())
@@ -2185,6 +2205,134 @@ class SqliteStoreTests(MnemoTestCase):
         finally:
             conn.close()
         self.assertTrue(expected.issubset(cols2))
+
+    def test_migration_idempotent(self) -> None:
+        server.load_store()
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            memory_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        finally:
+            conn.close()
+        self.assertIn("git_sha", memory_cols)
+        self.assertIn("git_branch", memory_cols)
+        self.assertIn("git_dirty", memory_cols)
+        self.assertIn("memory_files", tables)
+
+    def test_legacy_row_neutral(self) -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                """
+                INSERT INTO memories(
+                    id, kind, text, source, tags_json, linked_ids_json, metadata_json,
+                    pinned, deleted, created_at, token_estimate, git_sha, git_branch, git_dirty
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-neutral",
+                    "note",
+                    "legacy neutral marker",
+                    "legacy",
+                    "[]",
+                    "[]",
+                    "{}",
+                    0,
+                    0,
+                    server.now_iso(),
+                    1,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
+            multiplier = server.freshness_multiplier(conn, "note", "legacy-neutral", str(self.workspace))
+        finally:
+            conn.close()
+        self.assertEqual(multiplier, 1.0)
+
+    def test_fresh_drifted_stale(self) -> None:
+        self._init_git_repo()
+        a_path = self.workspace / "a.txt"
+        b_path = self.workspace / "b.txt"
+        a_path.write_text("alpha\n", encoding="utf-8")
+        b_path.write_text("beta\n", encoding="utf-8")
+        self._run_git(["add", "a.txt", "b.txt"])
+        self._run_git(["commit", "-m", "seed files"])
+
+        stored = self.record(
+            "fresh drift stale marker",
+            kind="note",
+            touched_files=["a.txt", "b.txt"],
+        )
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.row_factory = sqlite3.Row
+            fresh = server.freshness_multiplier(conn, "note", stored["id"], str(self.workspace))
+            self.assertEqual(fresh, 1.0)
+            a_path.write_text("alpha-updated\n", encoding="utf-8")
+            drifted = server.freshness_multiplier(conn, "note", stored["id"], str(self.workspace))
+            self.assertEqual(drifted, 0.7)
+            b_path.unlink()
+            stale = server.freshness_multiplier(conn, "note", stored["id"], str(self.workspace))
+            self.assertEqual(stale, 0.3)
+        finally:
+            conn.close()
+
+    def test_no_git_fallback(self) -> None:
+        path = self.workspace / "fallback.txt"
+        path.write_text("fallback bytes\n", encoding="utf-8")
+        stored = self.record(
+            "no git fallback marker",
+            kind="note",
+            touched_files=["fallback.txt"],
+        )
+        self.assertIsNone(stored.get("git_sha"))
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT path, file_sha FROM memory_files WHERE memory_table = ? AND memory_id = ?",
+                ("note", stored["id"]),
+            ).fetchall()
+            self.assertGreaterEqual(len(rows), 1)
+            self.assertTrue(any(str(row["file_sha"]).strip() for row in rows))
+            multiplier = server.freshness_multiplier(conn, "note", stored["id"], str(self.workspace))
+        finally:
+            conn.close()
+        self.assertEqual(multiplier, 1.0)
+
+    def test_retrieval_reorder(self) -> None:
+        self._init_git_repo()
+        fresh_path = self.workspace / "fresh.txt"
+        stale_path = self.workspace / "stale.txt"
+        fresh_path.write_text("fresh\n", encoding="utf-8")
+        stale_path.write_text("stale\n", encoding="utf-8")
+        self._run_git(["add", "fresh.txt", "stale.txt"])
+        self._run_git(["commit", "-m", "seed retrieval files"])
+
+        fresh = self.record(
+            "retrieval reorder fresh marker",
+            kind="note",
+            touched_files=["fresh.txt"],
+        )
+        stale = self.record(
+            "retrieval reorder stale marker",
+            kind="note",
+            touched_files=["stale.txt"],
+        )
+        stale_path.unlink()
+        store = self.read_store()
+        by_id = {str(item.get("id")): item for item in store.get("memories", []) if isinstance(item, dict)}
+        stale_memory = by_id[stale["id"]]
+        fresh_memory = by_id[fresh["id"]]
+        with mock.patch("server.rank_memories_for_query", return_value=[(0.8, stale_memory), (0.8, fresh_memory)]):
+            matches = server.search_rank({"query": "retrieval reorder", "limit": 2})
+        self.assertEqual(matches[0]["id"], fresh["id"])
+        self.assertEqual(matches[1]["id"], stale["id"])
 
     def test_recent_events_returns_compact_rows(self) -> None:
         self.record("recent events marker", kind="note", domain="payments", role="specialist", agent_id="spec_pay")

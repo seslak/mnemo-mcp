@@ -164,3 +164,45 @@ Do not commit runtime state unless intentionally publishing seed memory:
 - `*.archive.jsonl`
 - `*.lock`
 - generated exports
+
+## Git-aware memory schema (0.13.5)
+
+Mnemo 0.13.5 adds git-aware metadata to the SQLite `memories` table. The migration is additive and safe to re-run.
+
+New columns on `memories`:
+
+| Column | Meaning |
+|---|---|
+| `git_sha` | Commit SHA at write time, when Mnemo can read git state. |
+| `git_branch` | Branch name at write time, when available. |
+| `git_dirty` | `1` if the working tree was dirty, `0` if clean, `NULL` if git context is unavailable. |
+
+Touched-file fingerprints are stored in `memory_files`:
+
+```sql
+CREATE TABLE IF NOT EXISTS memory_files (
+  memory_table TEXT NOT NULL,
+  memory_id TEXT NOT NULL,
+  path TEXT NOT NULL,
+  file_sha TEXT NOT NULL,
+  PRIMARY KEY (memory_table, memory_id, path)
+);
+```
+
+`memory_table` stores the Mnemo memory kind because current Mnemo uses one physical `memories` table with a `kind` discriminator. `memory_id` is text because memory IDs use values such as `mem_...`.
+
+There is no backfill. Pre-existing rows keep `NULL` git metadata and remain neutral during retrieval.
+
+## Freshness reweighting
+
+When a memory has git metadata and touched-file fingerprints, retrieval applies a post-score freshness multiplier:
+
+| Condition | Multiplier |
+|---|---:|
+| Legacy row or `git_sha IS NULL` | `1.0` |
+| All touched files unchanged | `1.0` |
+| Any touched file changed but still exists | `0.7` |
+| Any touched file is deleted/missing | `0.3` |
+
+For multiple files, Mnemo uses the minimum multiplier. The IDF/Jaccard score itself is unchanged; freshness is applied after scoring and before final sorting. If the workspace is not a git repository, git is unavailable, or a git command fails, the multiplier is neutral (`1.0`).
+

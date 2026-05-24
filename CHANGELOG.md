@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.13.5
+
+### Added
+
+- Git-aware metadata for newly written SQLite memories:
+  - `git_sha`
+  - `git_branch`
+  - `git_dirty`
+- New `memory_files` table for touched-file fingerprints associated with memory rows.
+- New `git_context.py` helper module for safe git context and file fingerprint capture.
+- Optional `record.params.touched_files` support for linking new memories to files touched during a run.
+
+### Changed
+
+- Retrieval now applies a post-score freshness multiplier for git-aware memories with file fingerprints:
+  - legacy row / `git_sha IS NULL`: `1.0`
+  - unchanged touched files: `1.0`
+  - changed touched file: `0.7`
+  - deleted or missing touched file: `0.3`
+  - multiple touched files use the minimum multiplier
+
+### Compatibility
+
+- No backfill is performed. Existing rows remain neutral with `NULL` git metadata.
+- Non-git folders, unavailable git commands, or git failures are safe and non-fatal.
+- Legacy-row retrieval behavior is preserved unless a row is naturally rewritten with git-aware metadata.
+
 ## 0.13.4
 
 ### Added

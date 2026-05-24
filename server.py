@@ -51,13 +51,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from git_context import capture_git_context, current_file_sha, file_sha_at_head
 from salience_loader import load_optional_agent_salience
 
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.13.4"
+SERVER_VERSION = "0.13.5"
+SQLITE_SCHEMA_VERSION = "3"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
@@ -164,6 +166,7 @@ SKIP_DIRS = {
 _SHOULD_EXIT = False
 _SYMBOL_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
 _SQLITE_BOOTSTRAPPED: set[str] = set()
+_GIT_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
 _SQLITE_FTS_CANDIDATE_LIMIT = 500
 DEFAULT_EVENT_LIMIT = 20
 MAX_EVENT_LIMIT = 200
@@ -808,6 +811,41 @@ def normalize_metadata(raw_metadata: Any) -> dict[str, Any]:
     return {str(key): value for key, value in raw_metadata.items()}
 
 
+def normalize_touched_files(raw: Any) -> list[str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError("touched_files must be an array of strings")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError("touched_files must be an array of strings")
+        value = item.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def normalize_git_dirty(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return 1 if raw else 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        text = str(raw).strip().lower()
+        if text in {"true", "yes", "on"}:
+            return 1
+        if text in {"false", "no", "off"}:
+            return 0
+        return None
+    return 1 if value else 0
+
+
 def new_memory(
     memory_id: str,
     kind: str,
@@ -825,8 +863,12 @@ def new_memory(
     retention: str | None = None,
     confidence: str | None = None,
     linked_ids: list[str] | None = None,
+    touched_files: list[str] | None = None,
     parent_id: str | None = None,
     source_run_id: str | None = None,
+    git_sha: str | None = None,
+    git_branch: str | None = None,
+    git_dirty: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_references = normalize_references(references or [])
@@ -853,12 +895,16 @@ def new_memory(
         "confidence": confidence,
         "parent_id": parent_id,
         "source_run_id": source_run_id,
+        "git_sha": normalize_optional_string(git_sha),
+        "git_branch": normalize_optional_string(git_branch),
+        "git_dirty": normalize_git_dirty(git_dirty),
         "metadata": metadata or {},
         "created_at": now_iso(),
         "updated_at": None,
         "deleted_at": None,
         "deletion_reason": None,
         "superseded_by": None,
+        "_touched_files": list(touched_files or []),
     }
 
 
@@ -949,6 +995,14 @@ def migrate_memory(memory: dict[str, Any]) -> dict[str, Any]:
     )
     migrated["parent_id"] = normalize_optional_string(migrated.get("parent_id"))
     migrated["source_run_id"] = normalize_optional_string(migrated.get("source_run_id"))
+    migrated["git_sha"] = normalize_optional_string(migrated.get("git_sha"))
+    migrated["git_branch"] = normalize_optional_string(migrated.get("git_branch"))
+    migrated["git_dirty"] = normalize_git_dirty(migrated.get("git_dirty"))
+    touched_files = migrated.get("_touched_files")
+    if isinstance(touched_files, list):
+        migrated["_touched_files"] = [str(path).strip() for path in touched_files if str(path).strip()]
+    else:
+        migrated["_touched_files"] = []
     migrated["metadata"] = normalize_metadata(migrated.get("metadata"))
     migrated["created_at"] = str(migrated.get("created_at") or now_iso())
     migrated.setdefault("updated_at", None)
@@ -1550,6 +1604,17 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_files (
+            memory_table TEXT NOT NULL,
+            memory_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            file_sha TEXT NOT NULL,
+            PRIMARY KEY (memory_table, memory_id, path)
+        )
+        """
+    )
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)",
         "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
@@ -1576,6 +1641,7 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_alias_concepts_domain ON alias_concepts(domain, status)",
         "CREATE INDEX IF NOT EXISTS idx_alias_proposals_status ON alias_proposals(status, score)",
         "CREATE INDEX IF NOT EXISTS idx_alias_proposals_domain_status ON alias_proposals(domain, status, score)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_files_path ON memory_files(path)",
     ):
         conn.execute(statement)
     conn.execute(
@@ -1634,6 +1700,12 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         ORDER BY c.domain, c.language, alias_count DESC
         """
     )
+    schema_version_raw = str(_sqlite_get_meta(conn, "schema_version") or "").strip()
+    try:
+        schema_version = int(schema_version_raw) if schema_version_raw else 0
+    except ValueError:
+        schema_version = 0
+
     # Idempotent column migrations for v0.12.0 signature columns
     _v12_signature_columns = [
         ("normalized_hash", "TEXT"),
@@ -1649,6 +1721,16 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     for _col_name, _col_type in _v12_signature_columns:
         if _col_name not in _existing_cols:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
+    if schema_version < 3:
+        _git_columns = [
+            ("git_sha", "TEXT"),
+            ("git_branch", "TEXT"),
+            ("git_dirty", "INTEGER"),
+        ]
+        _existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+        for _col_name, _col_type in _git_columns:
+            if _col_name not in _existing_cols:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
     _event_columns = [
         ("event_id", "TEXT"),
         ("ts", "TEXT"),
@@ -1715,7 +1797,7 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     _sqlite_set_meta(conn, "events_fts_available", "1" if events_fts_available else "0")
     if events_fts_available and _sqlite_get_meta(conn, "events_fts_index_built_at") is None:
         _sqlite_rebuild_events_fts_index(conn)
-    _sqlite_set_meta(conn, "schema_version", "2")
+    _sqlite_set_meta(conn, "schema_version", SQLITE_SCHEMA_VERSION)
     if _sqlite_get_meta(conn, "created_at") is None:
         _sqlite_set_meta(conn, "created_at", now_iso())
 
@@ -1764,6 +1846,9 @@ def _memory_to_sqlite_row(memory: dict[str, Any]) -> dict[str, Any]:
         ),
         "parent_id": normalize_optional_string(migrated.get("parent_id")),
         "source_run_id": normalize_optional_string(migrated.get("source_run_id")),
+        "git_sha": normalize_optional_string(migrated.get("git_sha")),
+        "git_branch": normalize_optional_string(migrated.get("git_branch")),
+        "git_dirty": normalize_git_dirty(migrated.get("git_dirty")),
         "metadata_json": json.dumps(metadata, ensure_ascii=False),
         "pinned": 1 if bool(migrated.get("pinned")) else 0,
         "deleted": 1 if bool(migrated.get("deleted_at")) else 0,
@@ -1811,6 +1896,9 @@ def _sqlite_row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
         "confidence": row["confidence"],
         "parent_id": row["parent_id"],
         "source_run_id": row["source_run_id"],
+        "git_sha": _safe_row_get(row, "git_sha"),
+        "git_branch": _safe_row_get(row, "git_branch"),
+        "git_dirty": normalize_git_dirty(_safe_row_get(row, "git_dirty")),
         "metadata": metadata if isinstance(metadata, dict) else {},
         "created_at": str(row["created_at"] or now_iso()),
         "updated_at": row["updated_at"],
@@ -1883,8 +1971,52 @@ def _sqlite_sync_links_for_memory(conn: sqlite3.Connection, memory: dict[str, An
         )
 
 
+def _git_repo_root() -> str:
+    return str(workspace_root())
+
+
+def _store_memory_file_rows(
+    conn: sqlite3.Connection,
+    *,
+    memory_table: str,
+    memory_id: str,
+    touched_files: list[str],
+    repo_root: str,
+) -> None:
+    for raw_path in touched_files:
+        path_text = str(raw_path).strip()
+        if not path_text:
+            continue
+        file_sha = file_sha_at_head(repo_root, path_text)
+        if file_sha is None:
+            file_sha = current_file_sha(repo_root, path_text)
+        if not file_sha:
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_files(memory_table, memory_id, path, file_sha)
+            VALUES(?, ?, ?, ?)
+            """,
+            (memory_table, memory_id, path_text, file_sha),
+        )
+
+
 def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> None:
     row = _memory_to_sqlite_row(memory)
+    memory_id = str(row.get("id", "")).strip()
+    existing_row = conn.execute("SELECT git_sha, git_branch, git_dirty FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    is_new_row = existing_row is None
+    if is_new_row:
+        git_ctx = capture_git_context(_git_repo_root())
+        row["git_sha"] = normalize_optional_string(git_ctx.get("sha"))
+        row["git_branch"] = normalize_optional_string(git_ctx.get("branch"))
+        row["git_dirty"] = normalize_git_dirty(git_ctx.get("dirty"))
+    else:
+        row["git_sha"] = normalize_optional_string(row.get("git_sha")) or normalize_optional_string(existing_row["git_sha"])
+        row["git_branch"] = normalize_optional_string(row.get("git_branch")) or normalize_optional_string(existing_row["git_branch"])
+        if row.get("git_dirty") is None:
+            row["git_dirty"] = normalize_git_dirty(existing_row["git_dirty"])
+
     metadata = normalize_metadata(memory.get("metadata"))
     if row["deleted"]:
         metadata["_deleted_at"] = memory.get("deleted_at")
@@ -1895,7 +2027,7 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
         INSERT INTO memories(
             id, kind, text, title, preview, source, tags_json, linked_ids_json,
             agent_id, role, scope, domain, authority, retention, confidence,
-            parent_id, source_run_id, metadata_json, pinned, deleted, superseded_by,
+            parent_id, source_run_id, git_sha, git_branch, git_dirty, metadata_json, pinned, deleted, superseded_by,
             created_at, updated_at, token_estimate, content_hash,
             normalized_hash, token_count, unique_token_count,
             top_terms_json, shingle_hashes_json,
@@ -1903,7 +2035,7 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
         ) VALUES(
             :id, :kind, :text, :title, :preview, :source, :tags_json, :linked_ids_json,
             :agent_id, :role, :scope, :domain, :authority, :retention, :confidence,
-            :parent_id, :source_run_id, :metadata_json, :pinned, :deleted, :superseded_by,
+            :parent_id, :source_run_id, :git_sha, :git_branch, :git_dirty, :metadata_json, :pinned, :deleted, :superseded_by,
             :created_at, :updated_at, :token_estimate, :content_hash,
             :normalized_hash, :token_count, :unique_token_count,
             :top_terms_json, :shingle_hashes_json,
@@ -1926,6 +2058,9 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
             confidence=excluded.confidence,
             parent_id=excluded.parent_id,
             source_run_id=excluded.source_run_id,
+            git_sha=excluded.git_sha,
+            git_branch=excluded.git_branch,
+            git_dirty=excluded.git_dirty,
             metadata_json=excluded.metadata_json,
             pinned=excluded.pinned,
             deleted=excluded.deleted,
@@ -1945,6 +2080,15 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
         """,
         row,
     )
+    touched_files = normalize_touched_files(memory.get("_touched_files"))
+    if is_new_row and touched_files:
+        _store_memory_file_rows(
+            conn,
+            memory_table=str(row.get("kind", "")),
+            memory_id=memory_id,
+            touched_files=touched_files,
+            repo_root=_git_repo_root(),
+        )
     _sqlite_sync_links_for_memory(conn, memory)
     _sqlite_sync_fts_for_memory_row(conn, row)
 
@@ -2154,6 +2298,7 @@ def save_store(data: dict[str, Any]) -> None:
         delete_ids = sorted(current_ids - next_ids)
         for memory_id in delete_ids:
             conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            conn.execute("DELETE FROM memory_files WHERE memory_id = ?", (memory_id,))
             conn.execute("DELETE FROM links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
             if _sqlite_has_fts_table(conn):
                 conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
@@ -2734,6 +2879,87 @@ def _sqlite_fts_candidate_ids_for_memory(memory: dict[str, Any], *, limit: int, 
     except Exception:
         return []
 
+
+def _cached_git_context(repo_root: str | None) -> dict[str, Any]:
+    key = str(repo_root or "").strip()
+    if not key:
+        return {"sha": None, "branch": None, "dirty": None}
+    cached = _GIT_CONTEXT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ctx = capture_git_context(key)
+    _GIT_CONTEXT_CACHE[key] = ctx
+    return ctx
+
+
+def freshness_multiplier(
+    conn: sqlite3.Connection,
+    memory_table: str,
+    memory_id: int | str,
+    repo_root: str | None,
+) -> float:
+    """Apply git freshness weighting to an already-scored memory candidate."""
+    root = str(repo_root or "").strip()
+    if not root:
+        return 1.0
+    try:
+        ctx = _cached_git_context(root)
+        if normalize_optional_string(ctx.get("sha")) is None:
+            return 1.0
+
+        row = conn.execute(
+            "SELECT git_sha FROM memories WHERE id = ? AND kind = ?",
+            (str(memory_id), str(memory_table)),
+        ).fetchone()
+        if row is None:
+            row = conn.execute("SELECT git_sha FROM memories WHERE id = ?", (str(memory_id),)).fetchone()
+        if row is None or normalize_optional_string(row["git_sha"]) is None:
+            return 1.0
+
+        file_rows = conn.execute(
+            "SELECT path, file_sha FROM memory_files WHERE memory_table = ? AND memory_id = ?",
+            (str(memory_table), str(memory_id)),
+        ).fetchall()
+        if not file_rows:
+            return 1.0
+
+        bucket = 1.0
+        for file_row in file_rows:
+            path_text = str(file_row["path"] or "").strip()
+            stored_sha = str(file_row["file_sha"] or "").strip()
+            current_sha = current_file_sha(root, path_text)
+            if current_sha is None:
+                bucket = min(bucket, 0.3)
+                continue
+            if stored_sha and current_sha != stored_sha:
+                bucket = min(bucket, 0.7)
+        return float(bucket)
+    except Exception:
+        return 1.0
+
+
+def _apply_freshness_to_ranked(
+    conn: sqlite3.Connection,
+    ranked: list[tuple[float, dict[str, Any]]],
+    repo_root: str | None,
+) -> list[tuple[float, dict[str, Any]]]:
+    adjusted: list[tuple[float, dict[str, Any]]] = []
+    for score, memory in ranked:
+        multiplier = freshness_multiplier(
+            conn,
+            str(memory.get("kind", "")),
+            str(memory.get("id", "")),
+            repo_root,
+        )
+        candidate = memory
+        if multiplier != 1.0:
+            candidate = dict(memory)
+            candidate["_freshness_multiplier"] = multiplier
+        adjusted.append((float(score) * float(multiplier), candidate))
+    adjusted.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
+    return adjusted
+
+
 def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str, Any]]:
     query = str(args.get("query", "")).strip()
     expanded_query = normalize_optional_string(args.get("_expanded_query"))
@@ -2777,6 +3003,14 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
         query_text=query_for_retrieval,
         alias_runtime=alias_runtime,
     )
+    if store_backend() == "sqlite" and ranked:
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                ranked = _apply_freshness_to_ranked(conn, ranked, _git_repo_root())
+        except Exception:
+            pass
     return [memory_to_match(memory, score) for score, memory in ranked[:limit]]
 
 
@@ -2943,6 +3177,14 @@ def select_memories_by_query(
             candidate["_alias_concepts"] = alias_concepts
         if score > 0.0 or not query.strip():
             scored.append((score, candidate))
+    if store_backend() == "sqlite" and scored:
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                scored = _apply_freshness_to_ranked(conn, scored, _git_repo_root())
+        except Exception:
+            pass
     scored.sort(key=lambda item: (item[0], str(item[1].get("created_at", ""))), reverse=True)
     return scored[:limit]
 
@@ -3897,6 +4139,7 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
         confidence = normalize_choice(args.get("confidence"), "confidence", CONFIDENCE_VALUES, default=None)
         parent_id = normalize_optional_string(args.get("parent_id"))
         source_run_id = normalize_optional_string(args.get("source_run_id"))
+        touched_files = normalize_touched_files(args.get("touched_files"))
         metadata = normalize_metadata(args.get("metadata"))
         title = normalize_optional_string(args.get("title"))
         if title:
@@ -4043,6 +4286,7 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
                 return tool_error(cap_error or "memory cap reached")
             memories = store.setdefault("memories", [])
 
+            git_ctx = capture_git_context(_git_repo_root())
             memory = new_memory(
                 make_id(text),
                 kind,
@@ -4059,8 +4303,12 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
                 retention=retention,
                 confidence=confidence,
                 linked_ids=linked_ids,
+                touched_files=touched_files,
                 parent_id=parent_id,
                 source_run_id=source_run_id,
+                git_sha=normalize_optional_string(git_ctx.get("sha")),
+                git_branch=normalize_optional_string(git_ctx.get("branch")),
+                git_dirty=normalize_git_dirty(git_ctx.get("dirty")),
                 metadata=metadata,
             )
             memories.append(memory)
@@ -9173,6 +9421,7 @@ _TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
         "references": "When omitted, an empty list is used.",
         "linked_ids": "When omitted, an empty list is used.",
         "evidence_ids": "When omitted, an empty list is used.",
+        "touched_files": "Optional array of workspace file paths touched during this turn.",
         "pinned": "When omitted, false is used.",
     },
     "mnemo_link": {
