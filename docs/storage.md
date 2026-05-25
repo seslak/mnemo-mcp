@@ -22,6 +22,9 @@ Primary tables:
 - `alias_terms`
 - `alias_proposals`
 - `alias_proposal_events`
+- `memory_topics`
+- `imported_packs`
+- `exported_packs`
 - `meta`
 - optional FTS5 table `memories_fts`
 - optional FTS5 table `events_fts`
@@ -44,6 +47,199 @@ Inspection views:
 - `v_alias_concept_counts`
 
 Alias lifecycle is curated through maintenance actions (`propose_aliases`, `list_alias_proposals`, `approve_alias`, `reject_alias_proposal`, `list_aliases`, `disable_alias`, `disable_alias_concept`) instead of editing repository files.
+
+## Git-aware memory metadata (0.13.5)
+
+Mnemo stores git context on new memory writes in SQLite mode by adding columns on `memories`:
+
+- `git_sha` (`TEXT`)
+- `git_branch` (`TEXT`)
+- `git_dirty` (`INTEGER`, `0`/`1`)
+
+Mnemo also stores touched-file fingerprints in:
+
+- `memory_files(memory_table, memory_id, path, file_sha)`
+- index: `idx_memory_files_path`
+
+`memory_table` stores the row kind (`interaction_log`, `context_block`, `hippocampus_entry`, `agent_feedback`, etc.). `memory_id` stores the Mnemo memory id.
+
+`file_sha` resolution order:
+
+1. git blob SHA at `HEAD:path` when available
+2. current working-tree file hash (`git hash-object`)
+3. BLAKE2b-128 bytes digest fallback when git hashing is unavailable
+
+If no digest can be resolved for a path, the row is skipped without failing the write.
+
+Freshness-aware retrieval multiplies base score by:
+
+- `1.0` when `git_sha IS NULL` (legacy rows stay neutral)
+- `1.0` when all touched files are unchanged
+- `0.7` when any touched file changed but still exists
+- `0.3` when any touched file is missing/deleted/renamed away
+- for mixed states across files, the minimum multiplier is used
+
+Git-unavailable and non-git directories are treated as safe neutral paths (`1.0`), never hard failures.
+
+## Memory Packs Phase 1 substrate (0.14.0)
+
+Phase 1 adds pack-oriented schema substrate while keeping retrieval defaults local-only.
+
+### Added `memories` columns
+
+- `namespace TEXT NOT NULL DEFAULT 'local'`
+- `origin TEXT NOT NULL DEFAULT 'local'`
+- `import_freshness TEXT` (nullable placeholder for later import freshness summaries)
+
+Existing rows are not rewritten manually; SQLite defaults apply during migration:
+
+- `namespace='local'`
+- `origin='local'`
+- `import_freshness=NULL`
+
+### Added topic metadata table
+
+- `memory_topics(memory_id, topic, created_at, source)`
+- `PRIMARY KEY(memory_id, topic)`
+- indexes:
+  - `idx_memory_topics_topic`
+  - `idx_memory_topics_memory_id`
+
+Topics are relational metadata rows. Topic CRUD/listing uses SQL joins, not FTS body text.
+
+### Added placeholder pack registries
+
+- `imported_packs`
+  - trust levels: `trusted` or `quarantine`
+  - stores namespace mapping and manifest payloads
+- `exported_packs`
+  - stores export ledger metadata only
+
+Phase 1 intentionally does not implement pack wire-format import/export, redaction, signing, promotion, or trust-store policy.
+
+### Namespace/origin retrieval filtering
+
+Retrieval defaults:
+
+- namespace scope defaults to `['local']`
+- trusted imported namespaces are opt-in (`include_imported=true`)
+- quarantine namespaces are separate opt-in (`include_quarantine=true`)
+- origin is metadata by default (no origin filter unless explicitly requested)
+
+Origin filter rules:
+
+- explicit `origin` or `origins` applies origin restriction
+- no explicit origin filter means all origins inside the namespace scope are eligible
+
+Pack id derivation in retrieval metadata:
+
+- `pack:quarantine:<pack_id>` -> `<pack_id>`
+- `pack:<pack_id>` -> `<pack_id>`
+- other namespaces -> `pack_id=null`
+
+## Memory Packs Phase 2a preview engine (0.15.0)
+
+Phase 2a adds a read-only selection preview action: `pack_preview`.
+
+Selection semantics:
+
+- topic filtering joins `memory_topics` (no body-text/FTS topic inference)
+- touched path filtering joins `memory_files`
+- namespace/origin filtering reuses Phase 1 scope semantics
+- default namespace scope remains `['local']`
+- trusted imported namespaces require `include_imported=true`
+- quarantine namespaces require `include_quarantine=true`
+
+Output includes bounded, deterministic summaries:
+
+- selected row count and capped row ID list
+- counts by kind/namespace/origin
+- top 20 topic counts inside the selected set
+- top referenced files from `memory_files`
+- bounded sample previews (200-char compact text snippets)
+
+Phase 2a alias output is intentionally a placeholder:
+
+- `referenced_alias_count = 0`
+- `top_alias_concepts = []`
+
+Read-only guarantees:
+
+- no writes to `exported_packs`
+- no pack file writes
+- no zip export/import, redaction, signing, trust, or promotion logic
+
+## Memory Packs Phase 2b redaction dry-run (0.16.0)
+
+Phase 2b adds a read-only dry-run action: `pack_redaction_preview`.
+
+Behavior:
+
+- reuses the same row selection semantics as `pack_preview`
+- scans selected row text fields using a baseline built-in redaction ruleset
+- reports bounded deterministic counts and sample previews
+- never writes redacted memory back to SQLite
+- never writes pack artifacts
+
+Baseline categories in this phase:
+
+- `private_key_header`
+- `jwt`
+- `aws_access_key`
+- `email`
+- `user_path`
+- `ipv4`
+
+Known scope limit:
+
+- IPv6 and many provider-specific token formats are intentionally out of scope in the baseline-v1 ruleset.
+
+## Memory Packs Phase 2c export ZIP (0.17.0)
+
+Phase 2c adds `pack_export`, which writes an unsigned local development pack ZIP and records one export audit row in `exported_packs`.
+
+Export policy and scope:
+
+- requires `allow_unsigned=true` (signing is not implemented yet)
+- exportable kinds are strict in this phase:
+  - `context_block`
+  - `hippocampus_entry`
+- `interaction_log` and `agent_feedback` remain previewable but are rejected for export
+- no import/signing/trust/promotion workflows are implemented
+
+Output location:
+
+- default: `state/mnemo/packs/exports/`
+- optional `output_dir` is supported, with sanitized filename handling
+
+Pack safety and identity:
+
+- source DB memory IDs are not exported
+- exported row IDs are pack-local (`ctx_###`, `hip_###`)
+- export runs mandatory baseline-v1 redaction on all exported text fields (`text`, `title`)
+- baseline-v1 is intentionally incomplete and not a full DLP system
+
+Manifest/content hash:
+
+- `manifest.json` stores a SHA-256 `content_hash`
+- hash covers:
+  - `content/file_fingerprints.json`
+  - `content/memories.jsonl`
+  - `content/topics.json`
+  - `provenance/origin.json`
+  - `provenance/redactions.json`
+- `manifest.json` itself is not included in the Phase 2c content hash coverage
+
+Audit row:
+
+- successful export inserts one row into `exported_packs`:
+  - `pack_id`
+  - `pack_name`
+  - `exported_at`
+  - `row_count`
+  - `redaction_count`
+  - `signed=0`
+  - `manifest_json`
 
 ## Event typed columns (0.13.3)
 
@@ -108,6 +304,8 @@ Mnemo adds deterministic signature columns to `memories`:
 
 SQLite schema migration is idempotent. Existing v0.11.x stores load under modern releases. Rows without signatures remain usable and can be backfilled.
 
+Git-aware memory metadata is not backfilled. Existing rows keep `git_sha=NULL` and remain retrieval-neutral.
+
 Dry run:
 
 ```json
@@ -164,45 +362,3 @@ Do not commit runtime state unless intentionally publishing seed memory:
 - `*.archive.jsonl`
 - `*.lock`
 - generated exports
-
-## Git-aware memory schema (0.13.5)
-
-Mnemo 0.13.5 adds git-aware metadata to the SQLite `memories` table. The migration is additive and safe to re-run.
-
-New columns on `memories`:
-
-| Column | Meaning |
-|---|---|
-| `git_sha` | Commit SHA at write time, when Mnemo can read git state. |
-| `git_branch` | Branch name at write time, when available. |
-| `git_dirty` | `1` if the working tree was dirty, `0` if clean, `NULL` if git context is unavailable. |
-
-Touched-file fingerprints are stored in `memory_files`:
-
-```sql
-CREATE TABLE IF NOT EXISTS memory_files (
-  memory_table TEXT NOT NULL,
-  memory_id TEXT NOT NULL,
-  path TEXT NOT NULL,
-  file_sha TEXT NOT NULL,
-  PRIMARY KEY (memory_table, memory_id, path)
-);
-```
-
-`memory_table` stores the Mnemo memory kind because current Mnemo uses one physical `memories` table with a `kind` discriminator. `memory_id` is text because memory IDs use values such as `mem_...`.
-
-There is no backfill. Pre-existing rows keep `NULL` git metadata and remain neutral during retrieval.
-
-## Freshness reweighting
-
-When a memory has git metadata and touched-file fingerprints, retrieval applies a post-score freshness multiplier:
-
-| Condition | Multiplier |
-|---|---:|
-| Legacy row or `git_sha IS NULL` | `1.0` |
-| All touched files unchanged | `1.0` |
-| Any touched file changed but still exists | `0.7` |
-| Any touched file is deleted/missing | `0.3` |
-
-For multiple files, Mnemo uses the minimum multiplier. The IDF/Jaccard score itself is unchanged; freshness is applied after scoring and before final sorting. If the workspace is not a git repository, git is unavailable, or a git command fails, the multiplier is neutral (`1.0`).
-

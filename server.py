@@ -43,9 +43,12 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import sys
+import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -58,9 +61,75 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.13.5"
-SQLITE_SCHEMA_VERSION = "3"
+SERVER_VERSION = "0.17.0"
+SQLITE_SCHEMA_VERSION = "4"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
+DEFAULT_MEMORY_NAMESPACE = "local"
+DEFAULT_MEMORY_ORIGIN = "local"
+PACK_PREVIEW_DEFAULT_KINDS = ("context_block", "hippocampus_entry")
+PACK_PREVIEW_POLICY_WARNING_KINDS = ("interaction_log", "agent_feedback")
+PACK_EXPORT_ALLOWED_KINDS = ("context_block", "hippocampus_entry")
+BASELINE_REDACTION_RULESET_VERSION = "baseline-v1"
+PACK_REDACTION_RULE_ORDER = (
+    "private_key_header",
+    "jwt",
+    "aws_access_key",
+    "email",
+    "user_path",
+    "ipv4",
+)
+PACK_REDACTION_TEXT_FIELDS = ("text", "title")
+PACK_RESERVED_BASENAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+}
+PACK_REQUIRED_MEMBERS = (
+    "manifest.json",
+    "content/memories.jsonl",
+    "content/topics.json",
+    "content/file_fingerprints.json",
+    "provenance/origin.json",
+    "provenance/redactions.json",
+)
+PACK_CONTENT_HASH_COVERED_MEMBERS = (
+    "content/file_fingerprints.json",
+    "content/memories.jsonl",
+    "content/topics.json",
+    "provenance/origin.json",
+    "provenance/redactions.json",
+)
+PACK_BASELINE_WARNING_MESSAGE = (
+    "Redaction covered: private_key_header, jwt, aws_access_key, email, user_path, ipv4. "
+    "Other secret formats such as GitHub, Slack, GCP, Stripe, Azure SAS, generic Bearer tokens, "
+    "and IPv6 are not detected."
+)
+PACK_KIND_PREVIEW_ERROR_TEMPLATE = "kind '{kind}' is previewable but not exportable in v1 policy"
+PACK_ALLOW_UNSIGNED_ERROR = (
+    "Signing is not implemented yet; pass allow_unsigned=true to create an unsigned development pack."
+)
+PACK_SAMPLES_SCAN_ORDER = tuple(PACK_REDACTION_TEXT_FIELDS)
+PACK_NAMESPACE_PREFIX = "pack:"
+PACK_QUARANTINE_PREFIX = "pack:quarantine:"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
 TOKEN_CHARS_PER_TOKEN = 3.7
@@ -829,6 +898,125 @@ def normalize_touched_files(raw: Any) -> list[str] | None:
     return out
 
 
+def normalize_repo_relative_path(raw: Any, *, root: Path | None = None) -> str | None:
+    value = normalize_optional_string(raw)
+    if value is None:
+        return None
+    root_path = (root or workspace_root()).resolve()
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        try:
+            value = candidate.resolve().relative_to(root_path).as_posix()
+        except Exception:
+            value = candidate.as_posix()
+    else:
+        value = value.replace("\\", "/")
+    value = re.sub(r"/+", "/", value).strip()
+    while value.startswith("./"):
+        value = value[2:]
+    if value.endswith("/") and len(value) > 1:
+        value = value.rstrip("/")
+    return value or None
+
+
+def normalize_touched_paths(raw: Any) -> list[str] | None:
+    if raw is None:
+        return None
+    values = normalize_optional_string_list(raw, "touched_paths")
+    if values is None:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    root = workspace_root()
+    for item in values:
+        normalized = normalize_repo_relative_path(item, root=root)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def normalize_iso_utc_timestamp(raw: Any, field: str) -> str | None:
+    value = normalize_optional_string(raw)
+    if value is None:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{field} must be ISO-8601 UTC")
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def normalize_topic(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        raise ValueError("topic must be a non-empty string")
+    return value
+
+
+def normalize_optional_string_list(raw: Any, field: str) -> list[str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(f"{field} must be an array of strings")
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError(f"{field} must be an array of strings")
+        value = item.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def normalize_memory_namespace(raw: Any, default: str = DEFAULT_MEMORY_NAMESPACE) -> str:
+    return normalize_optional_string(raw) or default
+
+
+def normalize_memory_origin(raw: Any, default: str = DEFAULT_MEMORY_ORIGIN) -> str:
+    return normalize_optional_string(raw) or default
+
+
+def derive_pack_id_from_namespace(namespace: Any) -> str | None:
+    namespace_text = normalize_optional_string(namespace)
+    if namespace_text is None:
+        return None
+    if namespace_text.startswith(PACK_QUARANTINE_PREFIX):
+        pack_id = namespace_text[len(PACK_QUARANTINE_PREFIX) :].strip()
+        return pack_id or None
+    if namespace_text.startswith(PACK_NAMESPACE_PREFIX):
+        pack_id = namespace_text[len(PACK_NAMESPACE_PREFIX) :].strip()
+        return pack_id or None
+    return None
+
+
+def memory_namespace(memory: dict[str, Any]) -> str:
+    return normalize_memory_namespace(memory.get("namespace"), DEFAULT_MEMORY_NAMESPACE)
+
+
+def memory_origin(memory: dict[str, Any]) -> str:
+    return normalize_memory_origin(memory.get("origin"), DEFAULT_MEMORY_ORIGIN)
+
+
+def memory_import_freshness(memory: dict[str, Any]) -> str | None:
+    return normalize_optional_string(memory.get("import_freshness"))
+
+
+def _memory_in_scope(memory: dict[str, Any], namespaces: list[str], origins: list[str] | None) -> bool:
+    namespace_value = memory_namespace(memory)
+    if namespace_value not in namespaces:
+        return False
+    if origins is not None and memory_origin(memory) not in origins:
+        return False
+    return True
+
+
 def normalize_git_dirty(raw: Any) -> int | None:
     if raw is None:
         return None
@@ -869,6 +1057,9 @@ def new_memory(
     git_sha: str | None = None,
     git_branch: str | None = None,
     git_dirty: int | None = None,
+    namespace: str = DEFAULT_MEMORY_NAMESPACE,
+    origin: str = DEFAULT_MEMORY_ORIGIN,
+    import_freshness: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_references = normalize_references(references or [])
@@ -898,6 +1089,9 @@ def new_memory(
         "git_sha": normalize_optional_string(git_sha),
         "git_branch": normalize_optional_string(git_branch),
         "git_dirty": normalize_git_dirty(git_dirty),
+        "namespace": normalize_memory_namespace(namespace, DEFAULT_MEMORY_NAMESPACE),
+        "origin": normalize_memory_origin(origin, DEFAULT_MEMORY_ORIGIN),
+        "import_freshness": normalize_optional_string(import_freshness),
         "metadata": metadata or {},
         "created_at": now_iso(),
         "updated_at": None,
@@ -947,6 +1141,9 @@ def apply_structured_fields(memory: dict[str, Any], args: dict[str, Any]) -> Non
     )
     memory["parent_id"] = normalize_optional_string(args.get("parent_id"))
     memory["source_run_id"] = normalize_optional_string(args.get("source_run_id"))
+    memory["namespace"] = normalize_memory_namespace(args.get("namespace"), memory_namespace(memory))
+    memory["origin"] = normalize_memory_origin(args.get("origin"), memory_origin(memory))
+    memory["import_freshness"] = normalize_optional_string(args.get("import_freshness"))
     memory["metadata"] = normalize_metadata(args.get("metadata"))
 
 
@@ -998,6 +1195,9 @@ def migrate_memory(memory: dict[str, Any]) -> dict[str, Any]:
     migrated["git_sha"] = normalize_optional_string(migrated.get("git_sha"))
     migrated["git_branch"] = normalize_optional_string(migrated.get("git_branch"))
     migrated["git_dirty"] = normalize_git_dirty(migrated.get("git_dirty"))
+    migrated["namespace"] = normalize_memory_namespace(migrated.get("namespace"), DEFAULT_MEMORY_NAMESPACE)
+    migrated["origin"] = normalize_memory_origin(migrated.get("origin"), DEFAULT_MEMORY_ORIGIN)
+    migrated["import_freshness"] = normalize_optional_string(migrated.get("import_freshness"))
     touched_files = migrated.get("_touched_files")
     if isinstance(touched_files, list):
         migrated["_touched_files"] = [str(path).strip() for path in touched_files if str(path).strip()]
@@ -1478,6 +1678,12 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
             confidence TEXT,
             parent_id TEXT,
             source_run_id TEXT,
+            git_sha TEXT,
+            git_branch TEXT,
+            git_dirty INTEGER,
+            namespace TEXT NOT NULL DEFAULT 'local',
+            origin TEXT NOT NULL DEFAULT 'local',
+            import_freshness TEXT,
             metadata_json TEXT,
             pinned INTEGER DEFAULT 0,
             deleted INTEGER DEFAULT 0,
@@ -1615,6 +1821,45 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_topics (
+            memory_id TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            created_at TEXT,
+            source TEXT,
+            PRIMARY KEY (memory_id, topic),
+            FOREIGN KEY (memory_id) REFERENCES memories(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS imported_packs (
+            pack_id TEXT PRIMARY KEY,
+            pack_name TEXT NOT NULL,
+            source_label TEXT,
+            trust_level TEXT NOT NULL CHECK (trust_level IN ('trusted', 'quarantine')),
+            namespace TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            freshness_summary_json TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS exported_packs (
+            pack_id TEXT PRIMARY KEY,
+            pack_name TEXT NOT NULL,
+            exported_at TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            redaction_count INTEGER NOT NULL,
+            signed INTEGER NOT NULL DEFAULT 0,
+            manifest_json TEXT NOT NULL
+        )
+        """
+    )
     for statement in (
         "CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)",
         "CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)",
@@ -1642,6 +1887,8 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_alias_proposals_status ON alias_proposals(status, score)",
         "CREATE INDEX IF NOT EXISTS idx_alias_proposals_domain_status ON alias_proposals(domain, status, score)",
         "CREATE INDEX IF NOT EXISTS idx_memory_files_path ON memory_files(path)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_topics_topic ON memory_topics(topic)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_topics_memory_id ON memory_topics(memory_id)",
     ):
         conn.execute(statement)
     conn.execute(
@@ -1721,16 +1968,24 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     for _col_name, _col_type in _v12_signature_columns:
         if _col_name not in _existing_cols:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
-    if schema_version < 3:
-        _git_columns = [
-            ("git_sha", "TEXT"),
-            ("git_branch", "TEXT"),
-            ("git_dirty", "INTEGER"),
-        ]
-        _existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
-        for _col_name, _col_type in _git_columns:
-            if _col_name not in _existing_cols:
-                conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
+    _git_and_pack_columns = [
+        ("git_sha", "TEXT"),
+        ("git_branch", "TEXT"),
+        ("git_dirty", "INTEGER"),
+        ("namespace", "TEXT NOT NULL DEFAULT 'local'"),
+        ("origin", "TEXT NOT NULL DEFAULT 'local'"),
+        ("import_freshness", "TEXT"),
+    ]
+    _existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+    for _col_name, _col_type in _git_and_pack_columns:
+        if _col_name not in _existing_cols:
+            conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
+    for _statement in (
+        "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_origin ON memories(origin)",
+        "CREATE INDEX IF NOT EXISTS idx_memories_namespace_kind ON memories(namespace, kind)",
+    ):
+        conn.execute(_statement)
     _event_columns = [
         ("event_id", "TEXT"),
         ("ts", "TEXT"),
@@ -1849,6 +2104,9 @@ def _memory_to_sqlite_row(memory: dict[str, Any]) -> dict[str, Any]:
         "git_sha": normalize_optional_string(migrated.get("git_sha")),
         "git_branch": normalize_optional_string(migrated.get("git_branch")),
         "git_dirty": normalize_git_dirty(migrated.get("git_dirty")),
+        "namespace": normalize_memory_namespace(migrated.get("namespace"), DEFAULT_MEMORY_NAMESPACE),
+        "origin": normalize_memory_origin(migrated.get("origin"), DEFAULT_MEMORY_ORIGIN),
+        "import_freshness": normalize_optional_string(migrated.get("import_freshness")),
         "metadata_json": json.dumps(metadata, ensure_ascii=False),
         "pinned": 1 if bool(migrated.get("pinned")) else 0,
         "deleted": 1 if bool(migrated.get("deleted_at")) else 0,
@@ -1899,6 +2157,9 @@ def _sqlite_row_to_memory(row: sqlite3.Row) -> dict[str, Any]:
         "git_sha": _safe_row_get(row, "git_sha"),
         "git_branch": _safe_row_get(row, "git_branch"),
         "git_dirty": normalize_git_dirty(_safe_row_get(row, "git_dirty")),
+        "namespace": normalize_memory_namespace(_safe_row_get(row, "namespace"), DEFAULT_MEMORY_NAMESPACE),
+        "origin": normalize_memory_origin(_safe_row_get(row, "origin"), DEFAULT_MEMORY_ORIGIN),
+        "import_freshness": normalize_optional_string(_safe_row_get(row, "import_freshness")),
         "metadata": metadata if isinstance(metadata, dict) else {},
         "created_at": str(row["created_at"] or now_iso()),
         "updated_at": row["updated_at"],
@@ -2027,7 +2288,9 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
         INSERT INTO memories(
             id, kind, text, title, preview, source, tags_json, linked_ids_json,
             agent_id, role, scope, domain, authority, retention, confidence,
-            parent_id, source_run_id, git_sha, git_branch, git_dirty, metadata_json, pinned, deleted, superseded_by,
+            parent_id, source_run_id, git_sha, git_branch, git_dirty,
+            namespace, origin, import_freshness,
+            metadata_json, pinned, deleted, superseded_by,
             created_at, updated_at, token_estimate, content_hash,
             normalized_hash, token_count, unique_token_count,
             top_terms_json, shingle_hashes_json,
@@ -2035,7 +2298,9 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
         ) VALUES(
             :id, :kind, :text, :title, :preview, :source, :tags_json, :linked_ids_json,
             :agent_id, :role, :scope, :domain, :authority, :retention, :confidence,
-            :parent_id, :source_run_id, :git_sha, :git_branch, :git_dirty, :metadata_json, :pinned, :deleted, :superseded_by,
+            :parent_id, :source_run_id, :git_sha, :git_branch, :git_dirty,
+            :namespace, :origin, :import_freshness,
+            :metadata_json, :pinned, :deleted, :superseded_by,
             :created_at, :updated_at, :token_estimate, :content_hash,
             :normalized_hash, :token_count, :unique_token_count,
             :top_terms_json, :shingle_hashes_json,
@@ -2061,6 +2326,9 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
             git_sha=excluded.git_sha,
             git_branch=excluded.git_branch,
             git_dirty=excluded.git_dirty,
+            namespace=excluded.namespace,
+            origin=excluded.origin,
+            import_freshness=excluded.import_freshness,
             metadata_json=excluded.metadata_json,
             pinned=excluded.pinned,
             deleted=excluded.deleted,
@@ -2299,6 +2567,7 @@ def save_store(data: dict[str, Any]) -> None:
         for memory_id in delete_ids:
             conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
             conn.execute("DELETE FROM memory_files WHERE memory_id = ?", (memory_id,))
+            conn.execute("DELETE FROM memory_topics WHERE memory_id = ?", (memory_id,))
             conn.execute("DELETE FROM links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
             if _sqlite_has_fts_table(conn):
                 conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
@@ -2631,6 +2900,11 @@ def memory_preview(memory: dict[str, Any], max_chars: int = 200) -> str:
     return text if len(text) <= max_chars else text[:max_chars]
 
 
+def collapsed_preview_text(text: Any, max_chars: int = 200) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    return value if len(value) <= max_chars else value[:max_chars]
+
+
 def get_linked_memories(
     store: dict[str, Any],
     memory: dict[str, Any],
@@ -2649,6 +2923,94 @@ def get_linked_memories(
             continue
         out.append(linked)
     return out
+
+
+def _imported_pack_namespaces(conn: sqlite3.Connection, trust_level: str) -> list[str]:
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT namespace FROM imported_packs WHERE trust_level = ? ORDER BY namespace ASC",
+            (trust_level,),
+        ).fetchall()
+    except Exception:
+        return []
+    out: list[str] = []
+    for row in rows:
+        value = normalize_optional_string(row[0] if not isinstance(row, sqlite3.Row) else row["namespace"])
+        if value is not None:
+            out.append(value)
+    return out
+
+
+def resolve_namespace_origin_filters(
+    args: dict[str, Any],
+    conn: sqlite3.Connection | None = None,
+) -> tuple[list[str], list[str] | None]:
+    has_namespace = "namespace" in args and args.get("namespace") is not None
+    has_namespaces = "namespaces" in args and args.get("namespaces") is not None
+    if has_namespace and has_namespaces:
+        raise ValueError("namespace and namespaces cannot both be supplied")
+
+    namespaces: list[str]
+    if has_namespace:
+        namespace_value = normalize_optional_string(args.get("namespace"))
+        if namespace_value is None:
+            raise ValueError("namespace cannot be empty")
+        namespaces = [namespace_value]
+    elif has_namespaces:
+        provided = normalize_optional_string_list(args.get("namespaces"), "namespaces") or []
+        if not provided:
+            raise ValueError("namespaces must contain at least one value")
+        namespaces = list(provided)
+    else:
+        namespaces = [DEFAULT_MEMORY_NAMESPACE]
+
+    include_imported = parse_bool(args.get("include_imported"), default=False)
+    include_quarantine = parse_bool(args.get("include_quarantine"), default=False)
+    if conn is not None and include_imported:
+        namespaces.extend(_imported_pack_namespaces(conn, "trusted"))
+    if conn is not None and include_quarantine:
+        namespaces.extend(_imported_pack_namespaces(conn, "quarantine"))
+
+    deduped_namespaces: list[str] = []
+    seen_namespaces: set[str] = set()
+    for namespace_value in namespaces:
+        value = normalize_optional_string(namespace_value)
+        if value is None or value in seen_namespaces:
+            continue
+        seen_namespaces.add(value)
+        deduped_namespaces.append(value)
+    if not deduped_namespaces:
+        deduped_namespaces = [DEFAULT_MEMORY_NAMESPACE]
+
+    has_origin = "origin" in args and args.get("origin") is not None
+    has_origins = "origins" in args and args.get("origins") is not None
+    if has_origin and has_origins:
+        raise ValueError("origin and origins cannot both be supplied")
+    origins: list[str] | None = None
+    if has_origin:
+        origin_value = normalize_optional_string(args.get("origin"))
+        if origin_value is None:
+            raise ValueError("origin cannot be empty")
+        origins = [origin_value]
+    elif has_origins:
+        provided_origins = normalize_optional_string_list(args.get("origins"), "origins") or []
+        if not provided_origins:
+            raise ValueError("origins must contain at least one value")
+        origins = list(provided_origins)
+
+    return deduped_namespaces, origins
+
+
+def _memory_pack_metadata(memory: dict[str, Any]) -> dict[str, Any]:
+    namespace_value = memory_namespace(memory)
+    origin_value = memory_origin(memory)
+    import_freshness_value = memory_import_freshness(memory)
+    return {
+        "namespace": namespace_value,
+        "origin": origin_value,
+        "import_freshness": import_freshness_value,
+        "pack_id": derive_pack_id_from_namespace(namespace_value),
+    }
 
 
 def filter_memories(
@@ -2679,10 +3041,33 @@ def filter_memories(
     )
     source_run_id_filter = normalize_optional_string(filters.get("source_run_id"))
     pinned_filter = parse_bool(filters.get("pinned"), default=False) if "pinned" in filters else None
+    apply_scope_filter = (
+        "_resolved_namespaces" in filters
+        or ("namespace" in filters and filters.get("namespace") is not None)
+        or ("namespaces" in filters and filters.get("namespaces") is not None)
+        or ("origin" in filters and filters.get("origin") is not None)
+        or ("origins" in filters and filters.get("origins") is not None)
+    )
+    namespaces: list[str] = [DEFAULT_MEMORY_NAMESPACE]
+    if apply_scope_filter:
+        namespaces_filter = filters.get("_resolved_namespaces")
+        if not isinstance(namespaces_filter, list):
+            namespace_single = normalize_optional_string(filters.get("namespace"))
+            namespaces_filter = [namespace_single] if namespace_single else [DEFAULT_MEMORY_NAMESPACE]
+        namespaces = [str(item) for item in namespaces_filter if str(item).strip()]
+        if not namespaces:
+            namespaces = [DEFAULT_MEMORY_NAMESPACE]
+    origins_filter = filters.get("_resolved_origins")
+    if origins_filter is not None and not isinstance(origins_filter, list):
+        origin_single = normalize_optional_string(filters.get("origin"))
+        origins_filter = [origin_single] if origin_single else None
+    origins = [str(item) for item in origins_filter if str(item).strip()] if isinstance(origins_filter, list) else None
 
     out: list[dict[str, Any]] = []
     for memory in memories:
         if not visible_memory(memory, include_deleted, include_superseded):
+            continue
+        if apply_scope_filter and not _memory_in_scope(memory, namespaces, origins):
             continue
         if kind_filter and str(memory.get("kind", "")) != kind_filter:
             continue
@@ -2758,6 +3143,28 @@ def _sqlite_fts_candidate_memories(
         clauses.append("m.deleted = 0")
     if not include_superseded:
         clauses.append("(m.superseded_by IS NULL OR m.superseded_by = '')")
+    namespaces_filter = args.get("_resolved_namespaces")
+    if not isinstance(namespaces_filter, list):
+        namespace_value = normalize_optional_string(args.get("namespace"))
+        namespaces_filter = [namespace_value] if namespace_value else [DEFAULT_MEMORY_NAMESPACE]
+    namespaces = [str(item).strip() for item in namespaces_filter if str(item).strip()]
+    if not namespaces:
+        namespaces = [DEFAULT_MEMORY_NAMESPACE]
+    namespace_placeholders = ",".join("?" for _ in namespaces)
+    clauses.append(f"m.namespace IN ({namespace_placeholders})")
+    params.extend(namespaces)
+
+    origins_filter = args.get("_resolved_origins")
+    origins: list[str] | None = None
+    if isinstance(origins_filter, list):
+        origins = [str(item).strip() for item in origins_filter if str(item).strip()]
+    elif "origin" in args and args.get("origin") is not None:
+        origin_value = normalize_optional_string(args.get("origin"))
+        origins = [origin_value] if origin_value else []
+    if origins:
+        origin_placeholders = ",".join("?" for _ in origins)
+        clauses.append(f"m.origin IN ({origin_placeholders})")
+        params.extend(origins)
 
     for field in ("kind", "role", "agent_id", "domain", "scope", "source_run_id"):
         value = normalize_optional_string(args.get(field))
@@ -2977,12 +3384,23 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
         normalize_choice(args.get("retention"), "retention", RETENTION_VALUES)
     if phase is None:
         _, phase = resolve_phase(args, query)
+    search_filters = dict(args)
+    if store_backend() == "sqlite":
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
+    else:
+        resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, None)
+    search_filters["_resolved_namespaces"] = list(resolved_namespaces)
+    if resolved_origins is not None:
+        search_filters["_resolved_origins"] = list(resolved_origins)
 
     query_tokens = tokenize(query_for_retrieval)
     candidates: list[dict[str, Any]] = []
     if store_backend() == "sqlite" and query_for_retrieval and _sqlite_fts_flag():
         candidates = _sqlite_fts_candidate_memories(
-            args,
+            search_filters,
             query_for_retrieval,
             include_deleted=include_deleted,
             include_superseded=include_superseded,
@@ -2992,7 +3410,7 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
         store = load_store()
         candidates = filter_memories(
             [memory for memory in store.get("memories", []) if isinstance(memory, dict)],
-            args,
+            search_filters,
             include_deleted=include_deleted,
             include_superseded=include_superseded,
         )
@@ -3050,6 +3468,7 @@ def memory_to_match(memory: dict[str, Any], score: float) -> dict[str, Any]:
         "confidence": memory.get("confidence"),
         "parent_id": memory.get("parent_id"),
         "source_run_id": memory.get("source_run_id"),
+        **_memory_pack_metadata(memory),
         "metadata": memory.get("metadata", {}),
         "score": round(float(score), 3),
         "created_at": memory.get("created_at"),
@@ -3100,6 +3519,7 @@ def memory_bundle_item(memory: dict[str, Any], max_chars: int = 300, score: floa
         "linked_ids": memory.get("linked_ids", memory.get("references", [])),
         "parent_id": memory.get("parent_id"),
         "source_run_id": memory.get("source_run_id"),
+        **_memory_pack_metadata(memory),
         "pinned": bool(memory.get("pinned", False)),
         "created_at": memory.get("created_at"),
         "updated_at": memory.get("updated_at"),
@@ -3857,6 +4277,13 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         raw_shingle_overlap_threshold = args.get("shingle_overlap_threshold")
         shingle_overlap_threshold = 0.30 if raw_shingle_overlap_threshold is None else float(raw_shingle_overlap_threshold)
         shingle_overlap_threshold = max(0.0, min(1.0, shingle_overlap_threshold))
+        if store_backend() == "sqlite":
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
+        else:
+            resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, None)
     except Exception as exc:
         return tool_error(str(exc))
 
@@ -3886,9 +4313,13 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
 
     if store_backend() == "sqlite" and use_fts and fts_available:
+        candidate_args = dict(args)
+        candidate_args["_resolved_namespaces"] = list(resolved_namespaces)
+        if resolved_origins is not None:
+            candidate_args["_resolved_origins"] = list(resolved_origins)
         fts_query = " ".join(_load_json_string_list(input_sig.get("top_terms_json")))
         candidates = _sqlite_fts_candidate_memories(
-            args,
+            candidate_args,
             fts_query,
             include_deleted=include_deleted,
             include_superseded=include_superseded,
@@ -3904,6 +4335,7 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
             memory
             for memory in store.get("memories", [])
             if visible_memory(memory, include_deleted, include_superseded)
+            and _memory_in_scope(memory, list(resolved_namespaces), resolved_origins)
         ]
         # Bounded fallback chain: filter by metadata, shared top terms, then recent window.
         wanted_terms = set(_load_json_string_list(input_sig.get("top_terms_json")))
@@ -3969,6 +4401,7 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
             {
                 "memory_id": str(memory.get("id", "")),
                 "kind": str(memory.get("kind", "")),
+                **_memory_pack_metadata(memory),
                 "text_preview": memory_text[:200],
                 "score": round(score, 3),
                 "base_score": round(base_score, 3),
@@ -4139,6 +4572,8 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
         confidence = normalize_choice(args.get("confidence"), "confidence", CONFIDENCE_VALUES, default=None)
         parent_id = normalize_optional_string(args.get("parent_id"))
         source_run_id = normalize_optional_string(args.get("source_run_id"))
+        namespace = normalize_memory_namespace(args.get("namespace"), DEFAULT_MEMORY_NAMESPACE)
+        origin = normalize_memory_origin(args.get("origin"), DEFAULT_MEMORY_ORIGIN)
         touched_files = normalize_touched_files(args.get("touched_files"))
         metadata = normalize_metadata(args.get("metadata"))
         title = normalize_optional_string(args.get("title"))
@@ -4309,6 +4744,8 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
                 git_sha=normalize_optional_string(git_ctx.get("sha")),
                 git_branch=normalize_optional_string(git_ctx.get("branch")),
                 git_dirty=normalize_git_dirty(git_ctx.get("dirty")),
+                namespace=namespace,
+                origin=origin,
                 metadata=metadata,
             )
             memories.append(memory)
@@ -4420,6 +4857,12 @@ def update_memory(args: dict[str, Any]) -> dict[str, Any]:
             if "source_run_id" in args:
                 memory["source_run_id"] = normalize_optional_string(args.get("source_run_id"))
                 changed.append("source_run_id")
+            if "namespace" in args:
+                memory["namespace"] = normalize_memory_namespace(args.get("namespace"), DEFAULT_MEMORY_NAMESPACE)
+                changed.append("namespace")
+            if "origin" in args:
+                memory["origin"] = normalize_memory_origin(args.get("origin"), DEFAULT_MEMORY_ORIGIN)
+                changed.append("origin")
             if "metadata" in args and args.get("metadata") is not None:
                 memory["metadata"] = normalize_metadata(args.get("metadata"))
                 changed.append("metadata")
@@ -7141,6 +7584,8 @@ def _build_recall_bundle(
     max_feedback: int,
     include_pinned: bool,
     include_recent_logs: bool,
+    namespaces: list[str],
+    origins: list[str] | None,
     salience_module: Any | None,
     idf_profile: dict[str, Any] | None = None,
     alias_runtime: dict[str, Any] | None = None,
@@ -7148,7 +7593,9 @@ def _build_recall_bundle(
     visible = [
         memory
         for memory in store.get("memories", [])
-        if isinstance(memory, dict) and visible_memory(memory, False, False)
+        if isinstance(memory, dict)
+        and visible_memory(memory, False, False)
+        and _memory_in_scope(memory, namespaces, origins)
     ]
 
     if mode == "startup":
@@ -7486,6 +7933,16 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
     query_text = query or task
     language = _normalize_alias_language(args.get("language"))
     alias_runtime = _expand_query_with_aliases(query_text, domain=domain, language=language)
+    try:
+        if store_backend() == "sqlite":
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+                resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
+        else:
+            resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, None)
+    except Exception as exc:
+        return tool_error(str(exc))
 
     salience, _ = load_optional_agent_salience()
     recall_idf_profile: dict[str, Any] | None = None
@@ -7516,11 +7973,15 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
         max_feedback=max_feedback,
         include_pinned=include_pinned,
         include_recent_logs=include_recent_logs,
+        namespaces=list(resolved_namespaces),
+        origins=resolved_origins,
         salience_module=salience,
         idf_profile=recall_idf_profile,
         alias_runtime=alias_runtime,
     )
     structured = _apply_recall_output_caps(structured)
+    structured["namespaces"] = list(resolved_namespaces)
+    structured["origins"] = list(resolved_origins) if resolved_origins is not None else None
     structured["idf_used"] = bool(recall_idf_profile)
     structured["idf_scope_used"] = str(idf_choice.get("scope", "none")) if recall_idf_profile else "none"
     structured["idf_profile_status"] = str(idf_choice.get("status", "not_requested"))
@@ -7627,6 +8088,1365 @@ def memory_alias_hint(args: dict[str, Any]) -> dict[str, Any]:
             "include_in_salience": include_in_salience,
         },
     )
+
+
+def topic_add(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("topic actions require sqlite backend")
+    memory_id = str(args.get("memory_id", "")).strip()
+    if not memory_id:
+        return tool_error("memory_id is required")
+    try:
+        topic = normalize_topic(args.get("topic"))
+    except ValueError as exc:
+        return tool_error(str(exc))
+    source = normalize_optional_string(args.get("source")) or "agent"
+    created_at = now_iso()
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            exists = conn.execute("SELECT 1 FROM memories WHERE id = ? LIMIT 1", (memory_id,)).fetchone()
+            if exists is None:
+                return tool_error(f"memory not found: {memory_id}")
+            before = int(conn.total_changes)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO memory_topics(memory_id, topic, created_at, source)
+                VALUES(?, ?, ?, ?)
+                """,
+                (memory_id, topic, created_at, source),
+            )
+            inserted = int(conn.total_changes) > before
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+    return text_result(
+        f"Topic {'added' if inserted else 'already present'} for {memory_id}: {topic}",
+        {
+            "ok": True,
+            "memory_id": memory_id,
+            "topic": topic,
+            "source": source,
+            "inserted": bool(inserted),
+        },
+    )
+
+
+def topic_remove(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("topic actions require sqlite backend")
+    memory_id = str(args.get("memory_id", "")).strip()
+    if not memory_id:
+        return tool_error("memory_id is required")
+    try:
+        topic = normalize_topic(args.get("topic"))
+    except ValueError as exc:
+        return tool_error(str(exc))
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            before = int(conn.total_changes)
+            conn.execute("DELETE FROM memory_topics WHERE memory_id = ? AND topic = ?", (memory_id, topic))
+            removed = int(conn.total_changes) - before
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+    return text_result(
+        f"Removed {removed} topic row(s) for {memory_id}.",
+        {
+            "ok": True,
+            "memory_id": memory_id,
+            "topic": topic,
+            "removed": int(max(0, removed)),
+        },
+    )
+
+
+def topic_list(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("topic actions require sqlite backend")
+    scope = str(args.get("scope", "all")).strip().lower() or "all"
+    if scope not in {"all", "memory"}:
+        return tool_error("scope must be one of: all, memory")
+    memory_id = str(args.get("memory_id", "")).strip()
+    if scope == "memory" and not memory_id:
+        return tool_error("memory_id is required when scope=memory")
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
+            if scope == "all":
+                rows = conn.execute(
+                    """
+                    SELECT topic, COUNT(*) AS count
+                    FROM memory_topics
+                    GROUP BY topic
+                    ORDER BY count DESC, topic ASC
+                    """
+                ).fetchall()
+                topics = [{"topic": str(row["topic"]), "count": int(row["count"])} for row in rows]
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT topic, created_at, source
+                    FROM memory_topics
+                    WHERE memory_id = ?
+                    ORDER BY topic ASC
+                    """,
+                    (memory_id,),
+                ).fetchall()
+                topics = [
+                    {
+                        "topic": str(row["topic"]),
+                        "created_at": normalize_optional_string(row["created_at"]),
+                        "source": normalize_optional_string(row["source"]),
+                    }
+                    for row in rows
+                ]
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+    if scope == "all":
+        lines = [f"Topics ({len(topics)}):"]
+        lines.extend(f"- {item['topic']}: {item['count']}" for item in topics[:50])
+        return text_result("\n".join(lines), {"ok": True, "scope": "all", "topics": topics, "count": len(topics)})
+    lines = [f"Topics for {memory_id} ({len(topics)}):"]
+    lines.extend(f"- {item['topic']}" for item in topics[:50])
+    return text_result(
+        "\n".join(lines),
+        {
+            "ok": True,
+            "scope": "memory",
+            "memory_id": memory_id,
+            "topics": topics,
+            "count": len(topics),
+        },
+    )
+
+
+PACK_REDACTION_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        "private_key_header",
+        re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+        "[REDACTED:private_key_header]",
+    ),
+    (
+        "jwt",
+        re.compile(r"\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+        "[REDACTED:jwt]",
+    ),
+    (
+        "aws_access_key",
+        re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+        "[REDACTED:aws_access_key]",
+    ),
+    (
+        "email",
+        re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"),
+        "[REDACTED:email]",
+    ),
+    (
+        "user_path",
+        re.compile(r"(?:/home/[^/\s]+/[^\s]*|/Users/[^/\s]+/[^\s]*|[A-Za-z]:\\Users\\[^\\/\s]+\\[^\s]*)"),
+        "[REDACTED:user_path]",
+    ),
+    (
+        "ipv4",
+        re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"),
+        "[REDACTED:ipv4]",
+    ),
+)
+
+
+def _pack_kind_policy_warnings(args: dict[str, Any], kinds: list[str]) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+    if "kinds" in args and args.get("kinds") is not None:
+        for preview_only_kind in PACK_PREVIEW_POLICY_WARNING_KINDS:
+            if preview_only_kind in kinds:
+                warnings.append(
+                    {
+                        "code": "kind_preview_only",
+                        "message": f"{preview_only_kind} rows are previewable but not exportable in v1 policy.",
+                    }
+                )
+    return warnings
+
+
+def _pack_parse_common_filters(args: dict[str, Any]) -> dict[str, Any]:
+    topics = normalize_optional_string_list(args.get("topics"), "topics") or []
+    kinds_raw = normalize_optional_string_list(args.get("kinds"), "kinds")
+    if kinds_raw is None:
+        kinds = list(PACK_PREVIEW_DEFAULT_KINDS)
+    else:
+        if not kinds_raw:
+            raise ValueError("kinds must contain at least one value")
+        seen_kinds: set[str] = set()
+        kinds = []
+        for item in kinds_raw:
+            value = str(item).strip().lower()
+            if not value or value in seen_kinds:
+                continue
+            seen_kinds.add(value)
+            kinds.append(value)
+        if not kinds:
+            raise ValueError("kinds must contain at least one value")
+    raw_touched_paths = normalize_optional_string_list(args.get("touched_paths"), "touched_paths") or []
+    touched_paths = normalize_touched_paths(args.get("touched_paths")) or []
+    created_after = normalize_iso_utc_timestamp(args.get("created_after"), "created_after")
+    created_before = normalize_iso_utc_timestamp(args.get("created_before"), "created_before")
+    if created_after and created_before and created_after > created_before:
+        raise ValueError("created_after must be <= created_before")
+    limit = _safe_int(args.get("limit"), 100, minimum=1, maximum=1000)
+    return {
+        "topics": topics,
+        "kinds": kinds,
+        "raw_touched_paths": raw_touched_paths,
+        "touched_paths": touched_paths,
+        "created_after": created_after,
+        "created_before": created_before,
+        "limit": limit,
+    }
+
+
+def _pack_selection_context(
+    conn: sqlite3.Connection,
+    args: dict[str, Any],
+    parsed_filters: dict[str, Any],
+    warnings: list[dict[str, str]],
+) -> dict[str, Any]:
+    resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
+    topics: list[str] = list(parsed_filters["topics"])
+    kinds: list[str] = list(parsed_filters["kinds"])
+    raw_touched_paths: list[str] = list(parsed_filters["raw_touched_paths"])
+    touched_paths: list[str] = list(parsed_filters["touched_paths"])
+    created_after = normalize_optional_string(parsed_filters.get("created_after"))
+    created_before = normalize_optional_string(parsed_filters.get("created_before"))
+    limit = int(parsed_filters["limit"])
+
+    column_rows = conn.execute("PRAGMA table_info(memories)").fetchall()
+    memory_columns = {
+        str(row["name"] if isinstance(row, sqlite3.Row) else row[1]).strip()
+        for row in column_rows
+    }
+    created_column = "created_at" if "created_at" in memory_columns else None
+    if created_column is None and (created_after is not None or created_before is not None):
+        warnings.append(
+            {
+                "code": "date_filter_unavailable",
+                "message": "created_at timestamp column unavailable; created_after/created_before were ignored.",
+            }
+        )
+        created_after = None
+        created_before = None
+
+    clauses = [
+        "m.deleted = 0",
+        "(m.superseded_by IS NULL OR m.superseded_by = '')",
+    ]
+    sql_params: list[Any] = []
+
+    namespace_placeholders = ",".join("?" for _ in resolved_namespaces)
+    clauses.append(f"m.namespace IN ({namespace_placeholders})")
+    sql_params.extend(resolved_namespaces)
+
+    if resolved_origins:
+        origin_placeholders = ",".join("?" for _ in resolved_origins)
+        clauses.append(f"m.origin IN ({origin_placeholders})")
+        sql_params.extend(resolved_origins)
+
+    if kinds:
+        kind_placeholders = ",".join("?" for _ in kinds)
+        clauses.append(f"m.kind IN ({kind_placeholders})")
+        sql_params.extend(kinds)
+
+    if topics:
+        topic_placeholders = ",".join("?" for _ in topics)
+        clauses.append(
+            "EXISTS ("
+            "SELECT 1 FROM memory_topics mt "
+            "WHERE mt.memory_id = m.id "
+            f"AND mt.topic IN ({topic_placeholders})"
+            ")"
+        )
+        sql_params.extend(topics)
+
+    if touched_paths:
+        path_clauses: list[str] = []
+        if raw_touched_paths:
+            raw_placeholders = ",".join("?" for _ in raw_touched_paths)
+            path_clauses.append(f"mf_path.path IN ({raw_placeholders})")
+        normalized_placeholders = ",".join("?" for _ in touched_paths)
+        normalized_expr = "REPLACE(REPLACE(mf_path.path, char(92), '/'), './', '')"
+        path_clauses.append(f"{normalized_expr} IN ({normalized_placeholders})")
+        clauses.append(
+            "EXISTS ("
+            "SELECT 1 FROM memory_files mf_path "
+            "WHERE mf_path.memory_id = m.id "
+            "AND mf_path.memory_table = m.kind "
+            f"AND ({' OR '.join(path_clauses)})"
+            ")"
+        )
+        sql_params.extend(raw_touched_paths)
+        sql_params.extend(touched_paths)
+
+    if created_column is not None and created_after is not None:
+        clauses.append(f"m.{created_column} >= ?")
+        sql_params.append(created_after)
+    if created_column is not None and created_before is not None:
+        clauses.append(f"m.{created_column} <= ?")
+        sql_params.append(created_before)
+
+    where_sql = " AND ".join(clauses)
+    order_sql = f"COALESCE(m.{created_column}, '') DESC, m.id ASC" if created_column else "m.id ASC"
+
+    total_rows = int(conn.execute(f"SELECT COUNT(*) FROM memories m WHERE {where_sql}", tuple(sql_params)).fetchone()[0])
+    row_id_rows = conn.execute(
+        f"SELECT m.id FROM memories m WHERE {where_sql} ORDER BY {order_sql} LIMIT ?",
+        tuple(sql_params + [limit]),
+    ).fetchall()
+    row_ids = [str(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in row_id_rows]
+
+    selected_rows_raw = conn.execute(
+        "SELECT m.id, m.kind, m.text, m.title, m.preview, m.created_at, m.updated_at, "
+        "m.namespace, m.origin, m.import_freshness, m.git_sha, m.git_branch, m.git_dirty "
+        f"FROM memories m WHERE {where_sql} ORDER BY {order_sql} LIMIT ?",
+        tuple(sql_params + [limit]),
+    ).fetchall()
+    selected_rows = [
+        {
+            "id": str(row["id"] if isinstance(row, sqlite3.Row) else row[0]),
+            "kind": str(row["kind"] if isinstance(row, sqlite3.Row) else row[1]),
+            "text": str(row["text"] if isinstance(row, sqlite3.Row) else row[2]),
+            "title": normalize_optional_string(row["title"] if isinstance(row, sqlite3.Row) else row[3]),
+            "preview": normalize_optional_string(row["preview"] if isinstance(row, sqlite3.Row) else row[4]),
+            "created_at": normalize_optional_string(row["created_at"] if isinstance(row, sqlite3.Row) else row[5]),
+            "updated_at": normalize_optional_string(row["updated_at"] if isinstance(row, sqlite3.Row) else row[6]),
+            "namespace": str(row["namespace"] if isinstance(row, sqlite3.Row) else row[7]),
+            "origin": str(row["origin"] if isinstance(row, sqlite3.Row) else row[8]),
+            "import_freshness": normalize_optional_string(
+                row["import_freshness"] if isinstance(row, sqlite3.Row) else row[9]
+            ),
+            "git_sha": normalize_optional_string(row["git_sha"] if isinstance(row, sqlite3.Row) else row[10]),
+            "git_branch": normalize_optional_string(row["git_branch"] if isinstance(row, sqlite3.Row) else row[11]),
+            "git_dirty": normalize_git_dirty(row["git_dirty"] if isinstance(row, sqlite3.Row) else row[12]),
+        }
+        for row in selected_rows_raw
+    ]
+
+    return {
+        "topics": topics,
+        "kinds": kinds,
+        "raw_touched_paths": raw_touched_paths,
+        "touched_paths": touched_paths,
+        "created_after": created_after,
+        "created_before": created_before,
+        "limit": limit,
+        "resolved_namespaces": resolved_namespaces,
+        "resolved_origins": resolved_origins,
+        "where_sql": where_sql,
+        "sql_params": sql_params,
+        "created_column": created_column,
+        "order_sql": order_sql,
+        "total_rows": total_rows,
+        "row_ids": row_ids,
+        "selected_rows": selected_rows,
+    }
+
+
+def _pack_redaction_source_text(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for field in PACK_REDACTION_TEXT_FIELDS:
+        if field not in row:
+            continue
+        value_raw = row.get(field)
+        if value_raw is None:
+            continue
+        value = str(value_raw)
+        if value:
+            parts.append(value)
+    return "\n".join(parts)
+
+
+def _pack_redaction_apply(text: str) -> tuple[str, dict[str, int], int]:
+    source = str(text)
+    if not source:
+        return source, {}, 0
+
+    consumed = [False] * len(source)
+    replacements: list[tuple[int, int, str, str]] = []
+    counts: dict[str, int] = {}
+    for category, pattern, replacement in PACK_REDACTION_RULES:
+        for match in pattern.finditer(source):
+            start, end = match.span()
+            if end <= start:
+                continue
+            if any(consumed[idx] for idx in range(start, end)):
+                continue
+            for idx in range(start, end):
+                consumed[idx] = True
+            replacements.append((start, end, replacement, category))
+            counts[category] = int(counts.get(category, 0) + 1)
+
+    if not replacements:
+        return source, {}, 0
+
+    replacements.sort(key=lambda item: (item[0], item[1]))
+    chunks: list[str] = []
+    cursor = 0
+    for start, end, replacement, _category in replacements:
+        if start < cursor:
+            continue
+        chunks.append(source[cursor:start])
+        chunks.append(replacement)
+        cursor = end
+    chunks.append(source[cursor:])
+    redacted = "".join(chunks)
+    total = int(sum(counts.values()))
+    return redacted, counts, total
+
+
+def _pack_row_redaction(row: dict[str, Any]) -> dict[str, Any]:
+    text_fields: dict[str, str] = {}
+    by_category: dict[str, int] = {}
+    total_matches = 0
+    for field in PACK_REDACTION_TEXT_FIELDS:
+        if field not in row:
+            continue
+        raw_value = row.get(field)
+        if raw_value is None:
+            continue
+        redacted_value, field_counts, field_total = _pack_redaction_apply(str(raw_value))
+        text_fields[field] = redacted_value
+        total_matches += int(field_total)
+        for category_name in PACK_REDACTION_RULE_ORDER:
+            hit_count = int(field_counts.get(category_name, 0))
+            if hit_count <= 0:
+                continue
+            by_category[category_name] = int(by_category.get(category_name, 0) + hit_count)
+    categories = [name for name in PACK_REDACTION_RULE_ORDER if int(by_category.get(name, 0)) > 0]
+    return {
+        "text_fields": text_fields,
+        "by_category": by_category,
+        "categories": categories,
+        "total_matches": int(total_matches),
+        "redacted_preview": collapsed_preview_text(
+            "\n".join(text_fields.get(name, "") for name in PACK_REDACTION_TEXT_FIELDS if name in text_fields),
+            max_chars=300,
+        ),
+    }
+
+
+def _pack_baseline_warning() -> dict[str, str]:
+    return {
+        "code": "redaction_ruleset_baseline_only",
+        "message": PACK_BASELINE_WARNING_MESSAGE,
+    }
+
+
+def _pack_make_pack_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"pack_{stamp}_{secrets.token_hex(4)}"
+
+
+def _sanitize_pack_name(raw_name: Any) -> str:
+    value = normalize_optional_string(raw_name)
+    if value is None:
+        raise ValueError("pack_name is required")
+    value = value.strip()
+    if not value:
+        raise ValueError("pack_name is required")
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    if not sanitized:
+        raise ValueError("pack_name is empty after sanitization")
+    if sanitized.startswith("."):
+        raise ValueError("pack_name cannot start with '.'")
+    sanitized = sanitized[:64]
+    if not sanitized:
+        raise ValueError("pack_name is empty after sanitization")
+    if sanitized.upper() in PACK_RESERVED_BASENAMES:
+        raise ValueError(f"pack_name '{sanitized}' is reserved on Windows")
+    return sanitized
+
+
+def _pack_output_dir(raw_output_dir: Any) -> Path:
+    configured = normalize_optional_string(raw_output_dir)
+    if configured is None:
+        resolved = (state_dir() / "packs" / "exports").resolve()
+    else:
+        resolved = Path(configured).expanduser().resolve()
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _pack_output_path(output_dir: Path, sanitized_pack_name: str, pack_id: str) -> Path:
+    filename = f"{sanitized_pack_name}_{pack_id}.zip"
+    final_path = (output_dir / filename).resolve()
+    if final_path.parent != output_dir.resolve():
+        raise ValueError("unsafe export output path")
+    return final_path
+
+
+def _pack_json_bytes(payload: Any) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _pack_jsonl_bytes(rows: list[dict[str, Any]]) -> bytes:
+    lines = [json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) for row in rows]
+    if not lines:
+        return b""
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _pack_content_hash(
+    member_bytes: dict[str, bytes],
+    covered_members: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    if covered_members is None:
+        resolved_members = sorted(PACK_CONTENT_HASH_COVERED_MEMBERS)
+    else:
+        resolved_members = sorted(str(name) for name in covered_members)
+    member_hashes: dict[str, str] = {}
+    for member_name in resolved_members:
+        if member_name not in member_bytes:
+            raise ValueError(f"missing content hash member: {member_name}")
+        member_hashes[member_name] = hashlib.sha256(member_bytes[member_name]).hexdigest()
+    canonical = "".join(f"{member_name}\t{member_hashes[member_name]}\n" for member_name in resolved_members)
+    value = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {
+        "algorithm": "sha256",
+        "value": value,
+        "covered_members": resolved_members,
+    }
+
+
+def _pack_validate_zip(path: Path) -> dict[str, Any]:
+    with zipfile.ZipFile(path, "r") as archive:
+        members = set(archive.namelist())
+        for required_member in PACK_REQUIRED_MEMBERS:
+            if required_member not in members:
+                raise ValueError(f"missing zip member: {required_member}")
+
+        try:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"invalid manifest.json: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest.json must be an object")
+
+        content_hash = manifest.get("content_hash", {})
+        if not isinstance(content_hash, dict):
+            raise ValueError("manifest.content_hash must be an object")
+        covered_members = content_hash.get("covered_members")
+        if not isinstance(covered_members, list) or not covered_members:
+            raise ValueError("manifest.content_hash.covered_members must be a non-empty list")
+
+        member_bytes: dict[str, bytes] = {}
+        for member_name in covered_members:
+            if not isinstance(member_name, str):
+                raise ValueError("manifest.content_hash.covered_members must contain strings")
+            if member_name not in members:
+                raise ValueError(f"manifest referenced missing member: {member_name}")
+            member_bytes[member_name] = archive.read(member_name)
+        recomputed = _pack_content_hash(member_bytes, covered_members=covered_members)
+        if str(content_hash.get("value", "")) != str(recomputed.get("value", "")):
+            raise ValueError("manifest content hash mismatch")
+
+        rows_blob = archive.read("content/memories.jsonl").decode("utf-8")
+        exported_rows = 0
+        for line in rows_blob.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parsed = json.loads(line)
+            if not isinstance(parsed, dict):
+                raise ValueError("content/memories.jsonl rows must be objects")
+            exported_rows += 1
+
+        selection_payload = manifest.get("selection", {})
+        if not isinstance(selection_payload, dict):
+            raise ValueError("manifest.selection must be an object")
+        manifest_exported_rows = int(selection_payload.get("exported_rows", 0))
+        if exported_rows != manifest_exported_rows:
+            raise ValueError("manifest selection.exported_rows mismatch")
+        return manifest
+
+
+def _pack_sort_timestamp_iso(value: Any) -> float:
+    stamp = normalize_optional_string(value)
+    if not stamp:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return float(parsed.astimezone(timezone.utc).timestamp())
+
+
+def pack_preview(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only selector preview for future memory-pack export."""
+    if store_backend() != "sqlite":
+        return tool_error("pack_preview requires sqlite backend")
+
+    try:
+        parsed = _pack_parse_common_filters(args)
+        sample_per_kind = _safe_int(args.get("sample_per_kind"), 3, minimum=0, maximum=20)
+        include_samples = parse_bool(args.get("include_samples"), default=True)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    warnings = _pack_kind_policy_warnings(args, list(parsed["kinds"]))
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            selection = _pack_selection_context(conn, args, parsed, warnings)
+
+            where_sql = str(selection["where_sql"])
+            sql_params = list(selection["sql_params"])
+            total_rows = int(selection["total_rows"])
+            row_ids = list(selection["row_ids"])
+            limit = int(selection["limit"])
+
+            by_kind_rows = conn.execute(
+                f"SELECT m.kind, COUNT(*) AS count FROM memories m WHERE {where_sql} GROUP BY m.kind ORDER BY m.kind ASC",
+                tuple(sql_params),
+            ).fetchall()
+            by_kind = {
+                str(row["kind"] if isinstance(row, sqlite3.Row) else row[0]): int(
+                    row["count"] if isinstance(row, sqlite3.Row) else row[1]
+                )
+                for row in by_kind_rows
+            }
+
+            by_namespace_rows = conn.execute(
+                f"SELECT m.namespace, COUNT(*) AS count FROM memories m WHERE {where_sql} GROUP BY m.namespace ORDER BY m.namespace ASC",
+                tuple(sql_params),
+            ).fetchall()
+            by_namespace = {
+                str(row["namespace"] if isinstance(row, sqlite3.Row) else row[0]): int(
+                    row["count"] if isinstance(row, sqlite3.Row) else row[1]
+                )
+                for row in by_namespace_rows
+            }
+
+            by_origin_rows = conn.execute(
+                f"SELECT m.origin, COUNT(*) AS count FROM memories m WHERE {where_sql} GROUP BY m.origin ORDER BY m.origin ASC",
+                tuple(sql_params),
+            ).fetchall()
+            by_origin = {
+                str(row["origin"] if isinstance(row, sqlite3.Row) else row[0]): int(
+                    row["count"] if isinstance(row, sqlite3.Row) else row[1]
+                )
+                for row in by_origin_rows
+            }
+
+            topic_rows = conn.execute(
+                "SELECT mt.topic, COUNT(*) AS count "
+                "FROM memory_topics mt "
+                "JOIN memories m ON m.id = mt.memory_id "
+                f"WHERE {where_sql} "
+                "GROUP BY mt.topic "
+                "ORDER BY count DESC, mt.topic ASC "
+                "LIMIT 20",
+                tuple(sql_params),
+            ).fetchall()
+            topic_total_row = conn.execute(
+                "SELECT COUNT(*) FROM ("
+                "SELECT mt.topic "
+                "FROM memory_topics mt "
+                "JOIN memories m ON m.id = mt.memory_id "
+                f"WHERE {where_sql} "
+                "GROUP BY mt.topic"
+                ")",
+                tuple(sql_params),
+            ).fetchone()
+            topic_total = int(topic_total_row[0] if topic_total_row else 0)
+            by_topic = {
+                str(row["topic"] if isinstance(row, sqlite3.Row) else row[0]): int(
+                    row["count"] if isinstance(row, sqlite3.Row) else row[1]
+                )
+                for row in topic_rows
+            }
+
+            referenced_file_count_row = conn.execute(
+                "SELECT COUNT(DISTINCT mf.path) "
+                "FROM memory_files mf "
+                "JOIN memories m ON m.id = mf.memory_id AND m.kind = mf.memory_table "
+                f"WHERE {where_sql}",
+                tuple(sql_params),
+            ).fetchone()
+            referenced_file_count = int(referenced_file_count_row[0] if referenced_file_count_row else 0)
+            referenced_files_rows = conn.execute(
+                "SELECT mf.path, COUNT(DISTINCT mf.memory_id) AS count "
+                "FROM memory_files mf "
+                "JOIN memories m ON m.id = mf.memory_id AND m.kind = mf.memory_table "
+                f"WHERE {where_sql} "
+                "GROUP BY mf.path "
+                "ORDER BY count DESC, mf.path ASC "
+                "LIMIT 20",
+                tuple(sql_params),
+            ).fetchall()
+            top_referenced_files = [
+                {
+                    "path": str(row["path"] if isinstance(row, sqlite3.Row) else row[0]),
+                    "count": int(row["count"] if isinstance(row, sqlite3.Row) else row[1]),
+                }
+                for row in referenced_files_rows
+            ]
+
+            samples: dict[str, list[dict[str, Any]]] = {}
+            if include_samples and sample_per_kind > 0 and total_rows > 0:
+                sample_rows = conn.execute(
+                    "SELECT m.id, m.kind, m.text, m.created_at, m.updated_at, m.namespace, m.origin, m.import_freshness "
+                    f"FROM memories m WHERE {where_sql} ORDER BY {selection['order_sql']}",
+                    tuple(sql_params),
+                ).fetchall()
+                quotas = {kind_name: sample_per_kind for kind_name in by_kind}
+                for row in sample_rows:
+                    row_kind = str(row["kind"] if isinstance(row, sqlite3.Row) else row[1])
+                    if quotas.get(row_kind, 0) <= 0:
+                        continue
+                    namespace_value = str(row["namespace"] if isinstance(row, sqlite3.Row) else row[5])
+                    sample_item = {
+                        "id": str(row["id"] if isinstance(row, sqlite3.Row) else row[0]),
+                        "kind": row_kind,
+                        "namespace": namespace_value,
+                        "origin": str(row["origin"] if isinstance(row, sqlite3.Row) else row[6]),
+                        "import_freshness": normalize_optional_string(
+                            row["import_freshness"] if isinstance(row, sqlite3.Row) else row[7]
+                        ),
+                        "pack_id": derive_pack_id_from_namespace(namespace_value),
+                        "created_at": normalize_optional_string(
+                            row["created_at"] if isinstance(row, sqlite3.Row) else row[3]
+                        ),
+                        "updated_at": normalize_optional_string(
+                            row["updated_at"] if isinstance(row, sqlite3.Row) else row[4]
+                        ),
+                        "text_preview": collapsed_preview_text(
+                            row["text"] if isinstance(row, sqlite3.Row) else row[2],
+                            max_chars=200,
+                        ),
+                    }
+                    samples.setdefault(row_kind, []).append(sample_item)
+                    quotas[row_kind] = quotas.get(row_kind, 0) - 1
+                    if all(remaining <= 0 for remaining in quotas.values()):
+                        break
+                samples = {kind_name: samples[kind_name] for kind_name in sorted(samples)}
+
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    structured: dict[str, Any] = {
+        "action": "pack_preview",
+        "status": "ok",
+        "filters": {
+            "topics": list(selection["topics"]),
+            "kinds": list(selection["kinds"]),
+            "namespaces": list(selection["resolved_namespaces"]),
+            "origins": list(selection["resolved_origins"]) if selection["resolved_origins"] is not None else [],
+            "created_after": selection["created_after"],
+            "created_before": selection["created_before"],
+            "touched_paths": list(selection["touched_paths"]),
+        },
+        "selection": {
+            "total_rows": int(selection["total_rows"]),
+            "limited": bool(int(selection["total_rows"]) > int(selection["limit"])),
+            "limit": int(selection["limit"]),
+            "row_ids": list(selection["row_ids"]),
+        },
+        "counts": {
+            "by_kind": by_kind,
+            "by_namespace": by_namespace,
+            "by_origin": by_origin,
+            "by_topic": by_topic,
+            "by_topic_limited": bool(topic_total > 20),
+        },
+        "files": {
+            "referenced_file_count": int(referenced_file_count),
+            "top_referenced_files": top_referenced_files,
+        },
+        "aliases": {
+            "referenced_alias_count": 0,
+            "top_alias_concepts": [],
+        },
+        "samples": samples if include_samples else {},
+        "warnings": warnings,
+    }
+
+    top_topics_line = ", ".join(f"{topic}={count}" for topic, count in list(by_topic.items())[:5]) or "none"
+    top_files_line = ", ".join(f"{row['path']}={row['count']}" for row in top_referenced_files[:5]) or "none"
+    warning_line = "; ".join(f"{item['code']}: {item['message']}" for item in warnings) if warnings else "none"
+    lines = [
+        f"Pack preview rows: {total_rows} (limited={str(total_rows > limit).lower()}, limit={limit})",
+        f"By kind: {by_kind}",
+        f"By namespace: {by_namespace}",
+        f"Top topics: {top_topics_line}",
+        f"Top referenced files: {top_files_line}",
+        f"Warnings: {warning_line}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def pack_redaction_preview(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only redaction dry-run over the pack selection engine."""
+    if store_backend() != "sqlite":
+        return tool_error("pack_redaction_preview requires sqlite backend")
+
+    try:
+        parsed = _pack_parse_common_filters(args)
+        include_redacted_samples = parse_bool(args.get("include_redacted_samples"), default=True)
+        max_redacted_samples = _safe_int(args.get("max_redacted_samples"), 10, minimum=0, maximum=500)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    warnings = _pack_kind_policy_warnings(args, list(parsed["kinds"]))
+    warnings.append(_pack_baseline_warning())
+    if max_redacted_samples > 50:
+        max_redacted_samples = 50
+        warnings.append(
+            {
+                "code": "max_redacted_samples_capped",
+                "message": "max_redacted_samples was capped to 50.",
+            }
+        )
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            selection = _pack_selection_context(conn, args, parsed, warnings)
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    total_rows = int(selection["total_rows"])
+    limit = int(selection["limit"])
+    row_ids = list(selection["row_ids"])
+    limited = bool(total_rows > limit)
+    if limited:
+        warnings.append(
+            {
+                "code": "redaction_counts_limited",
+                "message": "Redaction counts reflect only the limited scanned row set. Increase limit to scan more selected rows.",
+            }
+        )
+
+    by_category: dict[str, int] = {}
+    rows_by_category: dict[str, int] = {}
+    total_matches = 0
+    affected_rows = 0
+    sample_candidates: list[dict[str, Any]] = []
+
+    for row in selection["selected_rows"]:
+        row_redaction = _pack_row_redaction(row)
+        category_counts = dict(row_redaction["by_category"])
+        match_count = int(row_redaction["total_matches"])
+        if match_count <= 0:
+            continue
+
+        affected_rows += 1
+        total_matches += int(match_count)
+        categories = [name for name in PACK_REDACTION_RULE_ORDER if int(category_counts.get(name, 0)) > 0]
+        for category in categories:
+            by_category[category] = int(by_category.get(category, 0) + int(category_counts.get(category, 0)))
+            rows_by_category[category] = int(rows_by_category.get(category, 0) + 1)
+
+        if include_redacted_samples:
+            memory_id = str(row.get("id", ""))
+            updated_ts = _pack_sort_timestamp_iso(row.get("updated_at"))
+            created_ts = _pack_sort_timestamp_iso(row.get("created_at"))
+            sort_ts = updated_ts if updated_ts > 0 else created_ts
+            sample_candidates.append(
+                {
+                    "memory_id": memory_id,
+                    "kind": str(row.get("kind", "")),
+                    "namespace": str(row.get("namespace", DEFAULT_MEMORY_NAMESPACE)),
+                    "origin": str(row.get("origin", DEFAULT_MEMORY_ORIGIN)),
+                    "categories": categories,
+                    "match_count": int(match_count),
+                    "redacted_preview": str(row_redaction["redacted_preview"]),
+                    "_sort_ts": sort_ts,
+                }
+            )
+
+    samples: list[dict[str, Any]] = []
+    if include_redacted_samples and max_redacted_samples > 0 and sample_candidates:
+        sample_candidates.sort(
+            key=lambda item: (
+                -int(item.get("match_count", 0)),
+                -float(item.get("_sort_ts", 0.0)),
+                str(item.get("memory_id", "")),
+            )
+        )
+        for item in sample_candidates[:max_redacted_samples]:
+            sample = dict(item)
+            sample.pop("_sort_ts", None)
+            samples.append(sample)
+
+    structured: dict[str, Any] = {
+        "action": "pack_redaction_preview",
+        "status": "ok",
+        "filters": {
+            "topics": list(selection["topics"]),
+            "kinds": list(selection["kinds"]),
+            "namespaces": list(selection["resolved_namespaces"]),
+            "origins": list(selection["resolved_origins"]) if selection["resolved_origins"] is not None else [],
+            "created_after": selection["created_after"],
+            "created_before": selection["created_before"],
+            "touched_paths": list(selection["touched_paths"]),
+        },
+        "selection": {
+            "total_rows": total_rows,
+            "limited": limited,
+            "limit": limit,
+            "row_ids": row_ids,
+        },
+        "redaction": {
+            "total_matches": int(total_matches),
+            "affected_rows": int(affected_rows),
+            "by_category": by_category,
+            "rows_by_category": rows_by_category,
+            "rules_applied": list(PACK_REDACTION_RULE_ORDER),
+            "ruleset_version": BASELINE_REDACTION_RULESET_VERSION,
+        },
+        "samples": samples if include_redacted_samples else [],
+        "warnings": warnings,
+    }
+
+    warning_line = "; ".join(f"{item['code']}: {item['message']}" for item in warnings) if warnings else "none"
+    lines = [
+        f"Pack redaction preview selected rows: {total_rows} (limited={str(limited).lower()}, limit={limit})",
+        f"Affected rows: {affected_rows}",
+        f"Total matches: {total_matches}",
+        f"By category: {by_category}",
+        f"Warnings: {warning_line}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def _pack_validate_export_kinds(args: dict[str, Any], kinds: list[str]) -> None:
+    if "kinds" not in args or args.get("kinds") is None:
+        return
+    for kind_name in kinds:
+        if kind_name in PACK_PREVIEW_POLICY_WARNING_KINDS:
+            raise ValueError(PACK_KIND_PREVIEW_ERROR_TEMPLATE.format(kind=kind_name))
+        if kind_name not in PACK_EXPORT_ALLOWED_KINDS:
+            raise ValueError(f"kind '{kind_name}' is not exportable in v1 policy")
+
+
+def _pack_topics_by_memory_id(conn: sqlite3.Connection, row_ids: list[str]) -> dict[str, list[str]]:
+    topic_map = {memory_id: [] for memory_id in row_ids}
+    if not row_ids:
+        return topic_map
+    placeholders = ",".join("?" for _ in row_ids)
+    rows = conn.execute(
+        f"SELECT memory_id, topic FROM memory_topics WHERE memory_id IN ({placeholders}) ORDER BY topic ASC",
+        tuple(row_ids),
+    ).fetchall()
+    for row in rows:
+        memory_id = str(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
+        topic = str(row["topic"] if isinstance(row, sqlite3.Row) else row[1])
+        topic_map.setdefault(memory_id, []).append(topic)
+    return topic_map
+
+
+def _pack_files_by_memory_id(conn: sqlite3.Connection, row_ids: list[str]) -> dict[str, list[dict[str, str]]]:
+    file_map: dict[str, list[dict[str, str]]] = {memory_id: [] for memory_id in row_ids}
+    if not row_ids:
+        return file_map
+    placeholders = ",".join("?" for _ in row_ids)
+    rows = conn.execute(
+        "SELECT mf.memory_id, mf.path, mf.file_sha "
+        "FROM memory_files mf "
+        "JOIN memories m ON m.id = mf.memory_id AND m.kind = mf.memory_table "
+        f"WHERE mf.memory_id IN ({placeholders}) "
+        "ORDER BY mf.memory_id ASC, mf.path ASC, mf.file_sha ASC",
+        tuple(row_ids),
+    ).fetchall()
+    dedupe: dict[str, set[tuple[str, str]]] = {}
+    for row in rows:
+        memory_id = str(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
+        path_value = str(row["path"] if isinstance(row, sqlite3.Row) else row[1])
+        sha_value = str(row["file_sha"] if isinstance(row, sqlite3.Row) else row[2])
+        key = (path_value, sha_value)
+        seen = dedupe.setdefault(memory_id, set())
+        if key in seen:
+            continue
+        seen.add(key)
+        file_map.setdefault(memory_id, []).append({"path": path_value, "file_sha": sha_value})
+    return file_map
+
+
+def pack_export(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("pack_export requires sqlite backend")
+
+    if not parse_bool(args.get("allow_unsigned"), default=False):
+        return tool_error(PACK_ALLOW_UNSIGNED_ERROR)
+
+    try:
+        sanitized_pack_name = _sanitize_pack_name(args.get("pack_name"))
+        parsed = _pack_parse_common_filters(args)
+        _pack_validate_export_kinds(args, list(parsed["kinds"]))
+        allow_limited_export = parse_bool(args.get("allow_limited_export"), default=False)
+        # Preflight conflict validation before any export-side effects.
+        resolve_namespace_origin_filters(args, None)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    warnings: list[dict[str, str]] = []
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            selection = _pack_selection_context(conn, args, parsed, warnings)
+            total_rows = int(selection["total_rows"])
+            limit = int(selection["limit"])
+            limited = bool(total_rows > limit)
+            if total_rows <= 0:
+                raise ValueError("selection returned zero rows; nothing to export")
+            if limited and not allow_limited_export:
+                raise ValueError(
+                    "selection is limited; increase limit or pass allow_limited_export=true to export only the limited selected row set"
+                )
+            selected_rows = list(selection["selected_rows"])
+            for row in selected_rows:
+                kind_name = str(row.get("kind", ""))
+                if kind_name not in PACK_EXPORT_ALLOWED_KINDS:
+                    if kind_name in PACK_PREVIEW_POLICY_WARNING_KINDS:
+                        raise ValueError(PACK_KIND_PREVIEW_ERROR_TEMPLATE.format(kind=kind_name))
+                    raise ValueError(f"kind '{kind_name}' is not exportable in v1 policy")
+            selected_row_ids = [str(row.get("id", "")) for row in selected_rows]
+            topics_by_memory_id = _pack_topics_by_memory_id(conn, selected_row_ids)
+            files_by_memory_id = _pack_files_by_memory_id(conn, selected_row_ids)
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    if bool(total_rows > limit and allow_limited_export):
+        warnings.append(
+            {
+                "code": "limited_export",
+                "message": "Only the limited selected row set was exported.",
+            }
+        )
+    warnings.append(
+        {
+            "code": "unsigned_development_pack",
+            "message": "This pack is unsigned because signing is not implemented yet.",
+        }
+    )
+    warnings.append(_pack_baseline_warning())
+
+    pack_id = _pack_make_pack_id()
+    try:
+        output_dir = _pack_output_dir(args.get("output_dir"))
+        final_zip_path = _pack_output_path(output_dir, sanitized_pack_name, pack_id)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    exported_rows: list[dict[str, Any]] = []
+    row_redaction_entries: list[dict[str, Any]] = []
+    by_kind: dict[str, int] = {}
+    by_namespace: dict[str, int] = {}
+    by_origin: dict[str, int] = {}
+    by_topic: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    rows_by_category: dict[str, int] = {}
+    total_matches = 0
+    affected_rows = 0
+
+    path_to_memory_ids: dict[str, set[str]] = {}
+    path_to_shas: dict[str, set[str]] = {}
+    context_counter = 0
+    hippocampus_counter = 0
+
+    for row in selected_rows:
+        kind_name = str(row.get("kind", ""))
+        if kind_name == "context_block":
+            context_counter += 1
+            row_id_in_pack = f"ctx_{context_counter:03d}"
+        elif kind_name == "hippocampus_entry":
+            hippocampus_counter += 1
+            row_id_in_pack = f"hip_{hippocampus_counter:03d}"
+        else:
+            # Defensively fail here even though this is already validated above.
+            if kind_name in PACK_PREVIEW_POLICY_WARNING_KINDS:
+                return tool_error(PACK_KIND_PREVIEW_ERROR_TEMPLATE.format(kind=kind_name))
+            return tool_error(f"kind '{kind_name}' is not exportable in v1 policy")
+
+        source_id = str(row.get("id", ""))
+        row_topics = sorted(topics_by_memory_id.get(source_id, []))
+        touched_files = list(files_by_memory_id.get(source_id, []))
+        row_redaction = _pack_row_redaction(row)
+        row_categories = list(row_redaction["categories"])
+        row_match_count = int(row_redaction["total_matches"])
+        if row_match_count > 0:
+            affected_rows += 1
+            row_redaction_entries.append(
+                {
+                    "row_id_in_pack": row_id_in_pack,
+                    "categories": row_categories,
+                    "match_count": row_match_count,
+                }
+            )
+        total_matches += row_match_count
+        row_counts = dict(row_redaction["by_category"])
+        for category_name in PACK_REDACTION_RULE_ORDER:
+            category_hits = int(row_counts.get(category_name, 0))
+            if category_hits <= 0:
+                continue
+            by_category[category_name] = int(by_category.get(category_name, 0) + category_hits)
+            rows_by_category[category_name] = int(rows_by_category.get(category_name, 0) + 1)
+
+        namespace_value = str(row.get("namespace", DEFAULT_MEMORY_NAMESPACE))
+        origin_value = str(row.get("origin", DEFAULT_MEMORY_ORIGIN))
+        by_kind[kind_name] = int(by_kind.get(kind_name, 0) + 1)
+        by_namespace[namespace_value] = int(by_namespace.get(namespace_value, 0) + 1)
+        by_origin[origin_value] = int(by_origin.get(origin_value, 0) + 1)
+        for topic_value in row_topics:
+            by_topic[topic_value] = int(by_topic.get(topic_value, 0) + 1)
+        for file_info in touched_files:
+            path_value = str(file_info.get("path", ""))
+            sha_value = str(file_info.get("file_sha", ""))
+            if not path_value:
+                continue
+            path_to_memory_ids.setdefault(path_value, set()).add(row_id_in_pack)
+            if sha_value:
+                path_to_shas.setdefault(path_value, set()).add(sha_value)
+
+        exported_rows.append(
+            {
+                "row_id_in_pack": row_id_in_pack,
+                "kind": kind_name,
+                "namespace_at_export": namespace_value,
+                "origin_at_export": origin_value,
+                "text_fields": dict(row_redaction["text_fields"]),
+                "topics": row_topics,
+                "created_at_in_source": normalize_optional_string(row.get("created_at")),
+                "git_sha_at_write": normalize_optional_string(row.get("git_sha")),
+                "git_branch_at_write": normalize_optional_string(row.get("git_branch")),
+                "git_dirty_at_write": normalize_git_dirty(row.get("git_dirty")),
+                "touched_files": touched_files,
+                "import_freshness_at_export": normalize_optional_string(row.get("import_freshness")),
+                "redaction_applied": True,
+            }
+        )
+
+    exported_rows_count = len(exported_rows)
+    limited = bool(total_rows > limit)
+    topic_summary = [
+        {"topic": topic_name, "row_count": int(count)}
+        for topic_name, count in sorted(by_topic.items(), key=lambda item: (-int(item[1]), item[0]))
+    ]
+    file_fingerprints = [
+        {
+            "path": path_value,
+            "memory_count": len(path_to_memory_ids.get(path_value, set())),
+            "file_shas": sorted(path_to_shas.get(path_value, set())),
+        }
+        for path_value in sorted(
+            path_to_memory_ids,
+            key=lambda path_item: (-len(path_to_memory_ids.get(path_item, set())), path_item),
+        )
+    ]
+    referenced_file_count = len(path_to_memory_ids)
+    exported_at = now_iso()
+    source_namespaces = sorted({str(row.get("namespace_at_export", DEFAULT_MEMORY_NAMESPACE)) for row in exported_rows})
+    source_origins = sorted({str(row.get("origin_at_export", DEFAULT_MEMORY_ORIGIN)) for row in exported_rows})
+    filters_payload = {
+        "topics": list(selection["topics"]),
+        "kinds": list(selection["kinds"]),
+        "namespaces": list(selection["resolved_namespaces"]),
+        "origins": list(selection["resolved_origins"]) if selection["resolved_origins"] is not None else [],
+        "created_after": selection["created_after"],
+        "created_before": selection["created_before"],
+        "touched_paths": list(selection["touched_paths"]),
+    }
+
+    redactions_payload = {
+        "ruleset_version": BASELINE_REDACTION_RULESET_VERSION,
+        "rules_applied": list(PACK_REDACTION_RULE_ORDER),
+        "total_matches": int(total_matches),
+        "affected_rows": int(affected_rows),
+        "by_category": by_category,
+        "rows_by_category": rows_by_category,
+        "by_pack_row": row_redaction_entries,
+    }
+    member_payloads: dict[str, Any] = {
+        "content/memories.jsonl": exported_rows,
+        "content/topics.json": {"topics": topic_summary},
+        "content/file_fingerprints.json": {"files": file_fingerprints},
+        "provenance/origin.json": {
+            "source": "mnemo",
+            "mnemo_version": SERVER_VERSION,
+            "exported_at": exported_at,
+            "selection_filters": filters_payload,
+            "source_namespaces": source_namespaces,
+            "source_origins": source_origins,
+        },
+        "provenance/redactions.json": redactions_payload,
+    }
+    member_bytes: dict[str, bytes] = {}
+    member_bytes["content/memories.jsonl"] = _pack_jsonl_bytes(member_payloads["content/memories.jsonl"])
+    for member_name in (
+        "content/topics.json",
+        "content/file_fingerprints.json",
+        "provenance/origin.json",
+        "provenance/redactions.json",
+    ):
+        member_bytes[member_name] = _pack_json_bytes(member_payloads[member_name])
+    content_hash = _pack_content_hash(member_bytes)
+
+    manifest = {
+        "pack_schema_version": 1,
+        "pack_id": pack_id,
+        "pack_name": sanitized_pack_name,
+        "created_at": exported_at,
+        "mnemo_version": SERVER_VERSION,
+        "signed": False,
+        "unsigned_reason": "signing_not_implemented",
+        "content_hash": content_hash,
+        "redaction_ruleset_version": BASELINE_REDACTION_RULESET_VERSION,
+        "redaction_rules_applied": list(PACK_REDACTION_RULE_ORDER),
+        "selection": {
+            "filters": filters_payload,
+            "total_rows": int(total_rows),
+            "exported_rows": int(exported_rows_count),
+            "limited": limited,
+            "limit": int(limit),
+        },
+        "counts": {
+            "by_kind": by_kind,
+            "by_namespace": by_namespace,
+            "by_origin": by_origin,
+            "by_topic": by_topic,
+        },
+        "files": {
+            "referenced_file_count": int(referenced_file_count),
+        },
+        "redaction": {
+            "total_matches": int(total_matches),
+            "affected_rows": int(affected_rows),
+            "by_category": by_category,
+            "rows_by_category": rows_by_category,
+        },
+    }
+    member_bytes["manifest.json"] = _pack_json_bytes(manifest)
+
+    temp_zip_path = Path(
+        tempfile.NamedTemporaryFile(dir=str(output_dir), delete=False, suffix=".zip.tmp").name
+    )
+    replaced = False
+    try:
+        with zipfile.ZipFile(temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for member_name in PACK_REQUIRED_MEMBERS:
+                archive.writestr(member_name, member_bytes[member_name])
+        validated_manifest = _pack_validate_zip(temp_zip_path)
+        if str(validated_manifest.get("pack_id", "")) != pack_id:
+            raise ValueError("validated manifest pack_id mismatch")
+
+        conn = _sqlite_connect()
+        try:
+            _sqlite_ensure_schema(conn)
+            conn.commit()
+            conn.execute(
+                """
+                INSERT INTO exported_packs(
+                    pack_id, pack_name, exported_at, row_count, redaction_count, signed, manifest_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pack_id,
+                    sanitized_pack_name,
+                    exported_at,
+                    int(exported_rows_count),
+                    int(total_matches),
+                    0,
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            os.replace(temp_zip_path, final_zip_path)
+            replaced = True
+            conn.commit()
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if replaced:
+                try:
+                    final_zip_path.unlink()
+                except Exception as cleanup_exc:
+                    return tool_error(
+                        f"{type(exc).__name__}: {exc} (post-replace cleanup failed: {cleanup_exc})"
+                    )
+            else:
+                try:
+                    if temp_zip_path.exists():
+                        temp_zip_path.unlink()
+                except Exception:
+                    pass
+            return tool_error(f"{type(exc).__name__}: {exc}")
+        finally:
+            conn.close()
+    except Exception as exc:
+        try:
+            if not replaced and temp_zip_path.exists():
+                temp_zip_path.unlink()
+        except Exception:
+            pass
+        return tool_error(f"{type(exc).__name__}: {exc}")
+    finally:
+        if not replaced:
+            try:
+                if temp_zip_path.exists():
+                    temp_zip_path.unlink()
+            except Exception:
+                pass
+
+    structured = {
+        "action": "pack_export",
+        "status": "ok",
+        "pack_id": pack_id,
+        "pack_name": sanitized_pack_name,
+        "output_path": str(final_zip_path),
+        "signed": False,
+        "unsigned_reason": "signing_not_implemented",
+        "content_hash": {
+            "algorithm": "sha256",
+            "value": str(content_hash["value"]),
+        },
+        "selection": {
+            "total_rows": int(total_rows),
+            "exported_rows": int(exported_rows_count),
+            "limited": limited,
+            "limit": int(limit),
+        },
+        "redaction": {
+            "ruleset_version": BASELINE_REDACTION_RULESET_VERSION,
+            "total_matches": int(total_matches),
+            "affected_rows": int(affected_rows),
+            "by_category": by_category,
+            "rows_by_category": rows_by_category,
+        },
+        "contents": {
+            "manifest": "manifest.json",
+            "memories": "content/memories.jsonl",
+            "topics": "content/topics.json",
+            "file_fingerprints": "content/file_fingerprints.json",
+            "origin": "provenance/origin.json",
+            "redactions": "provenance/redactions.json",
+        },
+        "warnings": warnings,
+    }
+    warning_codes = [str(item.get("code", "")) for item in warnings if isinstance(item, dict)]
+    lines = [
+        f"Pack export written: {final_zip_path}",
+        f"Rows: {exported_rows_count} (selected={total_rows}, limited={str(limited).lower()}, limit={limit})",
+        f"Content hash: {content_hash['value']}",
+        f"Redaction matches: {total_matches}",
+        f"Warnings: {', '.join(code for code in warning_codes if code) if warning_codes else 'none'}",
+    ]
+    return text_result("\n".join(lines), structured)
 
 
 def _compact_logs_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, Any]:
@@ -9095,6 +10915,123 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     else:
         aliases_payload["warnings"].append("alias tables are only available in sqlite backend")
 
+    memory_packs_payload: dict[str, Any] = {
+        "count_by_namespace": {},
+        "count_by_origin": {},
+        "count_by_namespace_kind": {},
+        "total_topic_count": 0,
+        "top_topics": [],
+        "untagged_memory_count": 0,
+        "import_freshness_non_null_count": 0,
+        "imported_packs_count": 0,
+        "exported_packs_count": 0,
+    }
+    if backend == "sqlite":
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                _sqlite_bootstrap_if_needed(conn)
+
+                namespace_rows = conn.execute(
+                    "SELECT namespace, COUNT(*) AS count FROM memories GROUP BY namespace ORDER BY count DESC, namespace ASC"
+                ).fetchall()
+                origin_rows = conn.execute(
+                    "SELECT origin, COUNT(*) AS count FROM memories GROUP BY origin ORDER BY count DESC, origin ASC"
+                ).fetchall()
+                kind_rows = conn.execute(
+                    """
+                    SELECT namespace, kind, COUNT(*) AS count
+                    FROM memories
+                    GROUP BY namespace, kind
+                    ORDER BY namespace ASC, count DESC, kind ASC
+                    """
+                ).fetchall()
+                topic_rows = conn.execute(
+                    """
+                    SELECT topic, COUNT(*) AS count
+                    FROM memory_topics
+                    GROUP BY topic
+                    ORDER BY count DESC, topic ASC
+                    LIMIT 20
+                    """
+                ).fetchall()
+                total_topic_count = int(conn.execute("SELECT COUNT(*) FROM memory_topics").fetchone()[0])
+                untagged_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM memories m
+                        LEFT JOIN memory_topics t ON t.memory_id = m.id
+                        WHERE t.memory_id IS NULL
+                        """
+                    ).fetchone()[0]
+                )
+                freshness_non_null_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM memories WHERE import_freshness IS NOT NULL AND TRIM(import_freshness) != ''"
+                    ).fetchone()[0]
+                )
+                imported_packs_count = int(conn.execute("SELECT COUNT(*) FROM imported_packs").fetchone()[0])
+                exported_packs_count = int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+
+                count_by_namespace: dict[str, int] = {}
+                for row in namespace_rows:
+                    namespace_key = str(row["namespace"] or DEFAULT_MEMORY_NAMESPACE)
+                    count_by_namespace[namespace_key] = int(row["count"] or 0)
+                count_by_origin: dict[str, int] = {}
+                for row in origin_rows:
+                    origin_key = str(row["origin"] or DEFAULT_MEMORY_ORIGIN)
+                    count_by_origin[origin_key] = int(row["count"] or 0)
+                count_by_namespace_kind: dict[str, dict[str, int]] = {}
+                for row in kind_rows:
+                    namespace_key = str(row["namespace"] or DEFAULT_MEMORY_NAMESPACE)
+                    kind_key = str(row["kind"] or "note")
+                    count_by_namespace_kind.setdefault(namespace_key, {})[kind_key] = int(row["count"] or 0)
+                top_topics = [
+                    {"topic": str(row["topic"] or ""), "count": int(row["count"] or 0)}
+                    for row in topic_rows
+                    if str(row["topic"] or "").strip()
+                ]
+                memory_packs_payload = {
+                    "count_by_namespace": count_by_namespace,
+                    "count_by_origin": count_by_origin,
+                    "count_by_namespace_kind": count_by_namespace_kind,
+                    "total_topic_count": total_topic_count,
+                    "top_topics": top_topics,
+                    "untagged_memory_count": untagged_count,
+                    "import_freshness_non_null_count": freshness_non_null_count,
+                    "imported_packs_count": imported_packs_count,
+                    "exported_packs_count": exported_packs_count,
+                }
+        except Exception as exc:
+            warnings.append(f"memory packs diagnostics unavailable: {type(exc).__name__}")
+    else:
+        count_by_namespace: dict[str, int] = {}
+        count_by_origin: dict[str, int] = {}
+        count_by_namespace_kind: dict[str, dict[str, int]] = {}
+        import_freshness_non_null_count = 0
+        for memory in memories:
+            namespace_key = memory_namespace(memory)
+            origin_key = memory_origin(memory)
+            kind_key = str(memory.get("kind") or "note")
+            count_by_namespace[namespace_key] = count_by_namespace.get(namespace_key, 0) + 1
+            count_by_origin[origin_key] = count_by_origin.get(origin_key, 0) + 1
+            kind_counts = count_by_namespace_kind.setdefault(namespace_key, {})
+            kind_counts[kind_key] = kind_counts.get(kind_key, 0) + 1
+            if memory_import_freshness(memory):
+                import_freshness_non_null_count += 1
+        memory_packs_payload = {
+            "count_by_namespace": count_by_namespace,
+            "count_by_origin": count_by_origin,
+            "count_by_namespace_kind": count_by_namespace_kind,
+            "total_topic_count": 0,
+            "top_topics": [],
+            "untagged_memory_count": memory_count,
+            "import_freshness_non_null_count": import_freshness_non_null_count,
+            "imported_packs_count": 0,
+            "exported_packs_count": 0,
+        }
+
     profile = mcp_profile()
     visible = exposed_tools(profile)
     available_actions = sorted(GATEWAY_ACTIONS)
@@ -9226,6 +11163,7 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         f"Last write: {memory_file_payload['last_write_iso']}  Last id: {memory_file_payload['last_memory_id']}",
         f"Events: {event_count} total, {recent_event_count} in last 24h, events_fts={'on' if events_fts_enabled else 'off'}",
         f"Aliases: active_concepts={int(aliases_payload.get('active_concept_count', 0))} active_aliases={int(aliases_payload.get('active_alias_count', 0))} pending_proposals={int(aliases_payload.get('pending_proposal_count', 0))}",
+        f"Namespaces: {len(memory_packs_payload.get('count_by_namespace', {}))} namespaces, {int(memory_packs_payload.get('total_topic_count', 0))} topic rows, imported_packs={int(memory_packs_payload.get('imported_packs_count', 0))}, exported_packs={int(memory_packs_payload.get('exported_packs_count', 0))}",
         f"Kinds: {kind_summary}",
         f"Drift: {drift_value:.2f} ({drift_interp})  Salience: {salience_text}  Search: {search_backend}",
         f"IDF: project={idf_project.get('status', 'cold')} active={'yes' if idf_project.get('active') else 'no'} domains_ready={idf_domains_ready} mode={idf_state.get('mode', idf_mode())}",
@@ -9280,6 +11218,7 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
         "drift": drift,
         "salience": salience_payload,
         "aliases": aliases_payload,
+        "memory_packs": memory_packs_payload,
         "idf": {
             "mode": str(idf_state.get("mode", idf_mode())),
             "available": bool(idf_state.get("available", False)),
@@ -9308,8 +11247,14 @@ GATEWAY_ACTIONS: dict[str, Any] = {
     "doctor": mnemo_doctor,
     "search": search_memories,
     "salience_check": memory_salience_check,
+    "pack_preview": pack_preview,
+    "pack_redaction_preview": pack_redaction_preview,
+    "pack_export": pack_export,
     "record": record_memory,
     "alias_hint": memory_alias_hint,
+    "topic_add": topic_add,
+    "topic_remove": topic_remove,
+    "topic_list": topic_list,
     "link": memory_link,
     "recall": memory_recall,
     "get": memory_get,
@@ -9377,7 +11322,7 @@ TOOLS = [
         "title": "Mnemo Memory Gateway",
         "description": (
             "Mnemo project-memory gateway; not Copilot native memory. "
-            "Actions: doctor, record, alias_hint, search, recall, get, link, export, "
+            "Actions: doctor, record, alias_hint, topic_add, topic_remove, topic_list, pack_preview, pack_redaction_preview, pack_export, search, recall, get, link, export, "
             "recent_events, search_events, get_event, memory_events, "
             "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures, propose_aliases, list_alias_proposals, approve_alias, reject_alias_proposal, list_aliases, disable_alias, disable_alias_concept), "
             "inspect, lookup_symbol, salience_check, update, delete, recent."
@@ -9388,7 +11333,7 @@ TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": sorted(GATEWAY_ACTIONS),
-                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept, or the top-level aliases backfill_signatures and consolidate_full for those v0.12 actions.",
+                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept; topic_add/topic_remove/topic_list/pack_preview/pack_redaction_preview/pack_export are first-class actions.",
                 },
                 "params": {
                     "type": "object",
@@ -9407,12 +11352,24 @@ _TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
         "limit": "Range 1-20. When omitted, 5 is used.",
         "include_deleted": "When omitted, false is used.",
         "include_superseded": "When omitted, false is used.",
+        "namespace": "Optional namespace filter. Cannot be combined with namespaces.",
+        "namespaces": "Optional namespace list filter. Defaults to ['local'] when namespace filters are omitted.",
+        "include_imported": "When true, trusted imported namespaces are added to scope (sqlite backend).",
+        "include_quarantine": "When true, quarantine namespaces are added to scope (sqlite backend).",
+        "origin": "Optional origin filter applied only when provided.",
+        "origins": "Optional origin-list filter applied only when provided.",
         "max_tokens": "Range 1-100000 when provided.",
     },
     "mnemo_salience_check": {
         "limit": "Range 1-50. When omitted, 5 is used.",
         "include_deleted": "When omitted, false is used.",
         "include_superseded": "When omitted, false is used.",
+        "namespace": "Optional namespace filter. Cannot be combined with namespaces.",
+        "namespaces": "Optional namespace list filter. Defaults to ['local'] when namespace filters are omitted.",
+        "include_imported": "When true, trusted imported namespaces are added to scope (sqlite backend).",
+        "include_quarantine": "When true, quarantine namespaces are added to scope (sqlite backend).",
+        "origin": "Optional origin filter applied only when provided.",
+        "origins": "Optional origin-list filter applied only when provided.",
         "threshold": "When omitted, 0.70 is used. Range 0.0-1.0.",
     },
     "mnemo_record": {
@@ -9421,6 +11378,8 @@ _TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
         "references": "When omitted, an empty list is used.",
         "linked_ids": "When omitted, an empty list is used.",
         "evidence_ids": "When omitted, an empty list is used.",
+        "namespace": "When omitted, local is used.",
+        "origin": "When omitted, local is used.",
         "touched_files": "Optional array of workspace file paths touched during this turn.",
         "pinned": "When omitted, false is used.",
     },
@@ -9433,6 +11392,12 @@ _TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
         "max_context_blocks": "Range 1-20. When omitted, 5 is used for agent mode.",
         "max_hippocampus": "Range 1-20. When omitted, 8 is used.",
         "max_feedback": "Range 1-30. When omitted: 5 in startup mode, 10 in agent mode.",
+        "namespace": "Optional namespace filter. Cannot be combined with namespaces.",
+        "namespaces": "Optional namespace list filter. Defaults to ['local'] when namespace filters are omitted.",
+        "include_imported": "When true, trusted imported namespaces are added to scope (sqlite backend).",
+        "include_quarantine": "When true, quarantine namespaces are added to scope (sqlite backend).",
+        "origin": "Optional origin filter applied only when provided.",
+        "origins": "Optional origin-list filter applied only when provided.",
         "include_pinned": "When omitted, true is used in startup mode.",
         "include_recent_logs": "When omitted, false is used in agent mode.",
     },
@@ -9445,6 +11410,12 @@ _TOOL_FIELD_CONSTRAINT_NOTES: dict[str, dict[str, str]] = {
         "limit": "Range 1-20. When omitted, 8 is used.",
         "include_deleted": "When omitted, false is used.",
         "include_superseded": "When omitted, false is used.",
+        "namespace": "Optional namespace filter. Cannot be combined with namespaces.",
+        "namespaces": "Optional namespace list filter. Defaults to ['local'] when namespace filters are omitted.",
+        "include_imported": "When true, trusted imported namespaces are added to scope (sqlite backend).",
+        "include_quarantine": "When true, quarantine namespaces are added to scope (sqlite backend).",
+        "origin": "Optional origin filter applied only when provided.",
+        "origins": "Optional origin-list filter applied only when provided.",
         "max_tokens": "Range 1-100000 when provided.",
     },
     "mnemo_inspect": {
@@ -9550,7 +11521,7 @@ def handle_request(message: dict[str, Any]) -> None:
                 },
                 "instructions": (
                     "Use the single mnemo gateway tool with action plus optional params. "
-                    "Common actions: doctor, search, record, alias_hint, recall, get, link, export, "
+                    "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, pack_preview, pack_redaction_preview, recall, get, link, export, "
                     "recent_events, search_events, get_event, memory_events, compact_context, "
                     "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
                     "Do not look for individual mnemo_* tools; "

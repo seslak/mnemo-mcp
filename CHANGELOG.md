@@ -1,31 +1,183 @@
 # Changelog
 
+## 0.17.0
+
+### Added
+
+- Memory Packs Phase 2c export action:
+  - `pack_export`
+- Local ZIP pack export with required members:
+  - `manifest.json`
+  - `content/memories.jsonl`
+  - `content/topics.json`
+  - `content/file_fingerprints.json`
+  - `provenance/origin.json`
+  - `provenance/redactions.json`
+- Mandatory baseline-v1 redaction during export (no reliance on previous dry-run output).
+- SHA-256 content-hash manifest block covering content/provenance members (excluding `manifest.json` itself).
+- `exported_packs` audit-row write on successful export.
+
+### Changed
+
+- `pack_preview` remains strict schema-only and does not bootstrap memory content on empty/fresh SQLite DBs.
+- Pack exports now use pack-local row identifiers (`ctx_###`, `hip_###`) instead of source DB memory IDs.
+- Export flow uses atomic temp ZIP write, validation, audit insert, and final `os.replace` move.
+
+### Compatibility / Scope
+
+- Phase 2c exports are unsigned development packs only and require `allow_unsigned=true`.
+- Export policy is strict in this phase:
+  - exportable kinds: `context_block`, `hippocampus_entry`
+  - preview-only kinds (`interaction_log`, `agent_feedback`) are rejected for export
+- No pack import, signing, trust-store policy, or promotion workflows are added in this phase.
+
+## 0.16.0
+
+### Added
+
+- Memory Packs Phase 2b read-only redaction dry-run action:
+  - `pack_redaction_preview`
+- Baseline built-in redaction categories for dry-run counting and sampling:
+  - `private_key_header`
+  - `jwt`
+  - `aws_access_key`
+  - `email`
+  - `user_path`
+  - `ipv4`
+- Deterministic bounded redaction output with:
+  - selected row count and limited row IDs
+  - affected-row and per-category match counts
+  - rows-per-category counts
+  - bounded redacted sample previews
+  - structured warning codes
+
+### Changed
+
+- `pack_preview` now uses schema-only initialization and does not trigger content bootstrap/import on empty SQLite stores.
+- `pack_preview` and `pack_redaction_preview` share the same selection semantics (topic/kind/namespace/origin/date/touched_paths filters).
+
+### Compatibility
+
+- `pack_redaction_preview` is dry-run only and read-only.
+- No pack ZIP export/import, redaction file generation, signing, trust-store policy, or promotion flows are added in this phase.
+- Baseline ruleset intentionally does not cover all secret formats.
+
+## 0.15.0
+
+### Added
+
+- Memory Packs Phase 2a read-only selection action:
+  - `pack_preview`
+- `pack_preview` filter support:
+  - `topics` via `memory_topics` joins
+  - `kinds` (default preview kinds: `context_block`, `hippocampus_entry`)
+  - `namespace` / `namespaces` with existing Phase 1 scope rules
+  - `include_imported` / `include_quarantine`
+  - `origin` / `origins` (explicit-only origin restriction)
+  - `created_after` / `created_before` timestamp filters
+  - `touched_paths` via `memory_files` joins
+- Deterministic, bounded preview payloads with:
+  - total/limited row selection metadata
+  - namespace/origin/kind/topic counts
+  - top referenced files summary
+  - per-kind bounded row samples
+  - structured warnings
+
+### Changed
+
+- Gateway surface now exposes `pack_preview` as a first-class `mnemo` action.
+- `pack_preview` returns placeholder alias preview fields in Phase 2a:
+  - `referenced_alias_count = 0`
+  - `top_alias_concepts = []`
+
+### Compatibility
+
+- `pack_preview` is read-only and does not write pack artifacts.
+- No new schema migration in 0.15.0; Phase 1 schema remains current.
+- No export/import/redaction/signing/trust/promotion workflows are added in this phase.
+
+## 0.14.0
+
+### Added
+
+- Memory Packs Phase 1 substrate:
+  - `memories.namespace` (`TEXT NOT NULL DEFAULT 'local'`)
+  - `memories.origin` (`TEXT NOT NULL DEFAULT 'local'`)
+  - `memories.import_freshness` (`TEXT`, nullable placeholder)
+- Topic metadata table:
+  - `memory_topics(memory_id, topic, created_at, source)`
+  - `idx_memory_topics_topic`
+  - `idx_memory_topics_memory_id`
+- Placeholder pack registries for future phases:
+  - `imported_packs`
+  - `exported_packs`
+- First-class topic actions:
+  - `topic_add`
+  - `topic_remove`
+  - `topic_list`
+
+### Changed
+
+- Retrieval paths now support namespace-aware filtering:
+  - default namespace scope is `['local']`
+  - `include_imported=true` adds trusted imported namespaces
+  - `include_quarantine=true` adds quarantine namespaces
+  - origin filtering is applied only when `origin`/`origins` is explicitly supplied
+- Retrieval result metadata now includes:
+  - `namespace`
+  - `origin`
+  - `import_freshness`
+  - derived `pack_id` from namespace prefix when applicable
+- `doctor` now reports Memory Packs Phase 1 diagnostics:
+  - counts by namespace/origin
+  - kind breakdown per namespace
+  - topic totals and top topics
+  - untagged memory count
+  - import-freshness non-null count
+  - imported/exported pack registry counts
+
+### Compatibility
+
+- Migration is additive and idempotent (no table rewrites).
+- Existing rows default to `namespace='local'`, `origin='local'`, and `import_freshness=NULL`.
+- Legacy rows remain retrieval-neutral unless explicit namespace/origin filters are supplied.
+- No topic backfill is performed.
+
+### Not In Scope (Phase 1)
+
+- No pack zip export/import workflow.
+- No redaction, signing, trust-store policy, promotion, or alias-pack handling.
+- No FTS schema changes or FTS table rebuild for namespace/origin columns.
+
 ## 0.13.5
 
 ### Added
 
-- Git-aware metadata for newly written SQLite memories:
+- Git-aware memory metadata on new SQLite writes:
   - `git_sha`
   - `git_branch`
   - `git_dirty`
-- New `memory_files` table for touched-file fingerprints associated with memory rows.
-- New `git_context.py` helper module for safe git context and file fingerprint capture.
-- Optional `record.params.touched_files` support for linking new memories to files touched during a run.
+- New SQLite table for per-memory touched-file fingerprints:
+  - `memory_files(memory_table, memory_id, path, file_sha)`
+  - `idx_memory_files_path`
+- `record` support for optional `touched_files` path arrays, used for git-aware file fingerprint persistence.
 
 ### Changed
 
-- Retrieval now applies a post-score freshness multiplier for git-aware memories with file fingerprints:
-  - legacy row / `git_sha IS NULL`: `1.0`
-  - unchanged touched files: `1.0`
-  - changed touched file: `0.7`
-  - deleted or missing touched file: `0.3`
-  - multiple touched files use the minimum multiplier
+- Retrieval now applies a post-score freshness multiplier for file-linked rows:
+  - `git_sha IS NULL` -> `1.0`
+  - all touched files unchanged -> `1.0`
+  - any touched file changed but present -> `0.7`
+  - any touched file missing/deleted/renamed away -> `0.3`
+  - mixed file states use the minimum multiplier.
+- Non-git repositories and git command failures remain non-fatal and fall back to neutral behavior.
+- Removed alias-curation prompt file coupling from Mnemo test coverage so standalone Mnemo no longer depends on external prompt-library assets.
 
 ### Compatibility
 
-- No backfill is performed. Existing rows remain neutral with `NULL` git metadata.
-- Non-git folders, unavailable git commands, or git failures are safe and non-fatal.
-- Legacy-row retrieval behavior is preserved unless a row is naturally rewritten with git-aware metadata.
+- Existing SQLite files migrate in place with idempotent schema updates.
+- Legacy rows remain neutral (`git_sha` stays `NULL`), preserving historical retrieval behavior unless rows are naturally rewritten.
+- No backfill is performed for git-aware metadata.
 
 ## 0.13.4
 
@@ -83,8 +235,6 @@
   - `alias_hint` for explicit failed-query to canonical-query alias evidence
 - New maintenance sub-action:
   - `maintenance(action="propose_aliases")`
-- New workflow prompt:
-  - `workflow.alias-curation.prompt.md` in the agentic prompt library
 
 ### Changed
 

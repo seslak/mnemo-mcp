@@ -8,7 +8,7 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.13.5**
+Current version: **0.17.0**
 
 Runtime requirements:
 
@@ -28,12 +28,16 @@ Mnemo is local-first. It does not require a cloud service, vector database, exte
 - Structured memory layers for agentic systems
 - Signature-at-write-time duplicate detection and consolidation support
 - Candidate-based consolidation by default, with full O(n²) scan gated behind explicit confirmation
-- Maintenance actions for log compaction, consolidation, JSON import, signature backfill, and alias proposal/curation lifecycle
+- Maintenance actions for log compaction, consolidation, JSON import, signature backfill, and alias proposal analysis
+- Git-aware memory metadata on new writes (`git_sha`, `git_branch`, `git_dirty`) with touched-file tracking
+- Freshness-aware retrieval multiplier in SQLite mode for file-linked memories
+- Memory Packs Phase 1 substrate: namespaces/origins, topic metadata, and namespace-aware retrieval filters
+- Memory Packs Phase 2a read-only pack selection preview (`pack_preview`)
+- Memory Packs Phase 2b redaction dry-run preview (`pack_redaction_preview`)
+- Memory Packs Phase 2c unsigned local ZIP export (`pack_export`)
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
 - Automatic local IDF activation when project/domain corpus maturity thresholds are met
-- SQLite-backed alias proposals, approved alias lifecycle, and runtime alias consumption
-- Git-aware memory metadata and freshness reweighting for memories tied to touched files
 - Lightweight symbol lookup under a configured workspace root
 
 ## Non-goals
@@ -46,13 +50,169 @@ Mnemo is not:
 - a secrets manager
 - a replacement for tests or source control
 
+## Git-aware memory (0.13.5)
+
+New memory writes in SQLite mode attempt to capture repository context:
+
+- `git_sha` (HEAD commit)
+- `git_branch` (current branch)
+- `git_dirty` (`1` when working tree has local changes, else `0`)
+
+When `record` receives `touched_files`, Mnemo records per-file digests in `memory_files`:
+
+- preferred: git blob SHA at `HEAD:path`
+- fallback: current file digest from `git hash-object` (or BLAKE2b-128 bytes digest when git hashing is unavailable)
+
+Retrieval applies a post-score freshness multiplier:
+
+- `git_sha` is `NULL` (legacy or non-git write): `1.0`
+- all touched files unchanged: `1.0`
+- any touched file changed but still present: `0.7`
+- any touched file missing/deleted/renamed away: `0.3`
+- mixed file states: minimum multiplier wins
+
+Safety and compatibility:
+
+- Non-git folders and git command failures are non-fatal.
+- No backfill is performed for legacy rows.
+- Legacy rows remain neutral (`1.0`) to preserve prior retrieval behavior.
+
+## Memory Packs Phase 1 (0.14.0)
+
+Phase 1 adds the SQLite substrate for future memory-pack workflows without enabling pack import/export policy workflows yet.
+
+New memory metadata columns on `memories`:
+
+- `namespace` (defaults to `local`)
+- `origin` (defaults to `local`)
+- `import_freshness` (nullable placeholder for later import phases)
+
+New SQLite tables:
+
+- `memory_topics(memory_id, topic, created_at, source)`
+- `imported_packs` (placeholder registry)
+- `exported_packs` (placeholder registry)
+
+New first-class topic actions:
+
+- `topic_add`
+- `topic_remove`
+- `topic_list`
+
+Namespace-aware retrieval filters are now available across retrieval paths:
+
+- default namespace scope is `local`
+- `include_imported=true` adds trusted imported namespaces
+- `include_quarantine=true` adds quarantine namespaces (never auto-included otherwise)
+- origin filtering is applied only when `origin`/`origins` is explicitly provided
+
+Freshness multiplier rules remain unchanged and are still applied after lexical/IDF scoring:
+
+- legacy row or `git_sha=NULL`: `1.0`
+- all touched files unchanged: `1.0`
+- any touched file changed: `0.7`
+- any touched file missing/deleted: `0.3`
+- mixed file states use the minimum multiplier
+
+Compatibility notes:
+
+- existing rows default to `namespace='local'`, `origin='local'`, `import_freshness=NULL`
+- legacy rows remain retrieval-neutral unless explicitly filtered
+- no backfill is performed for topic metadata
+- Phase 1 does **not** add pack export/import, redaction, signing, trust-store policy, or promotion flows
+
+## Memory Packs Phase 2a (0.15.0)
+
+Phase 2a adds a read-only selection engine for future pack export workflows via `pack_preview`.
+
+`pack_preview` supports deterministic preview filtering by:
+
+- `topics` (via `memory_topics` joins, not body text)
+- `kinds` (default preview kinds: `context_block`, `hippocampus_entry`)
+- `namespace` / `namespaces` with existing Phase 1 scope semantics
+- `include_imported` / `include_quarantine`
+- `origin` / `origins` (applied only when explicitly provided)
+- `created_after` / `created_before`
+- `touched_paths` (via `memory_files` joins)
+
+Preview output includes:
+
+- true selected row count and bounded row ID list
+- counts by kind, namespace, origin, and top topics
+- top referenced files from `memory_files`
+- bounded per-kind samples with compact text previews
+- structured warnings (for example, preview-policy warnings for `interaction_log`/`agent_feedback`)
+
+Phase 2a is intentionally read-only:
+
+- no `exported_packs` writes
+- no pack files
+- no zip export/import
+- no redaction/signing/trust/promotion logic
+
+## Memory Packs Phase 2b (0.16.0)
+
+Phase 2b adds a read-only redaction dry-run action: `pack_redaction_preview`.
+
+Phase 2b behavior:
+
+- reuses the same pack selection semantics as `pack_preview`
+- scans selected rows for baseline built-in redaction categories
+- returns category counts and bounded redacted samples
+- never returns original matched sensitive literals in structured output
+
+Built-in baseline categories in this phase:
+
+- `private_key_header`
+- `jwt`
+- `aws_access_key`
+- `email`
+- `user_path`
+- `ipv4`
+
+Compatibility and scope:
+
+- `pack_preview` no longer performs content bootstrap on empty/fresh SQLite DBs
+- schema creation/migration may still occur on first open
+- no ZIP export/import/signing/trust/promotion flows
+- baseline ruleset is intentionally limited and does not cover all secret formats (for example IPv6 and many provider-specific token formats)
+
+## Memory Packs Phase 2c (0.17.0)
+
+Phase 2c adds a local ZIP export action: `pack_export`.
+
+Key behavior:
+
+- requires `allow_unsigned=true` because signing is not implemented yet
+- reuses `pack_preview` selection semantics (topic/kind/namespace/origin/date/touched_paths filters)
+- export policy is strict in this phase:
+  - exportable kinds: `context_block`, `hippocampus_entry`
+  - non-exportable kinds (`interaction_log`, `agent_feedback`) fail early
+- mandatory baseline-v1 redaction runs again during export (dry-run output is not trusted)
+- exported content uses pack-local row IDs (`ctx_###`, `hip_###`), not source DB `mem_*` IDs
+- writes a ZIP with required members:
+  - `manifest.json`
+  - `content/memories.jsonl`
+  - `content/topics.json`
+  - `content/file_fingerprints.json`
+  - `provenance/origin.json`
+  - `provenance/redactions.json`
+- `manifest.json` includes a SHA-256 `content_hash` over covered content/provenance members
+- successful exports write one `exported_packs` audit row
+- default output directory is `state/mnemo/packs/exports/`
+
+Scope limits in 0.17.0:
+
+- unsigned development packs only
+- no import, signing, trust-store policy, or promotion workflows
+- baseline redaction ruleset is intentionally incomplete and not a full DLP system
+
 ## Repository layout
 
 ```text
 mnemo-mcp/
 ├── server.py
 ├── salience_loader.py
-├── git_context.py
 ├── memory.example.json
 ├── smoke_test.py
 ├── test_server.py
@@ -87,84 +247,7 @@ Example VS Code MCP config when Mnemo is checked out as `mnemo-mcp/` inside your
 }
 ```
 
-If you copy this repository into your project as a folder named `mnemo/`, use:
-
-```json
-"args": ["${workspaceFolder}/mnemo/server.py"]
-```
-
 More example configs are in [`examples/`](examples/).
-
-## Local storage
-
-Mnemo uses SQLite by default.
-
-```text
-state/mnemo/
-├── mnemo.sqlite              # primary store in SQLite mode
-├── memory.json               # legacy/import/export compatibility path
-└── exports/
-    ├── memory.jsonl
-    ├── hippocampus.md
-    ├── agent_feedback.md
-    └── startup_context_latest.md
-```
-
-SQLite remains copy/paste friendly because it is a single local file. You can copy `state/mnemo/` to move the memory with the project.
-
-`memory.json` is no longer the primary store when `MNEMO_STORE=sqlite`; it is retained as an import/export compatibility format.
-
-In SQLite mode, lifecycle/query events are stored in the SQLite `events` table. Legacy JSONL event/query files are imported when present and left on disk as legacy artifacts.
-
-## Git-aware memory freshness
-
-Mnemo 0.13.5 records lightweight git provenance on newly written SQLite memories when a repository is available. New rows are stamped with `git_sha`, `git_branch`, and `git_dirty`. When a write supplies `touched_files`, Mnemo stores per-file fingerprints in `memory_files`.
-
-Retrieval applies a post-score freshness multiplier for memories with touched files:
-
-| Condition | Multiplier |
-|---|---:|
-| Legacy row or no git SHA | `1.0` |
-| All touched files unchanged | `1.0` |
-| Any touched file changed but still exists | `0.7` |
-| Any touched file is missing/deleted | `0.3` |
-
-For memories linked to multiple files, Mnemo uses the minimum multiplier. Non-git folders, unavailable git commands, or git failures are safe and non-fatal; Mnemo writes the memory and treats freshness as neutral. There is no backfill: old rows keep `NULL` git metadata and preserve previous retrieval behavior.
-
-## Environment variables
-
-| Variable | Description |
-|---|---|
-| `MNEMO_STORE` | Storage backend: `sqlite` or `json`. Default: `sqlite`. |
-| `MNEMO_FILE` | Compatibility/import/export path for `memory.json`. Default: `<workspace>/state/mnemo/memory.json`. |
-| `MNEMO_SQLITE_FILE` | SQLite path when `MNEMO_STORE=sqlite`. Default: `<workspace>/state/mnemo/mnemo.sqlite`. |
-| `MNEMO_WORKSPACE_ROOT` | Workspace root for `lookup_symbol`. Default: current working directory. |
-| `MNEMO_MAX_MEMORIES` | Total memory cap including retired entries. Default: `5000`. |
-| `MNEMO_MAX_SEARCH_RESULTS` | Server-side cap for `search` results. Default: `20`. |
-| `MNEMO_MAX_RECENT_RESULTS` | Server-side cap for `recent` results. Default: `50`. |
-| `MNEMO_MAX_CHARS_PER_ITEM` | Per-item preview cap for search/recall/get preview mode. Default: `1200`. |
-| `MNEMO_MAX_TOTAL_CHARS` | Total preview cap for bundled search/recall output. Default: `12000`. |
-| `MNEMO_DECAY` | Set to `0` to disable time-decay scoring. Default: `1`. |
-| `MNEMO_LOG_EVENTS` | In JSON mode, set to `0` to disable `events.jsonl`. In SQLite mode, lifecycle events are stored in SQLite. Default: `1`. |
-| `MNEMO_LOG_QUERIES` | In JSON mode, set to `0` to disable `queries.jsonl`. In SQLite mode, query events are stored in SQLite. Default: `1`. |
-| `MNEMO_LOG_ARCHIVE` | Set to `0` to disable permanent archiving of rotated query/event logs. Default: `1`. |
-| `MNEMO_CONSOLIDATE_THRESHOLD` | Near-duplicate consolidation threshold. Default: `0.7`. |
-| `MNEMO_MISS_TOP_SCORE_THRESHOLD` | Miss threshold used by search-like event tagging. Default: `0.15`. |
-| `MNEMO_SYMBOL_TTL_SECONDS` | Symbol-index walk TTL. Default: `5`. |
-| `MNEMO_MAX_FILES_SCANNED` | Max files scanned by `lookup_symbol`. Default: `5000`. |
-| `MNEMO_MAX_TOTAL_BYTES` | Max total bytes scanned by `lookup_symbol`. Default: `52428800`. |
-| `MNEMO_MAX_FILE_BYTES` | Max single file bytes read by `lookup_symbol`. Default: `1048576`. |
-| `MNEMO_IDF_MODE` | IDF mode: `auto`, `off`, or `force`. Default: `auto`. |
-| `MNEMO_IDF_MIN_DOCUMENTS` | Project IDF minimum eligible memory records. Default: `200`. |
-| `MNEMO_IDF_MIN_UNIQUE_TERMS` | Project IDF minimum unique normalized terms. Default: `1000`. |
-| `MNEMO_IDF_MIN_TOTAL_TOKENS` | Project IDF minimum total normalized tokens. Default: `10000`. |
-| `MNEMO_IDF_DOMAIN_MIN_DOCUMENTS` | Domain IDF minimum eligible memory records. Default: `50`. |
-| `MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS` | Domain IDF minimum unique normalized terms. Default: `300`. |
-| `MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS` | Domain IDF minimum total normalized tokens. Default: `3000`. |
-| `MNEMO_IDF_MIN_TEXT_TOKENS` | Minimum tokens per memory included in the IDF corpus. Default: `5`. |
-| `AGENT_SALIENCE_HOME` | Optional path to local `agent-salience` checkout. |
-
-`MNEMO_MCP_PROFILE` is ignored. Mnemo always exposes one public gateway tool.
 
 ## MCP gateway model
 
@@ -189,6 +272,9 @@ Supported top-level actions:
 - `doctor`
 - `search`
 - `salience_check`
+- `pack_preview`
+- `pack_redaction_preview`
+- `pack_export`
 - `record`
 - `alias_hint`
 - `link`
@@ -209,7 +295,7 @@ Supported top-level actions:
 - `consolidate_full`
 - `lookup_symbol`
 
-`backfill_signatures` and `consolidate_full` are also available as `maintenance` sub-actions.
+`backfill_signatures` and `consolidate_full` are also available as top-level aliases. Alias lifecycle actions are available as `maintenance` sub-actions.
 
 ### Event history actions
 
@@ -231,13 +317,13 @@ Supported top-level actions:
 
 ### `doctor`
 
-Returns storage, schema, health, export, FTS, signature, salience, IDF, event-history, and alias diagnostics.
+Returns storage, schema, health, export, FTS, salience, and IDF diagnostics.
 
 ```json
 {"action":"doctor"}
 ```
 
-In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, FTS status, signature warnings, and `idf` activation status, plus SQLite alias table/proposal counts.
+In SQLite mode, use `doctor` to verify `backend`, `sqlite_file_exists`, `sqlite_size_bytes`, `memory_count`, `newest_memory`, `fts`, signature warnings, and `idf` activation status.
 
 ### `record`
 
@@ -247,7 +333,7 @@ Records a project memory of any supported kind.
 {"action":"record","params":{"kind":"decision","text":"Run validation commands before handoff.","source":"team note","tags":["validation"],"pinned":true}}
 ```
 
-Structured memory aliases are accepted by the generic record action:
+Structured aliases are accepted by the generic record action:
 
 ```json
 {"action":"record","params":{"kind":"interaction_log","summary":"Session handoff and active constraints.","role":"coordinator","agent_id":"coord_1"}}
@@ -265,25 +351,23 @@ Structured memory aliases are accepted by the generic record action:
 {"action":"record","params":{"kind":"agent_feedback","text":"Prefer middleware-first auth checks.","feedback_type":"good_pattern","agent_id":"spec_auth","domain":"auth"}}
 ```
 
-### `alias_hint`
-
-Records explicit alias evidence linking failed wording to successful canonical wording. Alias hints feed the same proposal pipeline as repeated miss events.
-
-```json
-{"action":"alias_hint","params":{"domain":"agentic","canonical":"memory recall pipeline","candidate_alias":"hippocampus bridge","original_query":"hippocampus bridge","successful_query":"memory recall pipeline","confidence":"high","include_in_salience":true}}
-```
-
 ### `search`
 
-Searches project memory with bounded output. Active approved aliases from SQLite can expand query wording and contribute bounded alias diagnostics.
+Searches project memory with bounded output.
 
 ```json
 {"action":"search","params":{"query":"validation commands before handoff","limit":5,"phase":"implementation","max_tokens":2000}}
 ```
 
+Search-like actions (`search`, `recall`, and `salience_check`) emit miss-aware query events:
+
+- miss when `result_count == 0` or `top_score < MNEMO_MISS_TOP_SCORE_THRESHOLD`
+- typed event fields include `result_count`, `success`, and `top_score`
+- miss events are marked `include_in_salience=1` for downstream alias analysis
+
 ### `recall`
 
-Returns startup or specialist recall bundles. Query-based recall consumes active approved aliases from SQLite when available.
+Returns startup or specialist recall bundles.
 
 ```json
 {"action":"recall","params":{"mode":"startup","role":"coordinator","agent_id":"coord_1","query":"release handoff","recent_logs":20}}
@@ -293,13 +377,17 @@ Returns startup or specialist recall bundles. Query-based recall consumes active
 {"action":"recall","params":{"mode":"agent","agent_id":"spec_auth","role":"specialist","domain":"auth","task":"review auth middleware"}}
 ```
 
+### `alias_hint`
+
+Records explicit alias evidence linking failed wording to successful canonical wording.
+
+```json
+{"action":"alias_hint","params":{"domain":"agentic","canonical":"memory recall pipeline","candidate_alias":"hippocampus bridge","original_query":"hippocampus bridge","successful_query":"memory recall pipeline","confidence":"high","include_in_salience":true}}
+```
+
 ### `get`
 
 Retrieves one memory by id. Use this when a search/recall preview is not enough.
-
-```json
-{"action":"get","params":{"id":"mem_123","full":false}}
-```
 
 ```json
 {"action":"get","params":{"id":"mem_123","full":true}}
@@ -325,20 +413,11 @@ Writes readable exports.
 {"action":"export","params":{"format":"hippocampus_markdown"}}
 ```
 
-```json
-{"action":"export","params":{"format":"agent_feedback_markdown"}}
-```
-
-Default outputs include:
-
-- `state/mnemo/exports/memory.jsonl`
-- `state/mnemo/exports/hippocampus.md`
-- `state/mnemo/exports/agent_feedback.md`
-- `state/mnemo/exports/startup_context_latest.md`
+Default outputs go under `state/mnemo/exports/`.
 
 ### `compact_context`
 
-Builds a prompt-ready memory context block. Query-based context compaction consumes active approved aliases from SQLite when available.
+Builds a prompt-ready memory context block.
 
 ```json
 {"action":"compact_context","params":{"query":"change the auth flow","limit":8,"phase":"implementation","max_tokens":2000}}
@@ -346,7 +425,7 @@ Builds a prompt-ready memory context block. Query-based context compaction consu
 
 ### `maintenance`
 
-Maintenance actions include:
+Maintenance sub-actions:
 
 - `compact_logs`
 - `consolidate`
@@ -361,20 +440,14 @@ Maintenance actions include:
 - `disable_alias`
 - `disable_alias_concept`
 
-```json
-{"action":"maintenance","params":{"action":"compact_logs","older_than_count":20,"max_logs":50,"dry_run":true}}
-```
-
-```json
-{"action":"maintenance","params":{"action":"consolidate","threshold":0.7,"dry_run":true,"max_candidates_per_memory":100}}
-```
-
-```json
-{"action":"maintenance","params":{"action":"import_json","path":"state/mnemo/memory.json","dry_run":true}}
-```
+Examples:
 
 ```json
 {"action":"maintenance","params":{"action":"backfill_signatures","dry_run":true}}
+```
+
+```json
+{"action":"maintenance","params":{"action":"consolidate","dry_run":true,"max_candidates_per_memory":100}}
 ```
 
 ```json
@@ -385,12 +458,12 @@ Maintenance actions include:
 {"action":"maintenance","params":{"action":"propose_aliases","window_days":30,"min_recurrence":3,"include_hints":true,"dry_run":true}}
 ```
 
-`propose_aliases` supports dry-run preview and SQLite persistence:
+The default `consolidate` action is candidate-based. The O(n²) full scan is only available through `consolidate_full` with `confirm_full_scan:true`.
 
-- `dry_run=true`: returns proposals without persisting them
+`propose_aliases` supports dry run and persistence:
+
+- `dry_run=true`: returns proposals but does not persist
 - `dry_run=false`: persists pending proposals in SQLite (`alias_proposals`, `alias_proposal_events`)
-
-Proposals returned from `dry_run=true` are preview-only. Approval/rejection by `proposal_id` requires a `dry_run=false` persistence pass first.
 
 ```json
 {"action":"maintenance","params":{"action":"list_alias_proposals","status":"pending","domain":"agentic","limit":50}}
@@ -403,8 +476,6 @@ Proposals returned from `dry_run=true` are preview-only. Approval/rejection by `
 ```json
 {"action":"maintenance","params":{"action":"reject_alias_proposal","proposal_id":"alias-prop-...","reason":"generic wording"}}
 ```
-
-The default `consolidate` action is candidate-based. The O(n²) full scan is only available through `consolidate_full` with `confirm_full_scan:true`.
 
 ### Top-level maintenance aliases
 
@@ -442,7 +513,7 @@ Optional deterministic salience diagnostics when Agent Salience is available. Wh
 {"action":"salience_check","params":{"text":"auth middleware decisions","limit":5,"candidate_limit":500,"max_scored":100}}
 ```
 
-`salience_check` is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, and scores only bounded survivors. Candidate generation is intentionally unchanged by IDF activation.
+`salience_check` is candidate-limited. In SQLite mode it uses FTS when available, then signature overlap, and scores only bounded survivors. Candidate generation is unchanged in this patch.
 
 When IDF is active, Mnemo uses IDF-dominant weights:
 
@@ -451,67 +522,28 @@ When IDF is active, Mnemo uses IDF-dominant weights:
 - `cosine: 0.05`
 - `jaccard: 0.05`
 
-### `update`, `delete`, and `recent`
+The added `idf_jaccard` (weighted Jaccard/Tanimoto using corpus IDF weights) suppresses common-word overlap false positives. When IDF is cold/off/unavailable, lexical scoring remains active.
 
-Advanced actions are also available through the gateway:
+## Local storage
 
-```json
-{"action":"update","params":{"id":"mem_123","tags":["release"]}}
+Mnemo uses SQLite by default.
+
+```text
+state/mnemo/
+├── mnemo.sqlite              # primary store in SQLite mode
+├── memory.json               # legacy/import/export compatibility path
+└── exports/
+    ├── memory.jsonl
+    ├── hippocampus.md
+    ├── agent_feedback.md
+    └── startup_context_latest.md
 ```
 
-```json
-{"action":"delete","params":{"id":"mem_123","reason":"obsolete"}}
-```
-
-```json
-{"action":"recent","params":{"limit":10}}
-```
-
-## Structured memory layers
-
-Mnemo uses neutral, reusable memory kinds:
-
-- `interaction_log`: short continuity notes from recent work
-- `context_block`: larger linked memory artifacts
-- `hippocampus_entry`: durable project/system knowledge
-- `agent_feedback`: feedback scoped to an `agent_id`, `role`, or `domain`
-
-Mnemo does not hardcode personal agent names. Use metadata fields such as:
-
-- `agent_id`
-- `role`
-- `scope`
-- `domain`
-- `authority`
-- `retention`
-- `confidence`
-- `linked_ids`
-- `parent_id`
-- `source_run_id`
-
-## Memory kinds
-
-Supported kinds:
-
-- `invariant`: rules that should hold across tasks
-- `decision`: agreed choices that should guide later edits
-- `failed_approach`: attempts that should not be repeated without a new reason
-- `test_result`: notable pass/fail outcomes and command evidence
-- `command`: exact commands that matter for this repo
-- `path`: important files, folders, endpoints, or generated locations
-- `note`: general notes
-- `interaction_log`: short session/turn continuity logs
-- `context_block`: larger linked memory artifacts
-- `hippocampus_entry`: durable project/system knowledge
-- `agent_feedback`: feedback scoped to an agent, role, or domain
-
-## Memory growth and token cost
-
-The store can grow locally without automatically increasing token usage. Mnemo controls token cost by returning bounded previews from search/recall and loading full memory bodies only by id through `action="get"`.
+`memory.json` is not the primary store when `MNEMO_STORE=sqlite`; it is retained as an import/export compatibility format.
 
 ## Signature-at-write-time
 
-Mnemo 0.12.0 stores deterministic signatures when memories are recorded, imported, or backfilled:
+Mnemo stores deterministic signatures when memories are recorded, imported, or backfilled:
 
 - `content_hash`: blake2b digest of full raw text after stable line-ending normalization
 - `normalized_hash`: blake2b digest of normalized tokens joined with spaces
@@ -533,59 +565,109 @@ jaccard([], []) = 0.0
 
 Empty-empty means no signal, not semantic identity. Tiny texts may match exact hashes but are skipped by shingle-based near-duplicate detection.
 
-## Consolidation and full-scan safety
+## Memory growth and token cost
 
-`action="maintenance"` with `params.action="consolidate"` uses a bounded, candidate-based consolidation path. It relies on exact hashes and compact shingle signatures before doing expensive similarity checks.
+The store can grow locally without automatically increasing token usage. Search and recall return bounded previews. Full bodies are loaded by id through `action="get"`.
 
-The historical all-pairs scan is not the default. To request it intentionally, call `consolidate_full` with explicit confirmation:
+## Structured memory layers
 
-```json
-{"action":"consolidate_full","params":{"confirm_full_scan":true,"dry_run":true}}
-```
+Mnemo uses neutral, reusable memory kinds:
 
-Without `confirm_full_scan:true`, Mnemo returns an error that includes the estimated number of pairs.
+- `interaction_log`: short continuity notes from recent work
+- `context_block`: larger linked memory artifacts
+- `hippocampus_entry`: durable project/system knowledge
+- `agent_feedback`: feedback scoped to an `agent_id`, `role`, or `domain`
 
-## Compaction
+Mnemo does not hardcode personal agent names. Use metadata fields such as `agent_id`, `role`, `scope`, `domain`, `authority`, `retention`, `confidence`, `linked_ids`, `parent_id`, and `source_run_id`.
 
-`action="maintenance"` with `params.action="compact_logs"` keeps recent interaction logs raw and can summarize older logs into a `context_block`. Source logs are retained.
+## Environment variables
 
-## Hippocampus storage
+| Variable | Description |
+|---|---|
+| `MNEMO_STORE` | Storage backend: `sqlite` or `json`. Default: `sqlite`. |
+| `MNEMO_FILE` | Compatibility/import/export path for `memory.json`. Default: `<workspace>/state/mnemo/memory.json`. |
+| `MNEMO_SQLITE_FILE` | SQLite path when `MNEMO_STORE=sqlite`. Default: `<workspace>/state/mnemo/mnemo.sqlite`. |
+| `MNEMO_WORKSPACE_ROOT` | Workspace root for `lookup_symbol`. Default: current working directory. |
+| `MNEMO_MAX_MEMORIES` | Total memory cap including retired entries. Default: `5000`. |
+| `MNEMO_MAX_SEARCH_RESULTS` | Server-side cap for `search` results. Default: `20`. |
+| `MNEMO_MAX_RECENT_RESULTS` | Server-side cap for `recent` results. Default: `50`. |
+| `MNEMO_MAX_CHARS_PER_ITEM` | Per-item preview cap for search/recall/get preview mode. Default: `1200`. |
+| `MNEMO_MAX_TOTAL_CHARS` | Total preview cap for bundled search/recall output. Default: `12000`. |
+| `MNEMO_DECAY` | Set to `0` to disable time-decay scoring. Default: `1`. |
+| `MNEMO_LOG_EVENTS` | In JSON mode, set to `0` to disable `events.jsonl`. In SQLite mode, lifecycle events are stored in SQLite. Default: `1`. |
+| `MNEMO_LOG_QUERIES` | In JSON mode, set to `0` to disable `queries.jsonl`. In SQLite mode, query events are stored in SQLite. Default: `1`. |
+| `MNEMO_LOG_ARCHIVE` | Set to `0` to disable permanent archiving of rotated query/event logs. Default: `1`. |
+| `MNEMO_CONSOLIDATE_THRESHOLD` | Near-duplicate consolidation threshold. Default: `0.7`. |
+| `MNEMO_MISS_TOP_SCORE_THRESHOLD` | Miss threshold used by search-like event tagging. Default: `0.15`. |
+| `MNEMO_SYMBOL_TTL_SECONDS` | Symbol-index walk TTL. Default: `5`. |
+| `MNEMO_MAX_FILES_SCANNED` | Max files scanned by `lookup_symbol`. Default: `5000`. |
+| `MNEMO_MAX_TOTAL_BYTES` | Max total bytes scanned by `lookup_symbol`. Default: `52428800`. |
+| `MNEMO_MAX_FILE_BYTES` | Max single file bytes read by `lookup_symbol`. Default: `1048576`. |
+| `MNEMO_IDF_MODE` | `auto`, `off`, or `force`. Default: `auto`. |
+| `MNEMO_IDF_MIN_DOCUMENTS` | Project IDF minimum documents. Default: `200`. |
+| `MNEMO_IDF_MIN_UNIQUE_TERMS` | Project IDF minimum unique terms. Default: `1000`. |
+| `MNEMO_IDF_MIN_TOTAL_TOKENS` | Project IDF minimum total tokens. Default: `10000`. |
+| `MNEMO_IDF_DOMAIN_MIN_DOCUMENTS` | Domain IDF minimum documents. Default: `50`. |
+| `MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS` | Domain IDF minimum unique terms. Default: `300`. |
+| `MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS` | Domain IDF minimum total tokens. Default: `3000`. |
+| `MNEMO_IDF_MIN_TEXT_TOKENS` | Minimum tokens per memory included in IDF corpus. Default: `5`. |
+| `AGENT_SALIENCE_HOME` | Optional path to local `agent-salience` checkout. |
 
-Hippocampus is not a separate database. Durable project knowledge is stored in the same SQLite database with `kind="hippocampus_entry"`, plus fields such as `domain`, `scope`, `authority`, and `retention`.
+`MNEMO_MCP_PROFILE` is ignored. Mnemo always exposes one public gateway tool.
 
 ## Salience / IDF / LSH
 
 Mnemo stores deterministic signature fields (`signature_version`, `normalizer_version`, `shingle_hashes_json`, hashes, token counts, and top terms) and automatically builds local project/domain IDF profiles when corpus maturity thresholds are met.
 
-Default activation thresholds:
+Defaults:
 
-- Project: `200` eligible memory records, `1000` unique terms, and `10000` total tokens
-- Domain: `50` eligible memory records, `300` unique terms, and `3000` total tokens
-- Inclusion floor: `5` tokens per memory record
+- `MNEMO_IDF_MODE=auto`
+- `MNEMO_IDF_MIN_DOCUMENTS=200`
+- `MNEMO_IDF_MIN_UNIQUE_TERMS=1000`
+- `MNEMO_IDF_MIN_TOTAL_TOKENS=10000`
+- `MNEMO_IDF_DOMAIN_MIN_DOCUMENTS=50`
+- `MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS=300`
+- `MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS=3000`
+- `MNEMO_IDF_MIN_TEXT_TOKENS=5`
 
-All activation thresholds are AND-gated: document count, unique terms, and total tokens must all pass. IDF activation is lazy automatic: `doctor`, `salience_check`, query recall, write/update/delete, and material maintenance writes refresh profile status as needed. No coordinator policy decision is required.
+Modes:
 
-When active, IDF is a scoring aid. It contributes through both `idf_cosine` and IDF-weighted Jaccard/Tanimoto (`idf_jaccard`) so common-token-only overlap does not create meaningful similarity. It does not replace signatures, lexical ranking, FTS, or baseline cosine/Jaccard primitives.
+- `auto`: activate only when thresholds are met
+- `off`: do not build/use IDF
+- `force`: activate below thresholds (dev/test only)
+
+`doctor` now returns an `idf` object with project/domain status (`cold|ready|disabled|unavailable`), activation flags, corpus counts, and remaining maturity gaps.
+
+All activation thresholds are AND-gated:
+
+- documents threshold must pass
+- unique-terms threshold must pass
+- total-token threshold must pass
+
+IDF is a scoring aid and does not replace signatures, lexical ranking, FTS, or baseline cosine/Jaccard primitives. It now contributes through both `idf_cosine` and `idf_jaccard`.
 
 Full LSH/MinHash buckets are still not implemented in this release. See [`docs/salience_lsh_idf_notes.md`](docs/salience_lsh_idf_notes.md).
 
 ## Alias runtime boundary
 
-Aliases are dynamic project/domain retrieval knowledge stored in Mnemo SQLite, not static JSON configuration.
+Aliases are dynamic project/domain retrieval knowledge stored in Mnemo SQLite.
 
-- Mnemo passively logs miss events and `alias_hint` evidence.
-- `maintenance(action="propose_aliases")` proposes alias candidates and can persist pending proposals.
+- Mnemo passively logs miss events and alias hints.
+- `maintenance(action="propose_aliases")` proposes candidates and can persist pending proposals.
 - Curation uses `list_alias_proposals`, `approve_alias`, and `reject_alias_proposal`.
 - Runtime query paths (`search`, `recall`, `salience_check`, `compact_context`) consume active aliases automatically.
-- SQLite inspection views include `v_alias_vocabulary`, `v_alias_pending_proposals`, and `v_alias_concept_counts`.
+- SQLite views for inspection:
+  - `v_alias_vocabulary`
+  - `v_alias_pending_proposals`
+  - `v_alias_concept_counts`
 
-See [`docs/alias_proposals.md`](docs/alias_proposals.md) for proposal scoring and curation details.
+See [`docs/alias_proposals.md`](docs/alias_proposals.md) for scoring and curation workflow details.
 
 ## Copilot compatibility
 
 Mnemo exposes a single public MCP gateway tool to avoid tool-inventory pressure and confusion with native assistant memory tools.
 
-Mnemo exports conservative MCP tool schemas for clients that reject full JSON Schema features. Constraints such as defaults, bounds, and enum handling are enforced in Python handlers and described in tool descriptions.
+The exported schema avoids unsupported JSON Schema features. Defaults, bounds, and validation are enforced in Python handlers.
 
 ## Development
 
@@ -596,18 +678,14 @@ python -m unittest discover -s . -p "test*.py"
 python benchmark_consolidation.py
 ```
 
-Expected result for this release:
-
-```text
-219 tests passed, 1 skipped
-```
+Expected result for this release: smoke test and unit suite pass locally.
 
 The benchmark inserts 50,000 synthetic memories, backfills signatures, runs candidate-based consolidation, and verifies the `consolidate_full` confirmation gate.
 
 ## Privacy
 
-Mnemo stores local project memory. Do not commit local state unless you intentionally want to share seed memory. See [`docs/privacy.md`](docs/privacy.md).
+Mnemo stores local project memory. Do not commit local state unless you intentionally want to share seed memory. See [`docs/storage.md`](docs/storage.md) and [`docs/tool_reference.md`](docs/tool_reference.md).
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See `LICENSE` when present in the packaged repository.

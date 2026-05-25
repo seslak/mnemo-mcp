@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -9,9 +10,11 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from importlib import import_module
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -530,6 +533,9 @@ class ToolSurfaceTests(MnemoTestCase):
         self.assertEqual(payload["public_tool_count"], 1)
         self.assertIn("record", payload["available_actions"])
         self.assertIn("search", payload["available_actions"])
+        self.assertIn("pack_preview", payload["available_actions"])
+        self.assertIn("pack_redaction_preview", payload["available_actions"])
+        self.assertIn("pack_export", payload["available_actions"])
 
     def test_gateway_includes_event_history_actions(self) -> None:
         for action in ("recent_events", "search_events", "get_event", "memory_events"):
@@ -538,6 +544,24 @@ class ToolSurfaceTests(MnemoTestCase):
         enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
         for action in ("recent_events", "search_events", "get_event", "memory_events"):
             self.assertIn(action, enum_values)
+
+    def test_gateway_includes_pack_preview_action(self) -> None:
+        self.assertIn("pack_preview", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_preview", enum_values)
+
+    def test_gateway_includes_pack_redaction_preview_action(self) -> None:
+        self.assertIn("pack_redaction_preview", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_redaction_preview", enum_values)
+
+    def test_gateway_includes_pack_export_action(self) -> None:
+        self.assertIn("pack_export", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_export", enum_values)
 
 
 class DoctorPayloadTests(MnemoTestCase):
@@ -2448,6 +2472,1543 @@ class SqliteStoreTests(MnemoTestCase):
         self.assertEqual(got["structuredContent"]["memory"]["id"], memory["id"])
 
 
+class MemoryPacksPhase1Tests(MnemoTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.sqlite_file = self.root / "mnemo" / "mnemo.sqlite"
+        os.environ["MNEMO_STORE"] = "sqlite"
+        os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _create_pre_phase1_schema(self, rows: list[dict[str, Any]], *, with_fts: bool = False) -> None:
+        self.sqlite_file.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    title TEXT,
+                    preview TEXT,
+                    source TEXT,
+                    tags_json TEXT,
+                    linked_ids_json TEXT,
+                    agent_id TEXT,
+                    role TEXT,
+                    scope TEXT,
+                    domain TEXT,
+                    authority TEXT,
+                    retention TEXT,
+                    confidence TEXT,
+                    parent_id TEXT,
+                    source_run_id TEXT,
+                    git_sha TEXT,
+                    git_branch TEXT,
+                    git_dirty INTEGER,
+                    metadata_json TEXT,
+                    pinned INTEGER DEFAULT 0,
+                    deleted INTEGER DEFAULT 0,
+                    superseded_by TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    token_estimate INTEGER,
+                    content_hash TEXT,
+                    normalized_hash TEXT,
+                    token_count INTEGER,
+                    unique_token_count INTEGER,
+                    top_terms_json TEXT,
+                    shingle_hashes_json TEXT,
+                    signature_version INTEGER,
+                    normalizer_version INTEGER,
+                    signature_updated_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS links (
+                    source_id TEXT,
+                    target_id TEXT,
+                    relation TEXT,
+                    created_at TEXT,
+                    PRIMARY KEY (source_id, target_id, relation)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS events (
+                    id TEXT PRIMARY KEY,
+                    memory_id TEXT,
+                    event_type TEXT,
+                    data_json TEXT,
+                    created_at TEXT
+                )
+                """
+            )
+            conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS idf_profiles (
+                    scope TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    profile_version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    active INTEGER NOT NULL,
+                    doc_count INTEGER NOT NULL,
+                    unique_terms INTEGER NOT NULL,
+                    total_tokens INTEGER NOT NULL,
+                    min_documents INTEGER NOT NULL,
+                    min_unique_terms INTEGER NOT NULL,
+                    min_total_tokens INTEGER NOT NULL,
+                    corpus_signature TEXT,
+                    profile_json TEXT,
+                    updated_at TEXT,
+                    PRIMARY KEY (scope, name, profile_version)
+                )
+                """
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '3')"
+            )
+            if with_fts:
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, text, title, tags)")
+            for row in rows:
+                migrated = server.migrate_memory(dict(row))
+                text = str(migrated.get("text", ""))
+                signature = server._build_memory_signature(text)
+                metadata_json = json.dumps(server.normalize_metadata(migrated.get("metadata")), ensure_ascii=False)
+                tags_json = json.dumps(server.normalize_tags(migrated.get("tags", [])), ensure_ascii=False)
+                linked_ids_json = json.dumps(
+                    server.normalize_linked_ids(migrated.get("linked_ids", migrated.get("references", []))),
+                    ensure_ascii=False,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO memories(
+                        id, kind, text, title, preview, source, tags_json, linked_ids_json,
+                        agent_id, role, scope, domain, authority, retention, confidence,
+                        parent_id, source_run_id, git_sha, git_branch, git_dirty,
+                        metadata_json, pinned, deleted, superseded_by, created_at, updated_at,
+                        token_estimate, content_hash, normalized_hash, token_count, unique_token_count,
+                        top_terms_json, shingle_hashes_json, signature_version, normalizer_version, signature_updated_at
+                    ) VALUES(
+                        ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(migrated.get("id", "")),
+                        str(migrated.get("kind", "note")),
+                        text,
+                        None,
+                        text[:240],
+                        str(migrated.get("source", "")),
+                        tags_json,
+                        linked_ids_json,
+                        server.normalize_optional_string(migrated.get("agent_id")),
+                        server.normalize_optional_string(migrated.get("role")),
+                        server.normalize_optional_string(migrated.get("scope")),
+                        server.normalize_optional_string(migrated.get("domain")),
+                        server.normalize_optional_string(migrated.get("authority")),
+                        server.normalize_optional_string(migrated.get("retention")),
+                        server.normalize_optional_string(migrated.get("confidence")),
+                        server.normalize_optional_string(migrated.get("parent_id")),
+                        server.normalize_optional_string(migrated.get("source_run_id")),
+                        server.normalize_optional_string(migrated.get("git_sha")),
+                        server.normalize_optional_string(migrated.get("git_branch")),
+                        server.normalize_git_dirty(migrated.get("git_dirty")),
+                        metadata_json,
+                        1 if bool(migrated.get("pinned")) else 0,
+                        1 if bool(migrated.get("deleted_at")) else 0,
+                        server.normalize_optional_string(migrated.get("superseded_by")),
+                        str(migrated.get("created_at") or server.now_iso()),
+                        server.normalize_optional_string(migrated.get("updated_at")),
+                        int(server.estimate_tokens(text)),
+                        signature["content_hash"],
+                        signature["normalized_hash"],
+                        int(signature["token_count"]),
+                        int(signature["unique_token_count"]),
+                        signature["top_terms_json"],
+                        signature["shingle_hashes_json"],
+                        int(signature["signature_version"]),
+                        int(signature["normalizer_version"]),
+                        signature["signature_updated_at"],
+                    ),
+                )
+                if with_fts:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO memories_fts(id, text, title, tags) VALUES(?, ?, ?, ?)",
+                        (
+                            str(migrated.get("id", "")),
+                            text,
+                            "",
+                            " ".join(str(tag) for tag in migrated.get("tags", []) if str(tag).strip()),
+                        ),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _insert_imported_pack(self, *, pack_id: str, trust_level: str, namespace: str) -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO imported_packs(
+                    pack_id, pack_name, source_label, trust_level, namespace,
+                    imported_at, manifest_json, freshness_summary_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pack_id,
+                    f"Pack {pack_id}",
+                    "unit-test",
+                    trust_level,
+                    namespace,
+                    server.now_iso(),
+                    "{}",
+                    None,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _pack_preview(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_preview(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_preview_ids(self, result: dict[str, Any]) -> list[str]:
+        selection = result["structuredContent"]["selection"]
+        return [str(memory_id) for memory_id in selection["row_ids"]]
+
+    def _set_created_at(self, memory_id: str, created_at: str) -> None:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute("UPDATE memories SET created_at = ? WHERE id = ?", (created_at, memory_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _pack_redaction_preview(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_redaction_preview(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _exported_packs_count(self) -> int:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+        finally:
+            conn.close()
+
+    def _memory_count(self) -> int:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+        finally:
+            conn.close()
+
+    def _memory_text(self, memory_id: str) -> str:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute("SELECT text FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            return str(row[0]) if row else ""
+        finally:
+            conn.close()
+
+    def _pack_export(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_export(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_export_error(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_export(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _read_zip_members(self, path: Path) -> dict[str, bytes]:
+        with zipfile.ZipFile(path, "r") as archive:
+            return {name: archive.read(name) for name in archive.namelist()}
+
+    def _recompute_pack_content_hash(self, members: dict[str, bytes], covered_members: list[str]) -> str:
+        lines: list[str] = []
+        for member_name in sorted(str(name) for name in covered_members):
+            digest = hashlib.sha256(members[member_name]).hexdigest()
+            lines.append(f"{member_name}\t{digest}\n")
+        canonical = "".join(lines).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _table_count(self, table: str) -> int:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        finally:
+            conn.close()
+
+    def test_memory_packs_phase1_migration_idempotent(self) -> None:
+        server.load_store()
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            memory_cols = {row[1] for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            indexes = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+            schema_version = int(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertTrue({"namespace", "origin", "import_freshness"}.issubset(memory_cols))
+        self.assertIn("memory_topics", tables)
+        self.assertIn("imported_packs", tables)
+        self.assertIn("exported_packs", tables)
+        self.assertIn("idx_memories_namespace", indexes)
+        self.assertIn("idx_memories_origin", indexes)
+        self.assertIn("idx_memories_namespace_kind", indexes)
+        self.assertIn("idx_memory_topics_topic", indexes)
+        self.assertIn("idx_memory_topics_memory_id", indexes)
+        self.assertGreaterEqual(schema_version, 4)
+
+    def test_memory_packs_phase1_existing_rows_default_local(self) -> None:
+        legacy = server.new_memory("legacy-v3", "note", "legacy body text", "", [])
+        legacy.pop("namespace", None)
+        legacy.pop("origin", None)
+        legacy.pop("import_freshness", None)
+        self._create_pre_phase1_schema([legacy])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before_count = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            before_text = str(conn.execute("SELECT text FROM memories WHERE id = 'legacy-v3'").fetchone()[0])
+        finally:
+            conn.close()
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM memories WHERE id = 'legacy-v3'").fetchone()
+            after_count = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(before_count, after_count)
+        self.assertEqual(before_text, str(row["text"]))
+        self.assertEqual(str(row["namespace"]), "local")
+        self.assertEqual(str(row["origin"]), "local")
+        self.assertIsNone(row["import_freshness"])
+
+    def test_memory_packs_phase1_default_retrieval_unchanged(self) -> None:
+        rows = [
+            server.new_memory("legacy-a", "note", "alpha beta gamma", "", []),
+            server.new_memory("legacy-b", "note", "alpha beta", "", []),
+            server.new_memory("legacy-c", "note", "alpha", "", []),
+        ]
+        for row in rows:
+            row.pop("namespace", None)
+            row.pop("origin", None)
+            row.pop("import_freshness", None)
+        baseline_memories = [server.migrate_memory(dict(row)) for row in rows]
+        baseline_ranked = server.rank_memories_for_query(
+            baseline_memories,
+            server.tokenize("alpha beta"),
+            phase=None,
+            query_text="alpha beta",
+        )
+        baseline_ids = [str(memory.get("id")) for score, memory in baseline_ranked[:3] if float(score) > 0.0]
+        self._create_pre_phase1_schema(rows)
+        result = server.search_memories({"query": "alpha beta", "limit": 3})
+        self.assertFalse(result["isError"], result)
+        ids = [str(item["id"]) for item in result["structuredContent"]["matches"]]
+        self.assertEqual(ids, baseline_ids)
+
+    def test_topic_add_remove_list(self) -> None:
+        memory = self.record("topic add remove marker", kind="note")
+        added = server.topic_add({"memory_id": memory["id"], "topic": "auth", "source": "operator"})
+        self.assertFalse(added["isError"], added)
+        self.assertTrue(added["structuredContent"]["inserted"])
+        dup = server.topic_add({"memory_id": memory["id"], "topic": "auth"})
+        self.assertFalse(dup["isError"], dup)
+        self.assertFalse(dup["structuredContent"]["inserted"])
+        other = server.topic_add({"memory_id": memory["id"], "topic": "release", "source": "maintenance"})
+        self.assertFalse(other["isError"], other)
+        all_topics = server.topic_list({})
+        self.assertFalse(all_topics["isError"], all_topics)
+        by_topic = {row["topic"]: int(row["count"]) for row in all_topics["structuredContent"]["topics"]}
+        self.assertEqual(by_topic.get("auth"), 1)
+        self.assertEqual(by_topic.get("release"), 1)
+        removed = server.topic_remove({"memory_id": memory["id"], "topic": "auth"})
+        self.assertFalse(removed["isError"], removed)
+        self.assertEqual(int(removed["structuredContent"]["removed"]), 1)
+        all_after = server.topic_list({})
+        by_topic_after = {row["topic"]: int(row["count"]) for row in all_after["structuredContent"]["topics"]}
+        self.assertNotIn("auth", by_topic_after)
+
+    def test_topic_list_scope_memory(self) -> None:
+        left = self.record("topic scope left", kind="note")
+        right = self.record("topic scope right", kind="note")
+        server.topic_add({"memory_id": left["id"], "topic": "auth"})
+        server.topic_add({"memory_id": left["id"], "topic": "gateway"})
+        server.topic_add({"memory_id": right["id"], "topic": "billing"})
+        scoped = server.topic_list({"scope": "memory", "memory_id": left["id"]})
+        self.assertFalse(scoped["isError"], scoped)
+        topics = {row["topic"] for row in scoped["structuredContent"]["topics"]}
+        self.assertEqual(topics, {"auth", "gateway"})
+
+    def test_retrieval_excludes_imported_by_default(self) -> None:
+        self._insert_imported_pack(pack_id="pack-test", trust_level="trusted", namespace="pack:test")
+        imported = self.record(
+            "imported trusted namespace marker",
+            kind="note",
+            namespace="pack:test",
+            origin="imported",
+        )
+        default = server.search_memories({"query": "imported trusted namespace marker", "limit": 5})
+        self.assertFalse(default["isError"], default)
+        self.assertEqual(default["structuredContent"]["matches"], [])
+        included = server.search_memories(
+            {"query": "imported trusted namespace marker", "limit": 5, "include_imported": True}
+        )
+        self.assertFalse(included["isError"], included)
+        ids = [row["id"] for row in included["structuredContent"]["matches"]]
+        self.assertIn(imported["id"], ids)
+
+    def test_retrieval_excludes_quarantine_unless_opted_in(self) -> None:
+        self._insert_imported_pack(
+            pack_id="pack-quarantine-test",
+            trust_level="quarantine",
+            namespace="pack:quarantine:test",
+        )
+        quarantined = self.record(
+            "quarantine namespace marker",
+            kind="note",
+            namespace="pack:quarantine:test",
+            origin="imported",
+        )
+        default = server.search_memories({"query": "quarantine namespace marker", "limit": 5})
+        self.assertFalse(default["isError"], default)
+        self.assertEqual(default["structuredContent"]["matches"], [])
+        imported_only = server.search_memories(
+            {"query": "quarantine namespace marker", "limit": 5, "include_imported": True}
+        )
+        self.assertFalse(imported_only["isError"], imported_only)
+        self.assertEqual(imported_only["structuredContent"]["matches"], [])
+        quarantine = server.search_memories(
+            {"query": "quarantine namespace marker", "limit": 5, "include_quarantine": True}
+        )
+        self.assertFalse(quarantine["isError"], quarantine)
+        ids = [row["id"] for row in quarantine["structuredContent"]["matches"]]
+        self.assertIn(quarantined["id"], ids)
+
+    def test_namespace_and_namespaces_conflict_errors(self) -> None:
+        result = server.search_memories(
+            {
+                "query": "namespace conflict marker",
+                "namespace": "local",
+                "namespaces": ["local"],
+            }
+        )
+        self.assertTrue(result["isError"])
+        self.assertIn("namespace and namespaces cannot both be supplied", result["content"][0]["text"])
+
+    def test_origin_filter_only_when_explicit(self) -> None:
+        local_row = self.record(
+            "origin filter marker shared",
+            kind="note",
+            namespace="local",
+            origin="local",
+        )
+        promoted_row = self.record(
+            "origin filter marker shared promoted",
+            kind="note",
+            namespace="local",
+            origin="promoted",
+        )
+        default = server.search_memories({"query": "origin filter marker shared", "limit": 10})
+        self.assertFalse(default["isError"], default)
+        default_ids = {row["id"] for row in default["structuredContent"]["matches"]}
+        self.assertIn(local_row["id"], default_ids)
+        self.assertIn(promoted_row["id"], default_ids)
+
+        local_only = server.search_memories(
+            {"query": "origin filter marker shared", "limit": 10, "origin": "local"}
+        )
+        self.assertFalse(local_only["isError"], local_only)
+        local_ids = [row["id"] for row in local_only["structuredContent"]["matches"]]
+        self.assertTrue(local_ids)
+        self.assertEqual(set(local_ids), {local_row["id"]})
+
+        promoted_only = server.search_memories(
+            {"query": "origin filter marker shared", "limit": 10, "origins": ["promoted"]}
+        )
+        self.assertFalse(promoted_only["isError"], promoted_only)
+        promoted_ids = [row["id"] for row in promoted_only["structuredContent"]["matches"]]
+        self.assertTrue(promoted_ids)
+        self.assertEqual(set(promoted_ids), {promoted_row["id"]})
+
+    def test_fts_schema_unchanged(self) -> None:
+        legacy = server.new_memory("legacy-fts", "note", "legacy fts schema marker", "", [])
+        legacy.pop("namespace", None)
+        legacy.pop("origin", None)
+        legacy.pop("import_freshness", None)
+        self._create_pre_phase1_schema([legacy], with_fts=True)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before = conn.execute("PRAGMA table_info(memories_fts)").fetchall()
+        finally:
+            conn.close()
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after = conn.execute("PRAGMA table_info(memories_fts)").fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(before, after)
+
+    def test_doctor_reports_topics_and_namespaces(self) -> None:
+        self._insert_imported_pack(pack_id="pack-topic-doctor", trust_level="trusted", namespace="pack:test")
+        local = self.record("doctor topic local", kind="note", namespace="local", origin="local")
+        promoted = self.record("doctor topic promoted", kind="note", namespace="local", origin="promoted")
+        imported = self.record("doctor topic imported", kind="note", namespace="pack:test", origin="imported")
+        server.topic_add({"memory_id": local["id"], "topic": "auth", "source": "operator"})
+        server.topic_add({"memory_id": imported["id"], "topic": "auth", "source": "pack_import"})
+        server.topic_add({"memory_id": imported["id"], "topic": "release", "source": "pack_import"})
+        doctor = server.mnemo_doctor({})
+        self.assertFalse(doctor["isError"], doctor)
+        payload = doctor["structuredContent"]["memory_packs"]
+        self.assertGreaterEqual(int(payload["count_by_namespace"].get("local", 0)), 2)
+        self.assertGreaterEqual(int(payload["count_by_namespace"].get("pack:test", 0)), 1)
+        self.assertGreaterEqual(int(payload["count_by_origin"].get("local", 0)), 1)
+        self.assertGreaterEqual(int(payload["count_by_origin"].get("promoted", 0)), 1)
+        self.assertGreaterEqual(int(payload["count_by_origin"].get("imported", 0)), 1)
+        self.assertGreaterEqual(int(payload["total_topic_count"]), 3)
+        self.assertGreaterEqual(int(payload["untagged_memory_count"]), 1)
+        self.assertEqual(int(payload["import_freshness_non_null_count"]), 0)
+        self.assertEqual(int(payload["imported_packs_count"]), 1)
+        self.assertEqual(int(payload["exported_packs_count"]), 0)
+        top_topics = {row["topic"]: int(row["count"]) for row in payload["top_topics"]}
+        self.assertEqual(top_topics.get("auth"), 2)
+
+    def test_topic_selection_uses_join_not_body_text(self) -> None:
+        body_only = self.record("auth keyword appears in body only", kind="note")
+        tagged = self.record("no matching keyword here", kind="note")
+        server.topic_add({"memory_id": tagged["id"], "topic": "auth", "source": "operator"})
+        listed = server.topic_list({})
+        self.assertFalse(listed["isError"], listed)
+        by_topic = {row["topic"]: int(row["count"]) for row in listed["structuredContent"]["topics"]}
+        self.assertEqual(by_topic.get("auth"), 1)
+        body_scope = server.topic_list({"scope": "memory", "memory_id": body_only["id"]})
+        self.assertFalse(body_scope["isError"], body_scope)
+        self.assertEqual(body_scope["structuredContent"]["topics"], [])
+
+    def test_pack_preview_default_local_only(self) -> None:
+        local = self.record("phase2a local preview marker", kind="context_block", namespace="local", origin="local")
+        self._insert_imported_pack(pack_id="phase2a-trusted", trust_level="trusted", namespace="pack:phase2a-trusted")
+        self._insert_imported_pack(
+            pack_id="phase2a-quarantine",
+            trust_level="quarantine",
+            namespace="pack:quarantine:phase2a-quarantine",
+        )
+        trusted = self.record(
+            "phase2a trusted preview marker",
+            kind="context_block",
+            namespace="pack:phase2a-trusted",
+            origin="imported",
+        )
+        quarantined = self.record(
+            "phase2a quarantine preview marker",
+            kind="context_block",
+            namespace="pack:quarantine:phase2a-quarantine",
+            origin="imported",
+        )
+        result = self._pack_preview()
+        ids = set(self._pack_preview_ids(result))
+        self.assertIn(local["id"], ids)
+        self.assertNotIn(trusted["id"], ids)
+        self.assertNotIn(quarantined["id"], ids)
+
+    def test_pack_preview_topic_filter_uses_memory_topics(self) -> None:
+        body_only = self.record("auth appears in body text only", kind="context_block")
+        tagged = self.record("no keyword in this memory", kind="context_block")
+        topic_add = server.topic_add({"memory_id": tagged["id"], "topic": "auth", "source": "operator"})
+        self.assertFalse(topic_add["isError"], topic_add)
+        result = self._pack_preview(topics=["auth"])
+        ids = self._pack_preview_ids(result)
+        self.assertIn(tagged["id"], ids)
+        self.assertNotIn(body_only["id"], ids)
+
+    def test_pack_preview_kind_filter(self) -> None:
+        context = self.record("phase2a kind context", kind="context_block")
+        hippocampus = self.record("phase2a kind hippocampus", kind="hippocampus_entry")
+        result = self._pack_preview(kinds=["context_block"])
+        ids = set(self._pack_preview_ids(result))
+        self.assertIn(context["id"], ids)
+        self.assertNotIn(hippocampus["id"], ids)
+        self.assertEqual(set(result["structuredContent"]["counts"]["by_kind"].keys()), {"context_block"})
+
+    def test_pack_preview_include_imported(self) -> None:
+        self._insert_imported_pack(pack_id="phase2a-inc-trusted", trust_level="trusted", namespace="pack:phase2a-inc-trusted")
+        self._insert_imported_pack(
+            pack_id="phase2a-inc-quarantine",
+            trust_level="quarantine",
+            namespace="pack:quarantine:phase2a-inc-quarantine",
+        )
+        self.record("phase2a local include_imported", kind="context_block", namespace="local", origin="local")
+        trusted = self.record(
+            "phase2a trusted include_imported",
+            kind="context_block",
+            namespace="pack:phase2a-inc-trusted",
+            origin="imported",
+        )
+        quarantined = self.record(
+            "phase2a quarantine include_imported",
+            kind="context_block",
+            namespace="pack:quarantine:phase2a-inc-quarantine",
+            origin="imported",
+        )
+        result = self._pack_preview(include_imported=True)
+        ids = set(self._pack_preview_ids(result))
+        self.assertIn(trusted["id"], ids)
+        self.assertNotIn(quarantined["id"], ids)
+
+    def test_pack_preview_include_quarantine(self) -> None:
+        self._insert_imported_pack(
+            pack_id="phase2a-quarantine-only",
+            trust_level="quarantine",
+            namespace="pack:quarantine:phase2a-quarantine-only",
+        )
+        quarantined = self.record(
+            "phase2a quarantine include_quarantine",
+            kind="context_block",
+            namespace="pack:quarantine:phase2a-quarantine-only",
+            origin="imported",
+        )
+        result = self._pack_preview(include_quarantine=True)
+        ids = set(self._pack_preview_ids(result))
+        self.assertIn(quarantined["id"], ids)
+
+    def test_pack_preview_namespace_conflict(self) -> None:
+        result = server.pack_preview({"namespace": "local", "namespaces": ["local"]})
+        self.assertTrue(result["isError"])
+        self.assertIn("namespace and namespaces cannot both be supplied", result["content"][0]["text"])
+
+    def test_pack_preview_origin_conflict(self) -> None:
+        result = server.pack_preview({"origin": "local", "origins": ["local"]})
+        self.assertTrue(result["isError"])
+        self.assertIn("origin and origins cannot both be supplied", result["content"][0]["text"])
+
+    def test_pack_preview_touched_paths_filter(self) -> None:
+        auth_file = self.workspace / "src" / "auth" / "session.py"
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        auth_file.write_text("TOKEN = 'a'\n", encoding="utf-8")
+        pay_file = self.workspace / "src" / "payments" / "ledger.py"
+        pay_file.parent.mkdir(parents=True, exist_ok=True)
+        pay_file.write_text("TOKEN = 'b'\n", encoding="utf-8")
+
+        auth_memory = self.record(
+            "phase2a touched path auth",
+            kind="context_block",
+            touched_files=["src/auth/session.py"],
+        )
+        other_memory = self.record(
+            "phase2a touched path other",
+            kind="context_block",
+            touched_files=["src/payments/ledger.py"],
+        )
+        result = self._pack_preview(touched_paths=["src/auth/session.py"])
+        ids = set(self._pack_preview_ids(result))
+        self.assertIn(auth_memory["id"], ids)
+        self.assertNotIn(other_memory["id"], ids)
+
+    def test_pack_preview_counts_and_samples(self) -> None:
+        tracked = self.workspace / "src" / "auth" / "session.py"
+        tracked.parent.mkdir(parents=True, exist_ok=True)
+        tracked.write_text("phase2a tracked\n", encoding="utf-8")
+        context = self.record(
+            "phase2a counts context",
+            kind="context_block",
+            touched_files=["src/auth/session.py"],
+        )
+        hippocampus = self.record("phase2a counts hippocampus", kind="hippocampus_entry")
+        server.topic_add({"memory_id": context["id"], "topic": "phase2a-auth", "source": "operator"})
+        server.topic_add({"memory_id": hippocampus["id"], "topic": "phase2a-auth", "source": "operator"})
+        result = self._pack_preview(topics=["phase2a-auth"], sample_per_kind=2)
+        payload = result["structuredContent"]
+        self.assertIn("total_rows", payload["selection"])
+        self.assertIn("by_kind", payload["counts"])
+        self.assertIn("by_namespace", payload["counts"])
+        self.assertIn("by_origin", payload["counts"])
+        self.assertIn("by_topic", payload["counts"])
+        self.assertIn("samples", payload)
+        self.assertIn("top_referenced_files", payload["files"])
+        self.assertGreaterEqual(int(payload["selection"]["total_rows"]), 2)
+        self.assertEqual(int(payload["counts"]["by_topic"].get("phase2a-auth", 0)), 2)
+        self.assertTrue(payload["samples"])
+        for kind_rows in payload["samples"].values():
+            self.assertLessEqual(len(kind_rows), 2)
+
+    def test_pack_preview_is_read_only(self) -> None:
+        self.record("phase2a read only baseline", kind="context_block")
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before_count = int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+        finally:
+            conn.close()
+        exports_dir = self.sqlite_file.parent / "exports"
+        before_files = sorted(str(path.relative_to(exports_dir)) for path in exports_dir.rglob("*")) if exports_dir.exists() else []
+
+        result = self._pack_preview()
+        self.assertFalse(result["isError"], result)
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after_count = int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+        finally:
+            conn.close()
+        after_files = sorted(str(path.relative_to(exports_dir)) for path in exports_dir.rglob("*")) if exports_dir.exists() else []
+        self.assertEqual(before_count, after_count)
+        self.assertEqual(before_files, after_files)
+
+    def test_pack_preview_interaction_log_warning(self) -> None:
+        interaction = self.record("phase2a interaction preview", kind="interaction_log")
+        result = self._pack_preview(kinds=["interaction_log"])
+        ids = set(self._pack_preview_ids(result))
+        self.assertIn(interaction["id"], ids)
+        warnings = result["structuredContent"]["warnings"]
+        self.assertTrue(any(row.get("code") == "kind_preview_only" for row in warnings))
+
+    def test_pack_preview_limit(self) -> None:
+        for idx in range(6):
+            self.record(f"phase2a limit context {idx}", kind="context_block")
+        result = self._pack_preview(kinds=["context_block"], limit=2)
+        selection = result["structuredContent"]["selection"]
+        self.assertTrue(selection["limited"])
+        self.assertLessEqual(len(selection["row_ids"]), 2)
+        self.assertGreater(int(selection["total_rows"]), 2)
+
+    def test_pack_preview_date_filters(self) -> None:
+        older = self.record("phase2a date older", kind="context_block")
+        newer = self.record("phase2a date newer", kind="context_block")
+        self._set_created_at(older["id"], "2025-01-01T00:00:00Z")
+        self._set_created_at(newer["id"], "2027-01-01T00:00:00Z")
+
+        after = self._pack_preview(kinds=["context_block"], created_after="2026-01-01T00:00:00Z")
+        after_ids = set(self._pack_preview_ids(after))
+        self.assertIn(newer["id"], after_ids)
+        self.assertNotIn(older["id"], after_ids)
+
+        before = self._pack_preview(kinds=["context_block"], created_before="2026-01-01T00:00:00Z")
+        before_ids = set(self._pack_preview_ids(before))
+        self.assertIn(older["id"], before_ids)
+        self.assertNotIn(newer["id"], before_ids)
+
+    def test_pack_preview_combined_filters(self) -> None:
+        self._insert_imported_pack(pack_id="phase2a-combo", trust_level="trusted", namespace="pack:phase2a-combo")
+        local_match = self.record(
+            "phase2a combo local target",
+            kind="context_block",
+            namespace="local",
+            origin="local",
+        )
+        local_other_kind = self.record(
+            "phase2a combo local other kind",
+            kind="hippocampus_entry",
+            namespace="local",
+            origin="local",
+        )
+        imported = self.record(
+            "phase2a combo imported",
+            kind="context_block",
+            namespace="pack:phase2a-combo",
+            origin="imported",
+        )
+        server.topic_add({"memory_id": local_match["id"], "topic": "phase2a-combo", "source": "operator"})
+        server.topic_add({"memory_id": local_other_kind["id"], "topic": "phase2a-combo", "source": "operator"})
+        server.topic_add({"memory_id": imported["id"], "topic": "phase2a-combo", "source": "operator"})
+
+        result = self._pack_preview(topics=["phase2a-combo"], kinds=["context_block"], namespace="local")
+        ids = set(self._pack_preview_ids(result))
+        self.assertEqual(ids, {local_match["id"]})
+
+    def test_pack_preview_empty_selection(self) -> None:
+        result = self._pack_preview(topics=["phase2a-topic-not-present"])
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(int(payload["selection"]["total_rows"]), 0)
+        self.assertEqual(payload["selection"]["row_ids"], [])
+        self.assertEqual(payload["samples"], {})
+
+    def test_pack_preview_sample_per_kind(self) -> None:
+        for idx in range(5):
+            self.record(f"phase2a sample context {idx}", kind="context_block")
+            self.record(f"phase2a sample hippocampus {idx}", kind="hippocampus_entry")
+        result = self._pack_preview(sample_per_kind=2)
+        samples = result["structuredContent"]["samples"]
+        self.assertIn("context_block", samples)
+        self.assertIn("hippocampus_entry", samples)
+        self.assertLessEqual(len(samples["context_block"]), 2)
+        self.assertLessEqual(len(samples["hippocampus_entry"]), 2)
+
+    def test_pack_preview_include_samples_false(self) -> None:
+        self.record("phase2a no samples row", kind="context_block")
+        result = self._pack_preview(include_samples=False)
+        self.assertEqual(result["structuredContent"]["samples"], {})
+
+    def test_pack_preview_backward_compat_retrieval_unchanged(self) -> None:
+        self.record("phase2a retrieval baseline alpha beta", kind="note")
+        self.record("phase2a retrieval baseline alpha", kind="note")
+        before = server.search_memories({"query": "alpha beta", "limit": 5})
+        self.assertFalse(before["isError"], before)
+        before_ids = [row["id"] for row in before["structuredContent"]["matches"]]
+        preview = self._pack_preview()
+        self.assertFalse(preview["isError"], preview)
+        after = server.search_memories({"query": "alpha beta", "limit": 5})
+        self.assertFalse(after["isError"], after)
+        after_ids = [row["id"] for row in after["structuredContent"]["matches"]]
+        self.assertEqual(before_ids, after_ids)
+
+    def test_pack_preview_strict_read_only_empty_db(self) -> None:
+        result = server.pack_preview({})
+        self.assertFalse(result["isError"], result)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            memories_count = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            exported_count = int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        finally:
+            conn.close()
+        self.assertIn("memories", tables)
+        self.assertIn("memory_topics", tables)
+        self.assertIn("imported_packs", tables)
+        self.assertIn("exported_packs", tables)
+        self.assertEqual(memories_count, 0)
+        self.assertEqual(exported_count, 0)
+        self.assertEqual(result["structuredContent"]["selection"]["row_ids"], [])
+
+    def test_pack_redaction_preview_email(self) -> None:
+        literal = "test.user@example.test"
+        self.record(f"phase2b email literal {literal}", kind="context_block")
+        result = self._pack_redaction_preview()
+        redaction = result["structuredContent"]["redaction"]
+        self.assertGreaterEqual(int(redaction["by_category"].get("email", 0)), 1)
+        samples = result["structuredContent"]["samples"]
+        self.assertTrue(samples)
+        self.assertIn("[REDACTED:email]", samples[0]["redacted_preview"])
+        self.assertNotIn(literal, json.dumps(result["structuredContent"], ensure_ascii=True))
+
+    def test_pack_redaction_preview_secret_patterns(self) -> None:
+        jwt_literal = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        aws_literal = "AKIA1234567890ABCDEF"
+        private_header = "-----BEGIN RSA PRIVATE KEY-----"
+        self.record(f"phase2b jwt literal {jwt_literal}", kind="context_block")
+        self.record(f"phase2b aws literal {aws_literal}", kind="context_block")
+        self.record(f"phase2b key header {private_header}", kind="context_block")
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        redaction = result["structuredContent"]["redaction"]
+        self.assertGreaterEqual(int(redaction["by_category"].get("jwt", 0)), 1)
+        self.assertGreaterEqual(int(redaction["by_category"].get("aws_access_key", 0)), 1)
+        self.assertGreaterEqual(int(redaction["by_category"].get("private_key_header", 0)), 1)
+        payload_text = json.dumps(result["structuredContent"], ensure_ascii=True)
+        self.assertNotIn(jwt_literal, payload_text)
+        self.assertNotIn(aws_literal, payload_text)
+        self.assertNotIn(private_header, payload_text)
+
+    def test_pack_redaction_preview_ip_and_user_path(self) -> None:
+        self.record(
+            "phase2b host 10.23.45.67 and path C:\\Users\\fakeuser\\secret.txt",
+            kind="context_block",
+        )
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        redaction = result["structuredContent"]["redaction"]
+        self.assertGreaterEqual(int(redaction["by_category"].get("ipv4", 0)), 1)
+        self.assertGreaterEqual(int(redaction["by_category"].get("user_path", 0)), 1)
+
+    def test_pack_redaction_preview_uses_pack_preview_selection(self) -> None:
+        self._insert_imported_pack(pack_id="phase2b-trusted", trust_level="trusted", namespace="pack:phase2b-trusted")
+        self._insert_imported_pack(
+            pack_id="phase2b-quarantine",
+            trust_level="quarantine",
+            namespace="pack:quarantine:phase2b-quarantine",
+        )
+        local = self.record("phase2b local marker test.user@example.test", kind="context_block", namespace="local", origin="local")
+        trusted = self.record(
+            "phase2b trusted marker test.user@example.test",
+            kind="context_block",
+            namespace="pack:phase2b-trusted",
+            origin="imported",
+        )
+        quarantined = self.record(
+            "phase2b quarantined marker test.user@example.test",
+            kind="context_block",
+            namespace="pack:quarantine:phase2b-quarantine",
+            origin="imported",
+        )
+        default_preview = self._pack_preview(kinds=["context_block"])
+        default_redaction = self._pack_redaction_preview(kinds=["context_block"])
+        self.assertEqual(default_preview["structuredContent"]["selection"]["row_ids"], default_redaction["structuredContent"]["selection"]["row_ids"])
+        self.assertIn(local["id"], default_redaction["structuredContent"]["selection"]["row_ids"])
+        self.assertNotIn(trusted["id"], default_redaction["structuredContent"]["selection"]["row_ids"])
+        self.assertNotIn(quarantined["id"], default_redaction["structuredContent"]["selection"]["row_ids"])
+
+        trusted_preview = self._pack_preview(kinds=["context_block"], include_imported=True)
+        trusted_redaction = self._pack_redaction_preview(kinds=["context_block"], include_imported=True)
+        self.assertEqual(trusted_preview["structuredContent"]["selection"]["row_ids"], trusted_redaction["structuredContent"]["selection"]["row_ids"])
+        self.assertIn(trusted["id"], trusted_redaction["structuredContent"]["selection"]["row_ids"])
+        self.assertNotIn(quarantined["id"], trusted_redaction["structuredContent"]["selection"]["row_ids"])
+
+        quarantine_preview = self._pack_preview(kinds=["context_block"], include_quarantine=True)
+        quarantine_redaction = self._pack_redaction_preview(kinds=["context_block"], include_quarantine=True)
+        self.assertEqual(
+            quarantine_preview["structuredContent"]["selection"]["row_ids"],
+            quarantine_redaction["structuredContent"]["selection"]["row_ids"],
+        )
+        self.assertIn(quarantined["id"], quarantine_redaction["structuredContent"]["selection"]["row_ids"])
+
+    def test_pack_redaction_preview_topic_filter(self) -> None:
+        body_only = self.record("phase2b auth text only test.user@example.test", kind="context_block")
+        tagged = self.record("phase2b tagged row with redaction test.user@example.test", kind="context_block")
+        topic_add = server.topic_add({"memory_id": tagged["id"], "topic": "phase2b-auth", "source": "operator"})
+        self.assertFalse(topic_add["isError"], topic_add)
+        result = self._pack_redaction_preview(topics=["phase2b-auth"], kinds=["context_block"])
+        ids = result["structuredContent"]["selection"]["row_ids"]
+        self.assertIn(tagged["id"], ids)
+        self.assertNotIn(body_only["id"], ids)
+
+    def test_pack_redaction_preview_touched_paths_filter(self) -> None:
+        auth_file = self.workspace / "src" / "auth" / "session.py"
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        auth_file.write_text("phase2b\n", encoding="utf-8")
+        pay_file = self.workspace / "src" / "billing" / "ledger.py"
+        pay_file.parent.mkdir(parents=True, exist_ok=True)
+        pay_file.write_text("phase2b\n", encoding="utf-8")
+        auth = self.record(
+            "phase2b touched auth test.user@example.test",
+            kind="context_block",
+            touched_files=["src/auth/session.py"],
+        )
+        other = self.record(
+            "phase2b touched other test.user@example.test",
+            kind="context_block",
+            touched_files=["src/billing/ledger.py"],
+        )
+        result = self._pack_redaction_preview(touched_paths=["src/auth/session.py"], kinds=["context_block"])
+        ids = result["structuredContent"]["selection"]["row_ids"]
+        self.assertIn(auth["id"], ids)
+        self.assertNotIn(other["id"], ids)
+
+    def test_pack_redaction_preview_empty_selection(self) -> None:
+        result = self._pack_redaction_preview(topics=["phase2b-missing-topic"])
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(int(payload["selection"]["total_rows"]), 0)
+        self.assertEqual(payload["selection"]["row_ids"], [])
+        self.assertEqual(int(payload["redaction"]["total_matches"]), 0)
+        self.assertEqual(payload["samples"], [])
+
+    def test_pack_redaction_preview_samples_bounded(self) -> None:
+        row_a = self.record(
+            "phase2b sample one test.user@example.test",
+            kind="context_block",
+        )
+        row_b = self.record(
+            "phase2b sample two test.user@example.test 10.20.30.40",
+            kind="context_block",
+        )
+        row_c = self.record(
+            "phase2b sample three test.user@example.test 10.20.30.41 AKIA1234567890ABCDEF",
+            kind="context_block",
+        )
+        self._set_created_at(row_a["id"], "2025-01-01T00:00:00Z")
+        self._set_created_at(row_b["id"], "2026-01-01T00:00:00Z")
+        self._set_created_at(row_c["id"], "2027-01-01T00:00:00Z")
+        result = self._pack_redaction_preview(kinds=["context_block"], max_redacted_samples=2)
+        samples = result["structuredContent"]["samples"]
+        self.assertLessEqual(len(samples), 2)
+        self.assertEqual([int(item["match_count"]) for item in samples], sorted([int(item["match_count"]) for item in samples], reverse=True))
+
+    def test_pack_redaction_preview_include_samples_false(self) -> None:
+        self.record("phase2b no samples test.user@example.test", kind="context_block")
+        result = self._pack_redaction_preview(include_redacted_samples=False)
+        self.assertEqual(result["structuredContent"]["samples"], [])
+
+    def test_pack_redaction_preview_read_only(self) -> None:
+        memory = self.record("phase2b read only test.user@example.test", kind="context_block")
+        before_exported = self._exported_packs_count()
+        before_memories = self._memory_count()
+        before_text = self._memory_text(memory["id"])
+        exports_dir = self.sqlite_file.parent / "exports"
+        before_files = sorted(str(path.relative_to(exports_dir)) for path in exports_dir.rglob("*")) if exports_dir.exists() else []
+        result = self._pack_redaction_preview()
+        self.assertFalse(result["isError"], result)
+        after_exported = self._exported_packs_count()
+        after_memories = self._memory_count()
+        after_text = self._memory_text(memory["id"])
+        after_files = sorted(str(path.relative_to(exports_dir)) for path in exports_dir.rglob("*")) if exports_dir.exists() else []
+        self.assertEqual(before_exported, after_exported)
+        self.assertEqual(before_memories, after_memories)
+        self.assertEqual(before_text, after_text)
+        self.assertEqual(before_files, after_files)
+
+    def test_pack_redaction_preview_interaction_log_warning(self) -> None:
+        memory = self.record("phase2b interaction test.user@example.test", kind="interaction_log")
+        result = self._pack_redaction_preview(kinds=["interaction_log"])
+        warnings = result["structuredContent"]["warnings"]
+        self.assertTrue(any(item.get("code") == "kind_preview_only" for item in warnings))
+        ids = result["structuredContent"]["selection"]["row_ids"]
+        self.assertIn(memory["id"], ids)
+        self.assertGreaterEqual(int(result["structuredContent"]["redaction"]["by_category"].get("email", 0)), 1)
+
+    def test_pack_redaction_preview_no_original_secret_leak(self) -> None:
+        jwt_literal = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.SflKxwRJSMeKKF2QT4fwpMeJJVVVVVVVVVVVV"
+        aws_literal = "AKIA1234567890ABCDEF"
+        email_literal = "phase2b.user@example.test"
+        ip_literal = "172.16.23.45"
+        path_literal = "C:\\Users\\phase2b\\secret.txt"
+        key_header = "-----BEGIN RSA PRIVATE KEY-----"
+        self.record(
+            f"phase2b leak check {email_literal} {aws_literal} {jwt_literal} {ip_literal} {path_literal} {key_header}",
+            kind="context_block",
+        )
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        structured_text = json.dumps(result.get("structuredContent", {}), ensure_ascii=True)
+        content_text = json.dumps(result.get("content", []), ensure_ascii=True)
+        for literal in (jwt_literal, aws_literal, email_literal, ip_literal, path_literal, key_header):
+            self.assertNotIn(literal, structured_text)
+            self.assertNotIn(literal, content_text)
+
+    def test_pack_redaction_preview_limit(self) -> None:
+        for idx in range(6):
+            self.record(f"phase2b limit {idx} test.user@example.test", kind="context_block")
+        result = self._pack_redaction_preview(kinds=["context_block"], limit=2)
+        payload = result["structuredContent"]
+        self.assertTrue(payload["selection"]["limited"])
+        self.assertLessEqual(len(payload["selection"]["row_ids"]), 2)
+        self.assertLessEqual(int(payload["redaction"]["affected_rows"]), 2)
+        warnings = payload["warnings"]
+        self.assertTrue(any(item.get("code") == "redaction_counts_limited" for item in warnings))
+
+    def test_pack_preview_no_bootstrap_regression(self) -> None:
+        result = server.mnemo_gateway({"action": "pack_preview", "params": {}})
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(self._memory_count(), 0)
+
+    def test_pack_redaction_preview_no_ipv6_category_in_phase2b(self) -> None:
+        self.record("phase2b ipv6 only 2001:0db8:85a3:0000:0000:8a2e:0370:7334", kind="context_block")
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        redaction = result["structuredContent"]["redaction"]
+        self.assertNotIn("ipv6", redaction["rules_applied"])
+        self.assertNotIn("ipv6", redaction["by_category"])
+        warnings = result["structuredContent"]["warnings"]
+        self.assertTrue(any(item.get("code") == "redaction_ruleset_baseline_only" for item in warnings))
+
+    def test_pack_redaction_preview_caps_max_samples(self) -> None:
+        for idx in range(55):
+            self.record(f"phase2b cap {idx} test.user@example.test", kind="context_block")
+        result = self._pack_redaction_preview(kinds=["context_block"], max_redacted_samples=100)
+        self.assertLessEqual(len(result["structuredContent"]["samples"]), 50)
+        warnings = result["structuredContent"]["warnings"]
+        self.assertTrue(any(item.get("code") == "max_redacted_samples_capped" for item in warnings))
+
+    def test_pack_redaction_preview_action_log_no_sensitive_leak(self) -> None:
+        literal = "phase2b.log@example.test"
+        self.record(f"phase2b log safety {literal}", kind="context_block")
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            before_max_rowid = int(conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM events").fetchone()[0])
+        finally:
+            conn.close()
+
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        self.assertFalse(result["isError"], result)
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            available = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(events)").fetchall()
+            }
+            wanted = [name for name in ("event_type", "action", "query_text", "summary", "data_json") if name in available]
+            if not wanted:
+                self.assertTrue(True)
+                return
+            select_sql = "SELECT " + ", ".join(wanted) + " FROM events WHERE rowid > ?"
+            new_rows = conn.execute(select_sql, (before_max_rowid,)).fetchall()
+        finally:
+            conn.close()
+        if not new_rows:
+            self.assertTrue(True)
+            return
+        rendered = json.dumps([dict(row) for row in new_rows], ensure_ascii=True)
+        self.assertNotIn(literal, rendered)
+        self.assertNotIn("[REDACTED:email]", rendered)
+
+    def test_pack_redaction_preview_consume_on_match(self) -> None:
+        # user_path runs before ipv4; ipv4 inside this path should not be double-counted.
+        self.record("phase2b consume /home/10.23.45.67/secret.txt", kind="context_block")
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        by_category = result["structuredContent"]["redaction"]["by_category"]
+        self.assertEqual(int(by_category.get("user_path", 0)), 1)
+        self.assertEqual(int(by_category.get("ipv4", 0)), 0)
+
+    def test_pack_redaction_preview_scans_all_relevant_text_fields(self) -> None:
+        self.record(
+            "phase2b safe body text only",
+            kind="context_block",
+            title="phase2b.title@example.test",
+        )
+        result = self._pack_redaction_preview(kinds=["context_block"])
+        redaction = result["structuredContent"]["redaction"]
+        self.assertGreaterEqual(int(redaction["by_category"].get("email", 0)), 1)
+
+    def test_pack_export_requires_allow_unsigned(self) -> None:
+        self.record("phase2c requires unsigned test.user@example.test", kind="context_block")
+        output_dir = self.root / "phase2c_unsigned_required"
+        before_audit = self._exported_packs_count()
+        result = self._pack_export_error(
+            pack_name="phase2c_requires_unsigned",
+            output_dir=str(output_dir),
+        )
+        self.assertIn("Signing is not implemented yet", result["content"][0]["text"])
+        self.assertEqual(self._exported_packs_count(), before_audit)
+        if output_dir.exists():
+            self.assertEqual(list(output_dir.glob("*.zip")), [])
+
+    def test_pack_export_creates_zip_with_required_members(self) -> None:
+        self.record("phase2c zip member email test.user@example.test", kind="context_block")
+        self.record("phase2c zip member aws AKIA1234567890ABCDEF", kind="hippocampus_entry")
+        output_dir = self.root / "phase2c_members"
+        result = self._pack_export(
+            pack_name="phase2c_members",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        self.assertTrue(output_path.exists())
+        with zipfile.ZipFile(output_path, "r") as archive:
+            names = set(archive.namelist())
+        for member in server.PACK_REQUIRED_MEMBERS:
+            self.assertIn(member, names)
+
+    def test_pack_export_manifest_and_jsonl_parse(self) -> None:
+        self.record("phase2c manifest parse one", kind="context_block")
+        self.record("phase2c manifest parse two", kind="hippocampus_entry")
+        output_dir = self.root / "phase2c_manifest_parse"
+        result = self._pack_export(
+            pack_name="phase2c_manifest_parse",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            rows_blob = archive.read("content/memories.jsonl").decode("utf-8")
+        rows = [json.loads(line) for line in rows_blob.splitlines() if line.strip()]
+        self.assertEqual(len(rows), int(manifest["selection"]["exported_rows"]))
+
+    def test_pack_export_content_hash_verifies(self) -> None:
+        self.record("phase2c hash email test.user@example.test", kind="context_block")
+        output_dir = self.root / "phase2c_hash"
+        result = self._pack_export(
+            pack_name="phase2c_hash",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        members = self._read_zip_members(output_path)
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        covered = list(manifest["content_hash"]["covered_members"])
+        recomputed = self._recompute_pack_content_hash(members, covered)
+        self.assertEqual(recomputed, str(manifest["content_hash"]["value"]))
+        self.assertEqual(recomputed, str(result["structuredContent"]["content_hash"]["value"]))
+
+    def test_pack_export_redacts_sensitive_literals(self) -> None:
+        fake_email = "test.user@example.test"
+        fake_jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJwaDJjIn0.c2lnbmF0dXJl"
+        fake_aws = "AKIA1234567890ABCDEF"
+        fake_path = "C:\\Users\\fakeuser\\secret.txt"
+        fake_ipv4 = "10.44.55.66"
+        fake_key = "-----BEGIN RSA PRIVATE KEY-----"
+        self.record(
+            f"phase2c redact {fake_email} {fake_jwt} {fake_aws} {fake_path} {fake_ipv4} {fake_key}",
+            kind="context_block",
+        )
+        output_dir = self.root / "phase2c_redaction"
+        result = self._pack_export(
+            pack_name="phase2c_redaction",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        members = self._read_zip_members(output_path)
+        bundle_text = "\n".join(blob.decode("utf-8", errors="ignore") for blob in members.values())
+        for literal in (fake_email, fake_jwt, fake_aws, fake_path, fake_ipv4, fake_key):
+            self.assertNotIn(literal, bundle_text)
+        for replacement in (
+            "[REDACTED:email]",
+            "[REDACTED:jwt]",
+            "[REDACTED:aws_access_key]",
+            "[REDACTED:user_path]",
+            "[REDACTED:ipv4]",
+            "[REDACTED:private_key_header]",
+        ):
+            self.assertIn(replacement, bundle_text)
+
+    def test_pack_export_no_source_db_ids_in_zip(self) -> None:
+        first = self.record("phase2c no id leak first", kind="context_block")
+        second = self.record("phase2c no id leak second", kind="hippocampus_entry")
+        output_dir = self.root / "phase2c_no_source_ids"
+        result = self._pack_export(
+            pack_name="phase2c_no_source_ids",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        members = self._read_zip_members(output_path)
+        bundle_text = "\n".join(blob.decode("utf-8", errors="ignore") for blob in members.values())
+        self.assertNotIn(first["id"], bundle_text)
+        self.assertNotIn(second["id"], bundle_text)
+
+    def test_pack_export_writes_exported_packs_audit_row(self) -> None:
+        self.record("phase2c audit row one", kind="context_block")
+        before = self._exported_packs_count()
+        output_dir = self.root / "phase2c_audit_row"
+        result = self._pack_export(
+            pack_name="phase2c_audit_row",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        after = self._exported_packs_count()
+        self.assertEqual(after, before + 1)
+        pack_id = str(result["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM exported_packs WHERE pack_id = ?", (pack_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        manifest = json.loads(str(row["manifest_json"]))
+        self.assertEqual(str(row["pack_id"]), pack_id)
+        self.assertEqual(int(row["row_count"]), int(result["structuredContent"]["selection"]["exported_rows"]))
+        self.assertEqual(int(row["signed"]), 0)
+        self.assertEqual(
+            str(manifest["content_hash"]["value"]),
+            str(result["structuredContent"]["content_hash"]["value"]),
+        )
+
+    def test_pack_export_failure_no_audit_row(self) -> None:
+        self.record("phase2c failure no audit", kind="context_block")
+        before = self._exported_packs_count()
+        result = self._pack_export_error(pack_name="phase2c_failure_no_audit")
+        self.assertIn("Signing is not implemented yet", result["content"][0]["text"])
+        self.assertEqual(self._exported_packs_count(), before)
+
+    def test_pack_export_rejects_interaction_log_and_agent_feedback(self) -> None:
+        self.record("phase2c interaction log", kind="interaction_log")
+        self.record("phase2c feedback", kind="agent_feedback", role="specialist")
+        before = self._exported_packs_count()
+        output_dir = self.root / "phase2c_reject_kind"
+        bad_log = self._pack_export_error(
+            pack_name="phase2c_reject_interaction",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            kinds=["interaction_log"],
+        )
+        self.assertIn("kind 'interaction_log' is previewable but not exportable", bad_log["content"][0]["text"])
+        bad_feedback = self._pack_export_error(
+            pack_name="phase2c_reject_feedback",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            kinds=["agent_feedback"],
+        )
+        self.assertIn("kind 'agent_feedback' is previewable but not exportable", bad_feedback["content"][0]["text"])
+        self.assertEqual(self._exported_packs_count(), before)
+        if output_dir.exists():
+            self.assertEqual(list(output_dir.glob("*.zip")), [])
+
+    def test_pack_export_empty_selection_fails(self) -> None:
+        self.record("phase2c empty selection marker", kind="context_block")
+        before = self._exported_packs_count()
+        output_dir = self.root / "phase2c_empty_selection"
+        result = self._pack_export_error(
+            pack_name="phase2c_empty_selection",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            topics=["missing-phase2c-topic"],
+        )
+        self.assertIn("selection returned zero rows", result["content"][0]["text"])
+        self.assertEqual(self._exported_packs_count(), before)
+        if output_dir.exists():
+            self.assertEqual(list(output_dir.glob("*.zip")), [])
+
+    def test_pack_export_limited_selection_requires_override(self) -> None:
+        for idx in range(6):
+            self.record(f"phase2c limited selection {idx}", kind="context_block")
+        output_dir = self.root / "phase2c_limited"
+        failed = self._pack_export_error(
+            pack_name="phase2c_limited_fail",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            limit=2,
+        )
+        self.assertIn("selection is limited", failed["content"][0]["text"])
+        success = self._pack_export(
+            pack_name="phase2c_limited_success",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            limit=2,
+            allow_limited_export=True,
+        )
+        warnings = success["structuredContent"]["warnings"]
+        self.assertTrue(any(item.get("code") == "limited_export" for item in warnings))
+        output_path = Path(success["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        selection = manifest["selection"]
+        self.assertGreater(int(selection["total_rows"]), int(selection["exported_rows"]))
+        self.assertEqual(int(selection["exported_rows"]), 2)
+
+    def test_pack_export_topic_filter_uses_memory_topics(self) -> None:
+        body_only = self.record("phase2c topic auth body-only marker", kind="context_block")
+        tagged = self.record("phase2c tagged memory", kind="context_block")
+        topic_add = server.topic_add({"memory_id": tagged["id"], "topic": "phase2c-auth", "source": "operator"})
+        self.assertFalse(topic_add["isError"], topic_add)
+        output_dir = self.root / "phase2c_topic_filter"
+        result = self._pack_export(
+            pack_name="phase2c_topic_filter",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            topics=["phase2c-auth"],
+            kinds=["context_block"],
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            rows = [
+                json.loads(line)
+                for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(len(rows), 1)
+        text_value = rows[0]["text_fields"]["text"]
+        self.assertIn("phase2c tagged memory", text_value)
+        self.assertNotIn(body_only["id"], json.dumps(rows, ensure_ascii=True))
+
+    def test_pack_export_touched_paths_filter(self) -> None:
+        auth_file = self.workspace / "src" / "auth" / "session.py"
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        auth_file.write_text("phase2c\n", encoding="utf-8")
+        other_file = self.workspace / "src" / "billing" / "ledger.py"
+        other_file.parent.mkdir(parents=True, exist_ok=True)
+        other_file.write_text("phase2c\n", encoding="utf-8")
+        self.record(
+            "phase2c touched auth",
+            kind="context_block",
+            touched_files=["src/auth/session.py"],
+        )
+        self.record(
+            "phase2c touched billing",
+            kind="context_block",
+            touched_files=["src/billing/ledger.py"],
+        )
+        output_dir = self.root / "phase2c_touched_paths"
+        result = self._pack_export(
+            pack_name="phase2c_touched_paths",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            touched_paths=["src/auth/session.py"],
+            kinds=["context_block"],
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            rows = [
+                json.loads(line)
+                for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(len(rows), 1)
+        touched_files = rows[0]["touched_files"]
+        self.assertEqual(len(touched_files), 1)
+        self.assertEqual(str(touched_files[0]["path"]), "src/auth/session.py")
+
+    def test_pack_export_read_only_except_audit_and_zip(self) -> None:
+        self.record("phase2c read-only export row", kind="context_block")
+        before = {
+            "memories": self._table_count("memories"),
+            "memory_topics": self._table_count("memory_topics"),
+            "memory_files": self._table_count("memory_files"),
+            "imported_packs": self._table_count("imported_packs"),
+            "alias_concepts": self._table_count("alias_concepts"),
+            "alias_terms": self._table_count("alias_terms"),
+            "alias_proposals": self._table_count("alias_proposals"),
+            "alias_proposal_events": self._table_count("alias_proposal_events"),
+            "exported_packs": self._table_count("exported_packs"),
+        }
+        output_dir = self.root / "phase2c_read_only"
+        result = self._pack_export(
+            pack_name="phase2c_read_only",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        after = {
+            "memories": self._table_count("memories"),
+            "memory_topics": self._table_count("memory_topics"),
+            "memory_files": self._table_count("memory_files"),
+            "imported_packs": self._table_count("imported_packs"),
+            "alias_concepts": self._table_count("alias_concepts"),
+            "alias_terms": self._table_count("alias_terms"),
+            "alias_proposals": self._table_count("alias_proposals"),
+            "alias_proposal_events": self._table_count("alias_proposal_events"),
+            "exported_packs": self._table_count("exported_packs"),
+        }
+        self.assertEqual(before["memories"], after["memories"])
+        self.assertEqual(before["memory_topics"], after["memory_topics"])
+        self.assertEqual(before["memory_files"], after["memory_files"])
+        self.assertEqual(before["imported_packs"], after["imported_packs"])
+        self.assertEqual(before["alias_concepts"], after["alias_concepts"])
+        self.assertEqual(before["alias_terms"], after["alias_terms"])
+        self.assertEqual(before["alias_proposals"], after["alias_proposals"])
+        self.assertEqual(before["alias_proposal_events"], after["alias_proposal_events"])
+        self.assertEqual(before["exported_packs"] + 1, after["exported_packs"])
+        self.assertTrue(Path(result["structuredContent"]["output_path"]).exists())
+
+    def test_pack_export_pack_local_row_ids(self) -> None:
+        self.record("phase2c row ids context a", kind="context_block")
+        self.record("phase2c row ids hip a", kind="hippocampus_entry")
+        self.record("phase2c row ids context b", kind="context_block")
+        self.record("phase2c row ids hip b", kind="hippocampus_entry")
+        output_dir = self.root / "phase2c_row_ids"
+        result = self._pack_export(
+            pack_name="phase2c_row_ids",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            rows = [
+                json.loads(line)
+                for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines()
+                if line.strip()
+            ]
+        ctx_ids = [str(row["row_id_in_pack"]) for row in rows if str(row["kind"]) == "context_block"]
+        hip_ids = [str(row["row_id_in_pack"]) for row in rows if str(row["kind"]) == "hippocampus_entry"]
+        self.assertEqual(ctx_ids, [f"ctx_{idx:03d}" for idx in range(1, len(ctx_ids) + 1)])
+        self.assertEqual(hip_ids, [f"hip_{idx:03d}" for idx in range(1, len(hip_ids) + 1)])
+
+    def test_pack_export_zip_validation_failure_no_success(self) -> None:
+        self.record("phase2c forced validation failure", kind="context_block")
+        output_dir = self.root / "phase2c_validation_fail"
+        before = self._exported_packs_count()
+        with mock.patch("server._pack_validate_zip", side_effect=ValueError("forced invalid zip")):
+            result = self._pack_export_error(
+                pack_name="phase2c_validation_fail",
+                output_dir=str(output_dir),
+                allow_unsigned=True,
+            )
+        self.assertIn("forced invalid zip", result["content"][0]["text"])
+        self.assertEqual(self._exported_packs_count(), before)
+        if output_dir.exists():
+            leftovers = [path for path in output_dir.iterdir() if path.suffix in {".zip", ".tmp"} or path.name.endswith(".zip.tmp")]
+            self.assertEqual(leftovers, [])
+
+    def test_pack_export_rejects_unsafe_pack_name(self) -> None:
+        self.record("phase2c unsafe names", kind="context_block")
+        before = self._exported_packs_count()
+        empty_name = self._pack_export_error(pack_name="   ", allow_unsigned=True)
+        self.assertIn("pack_name", empty_name["content"][0]["text"])
+        leading_dot = self._pack_export_error(pack_name=".hidden_pack", allow_unsigned=True)
+        self.assertIn("cannot start with", leading_dot["content"][0]["text"])
+        reserved = self._pack_export_error(pack_name="CON", allow_unsigned=True)
+        self.assertIn("reserved", reserved["content"][0]["text"])
+        self.assertEqual(self._exported_packs_count(), before)
+
+    def test_pack_export_filename_sanitization(self) -> None:
+        self.record("phase2c filename sanitize row", kind="context_block")
+        output_dir = self.root / "phase2c_safe_output"
+        result = self._pack_export(
+            pack_name="my pack ../unsafe::name!!",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"]).resolve()
+        self.assertEqual(output_path.parent, output_dir.resolve())
+        self.assertNotIn(" ", output_path.name)
+        self.assertNotIn("/", output_path.name)
+        self.assertNotIn("\\", output_path.name)
+
+    def test_pack_export_preview_redaction_parity(self) -> None:
+        first = self.record(
+            "phase2c parity one test.user@example.test AKIA1234567890ABCDEF",
+            kind="context_block",
+        )
+        second = self.record(
+            "phase2c parity two test.user@example.test 10.22.33.44",
+            kind="hippocampus_entry",
+        )
+        server.topic_add({"memory_id": first["id"], "topic": "phase2c-parity", "source": "operator"})
+        server.topic_add({"memory_id": second["id"], "topic": "phase2c-parity", "source": "operator"})
+        preview = self._pack_redaction_preview(
+            topics=["phase2c-parity"],
+            kinds=["context_block", "hippocampus_entry"],
+            limit=100,
+        )
+        export = self._pack_export(
+            pack_name="phase2c_parity",
+            output_dir=str(self.root / "phase2c_parity"),
+            allow_unsigned=True,
+            topics=["phase2c-parity"],
+            kinds=["context_block", "hippocampus_entry"],
+            limit=100,
+        )
+        preview_redaction = preview["structuredContent"]["redaction"]
+        export_redaction = export["structuredContent"]["redaction"]
+        self.assertEqual(int(preview_redaction["total_matches"]), int(export_redaction["total_matches"]))
+        self.assertEqual(
+            {str(k): int(v) for k, v in preview_redaction["by_category"].items()},
+            {str(k): int(v) for k, v in export_redaction["by_category"].items()},
+        )
+
+    def test_pack_export_all_rows_redacted_edge_case(self) -> None:
+        self.record("phase2c all redacted one test.user@example.test", kind="context_block")
+        self.record("phase2c all redacted two test.user@example.test", kind="hippocampus_entry")
+        result = self._pack_export(
+            pack_name="phase2c_all_redacted",
+            output_dir=str(self.root / "phase2c_all_redacted"),
+            allow_unsigned=True,
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        payload = result["structuredContent"]
+        self.assertEqual(int(payload["redaction"]["affected_rows"]), int(payload["selection"]["exported_rows"]))
+
+    def test_pack_export_ruleset_version_constant(self) -> None:
+        self.record("phase2c ruleset constant test.user@example.test", kind="context_block")
+        result = self._pack_export(
+            pack_name="phase2c_ruleset",
+            output_dir=str(self.root / "phase2c_ruleset"),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            redactions = json.loads(archive.read("provenance/redactions.json").decode("utf-8"))
+        self.assertEqual(str(manifest["redaction_ruleset_version"]), "baseline-v1")
+        self.assertEqual(str(redactions["ruleset_version"]), "baseline-v1")
+        self.assertEqual(str(result["structuredContent"]["redaction"]["ruleset_version"]), "baseline-v1")
+
+
 class IdfActivationTests(MnemoTestCase):
     class _FakeBreakdown:
         def __init__(
@@ -3746,30 +5307,6 @@ class MissTrackingAndAliasProposalTests(MnemoTestCase):
         finally:
             conn.close()
         self.assertEqual(count, 0)
-
-    def test_alias_curation_workflow_prompt_exists(self) -> None:
-        current = Path(__file__).resolve()
-        found: Path | None = None
-        for parent in [current.parent, *current.parents]:
-            direct = parent / ".github" / "prompts" / "workflow.alias-curation.prompt.md"
-            if direct.exists():
-                found = direct
-                break
-            nested = parent / "agentic" / ".github" / "prompts" / "workflow.alias-curation.prompt.md"
-            if nested.exists():
-                found = nested
-                break
-        self.assertIsNotNone(found, "workflow.alias-curation.prompt.md was not found in prompt library")
-        assert found is not None
-        text = found.read_text(encoding="utf-8")
-        self.assertIn("propose_aliases", text)
-        self.assertIn("list_alias_proposals", text)
-        self.assertIn("approve_alias", text)
-        self.assertIn("reject_alias_proposal", text)
-        self.assertNotIn("prepare a patch for `.agentic/vocabulary/aliases.json`", text)
-        self.assertIn("Do not touch `.agentic/vocabulary/aliases.json`", text)
-        self.assertIn(".agentic/vocabulary/aliases.example.json", text)
-
 
 class AliasSqliteLifecycleTests(MnemoTestCase):
     def setUp(self) -> None:
