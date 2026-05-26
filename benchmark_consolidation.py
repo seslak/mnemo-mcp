@@ -1,5 +1,5 @@
 """
-Mnemo v0.13.4 consolidation benchmark.
+Mnemo v0.13.0 consolidation benchmark.
 
 Inserts 50 000 memories (mix of exact duplicates, near-duplicates, and unique),
 then measures:
@@ -134,7 +134,7 @@ def run_benchmark(n: int = 50_000) -> bool:
         os.environ["MNEMO_LOG_EVENTS"] = "0"
         server._SQLITE_BOOTSTRAPPED.clear()
 
-        print(f"\n=== Mnemo v0.13.4 Consolidation Benchmark ({n:,} rows) ===\n")
+        print(f"\n=== Mnemo v0.13.0 Consolidation Benchmark ({n:,} rows) ===\n")
 
         # Ensure schema exists
         server.load_store()

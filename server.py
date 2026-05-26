@@ -39,6 +39,8 @@ Environment variables:
 from __future__ import annotations
 
 import hashlib
+import hmac
+import io
 import json
 import math
 import os
@@ -61,8 +63,8 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.17.0"
-SQLITE_SCHEMA_VERSION = "4"
+SERVER_VERSION = "0.21.2"
+SQLITE_SCHEMA_VERSION = "7"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 DEFAULT_MEMORY_NAMESPACE = "local"
 DEFAULT_MEMORY_ORIGIN = "local"
@@ -118,18 +120,69 @@ PACK_CONTENT_HASH_COVERED_MEMBERS = (
     "provenance/origin.json",
     "provenance/redactions.json",
 )
+PACK_INSPECT_REQUIRED_MEMBERS = (
+    "manifest.json",
+    "content/memories.jsonl",
+    "content/topics.json",
+    "content/file_fingerprints.json",
+    "provenance/origin.json",
+    "provenance/redactions.json",
+)
+PACK_INSPECT_KNOWN_EXTRA_MEMBERS = {
+    "signature/pack.sig",
+    "signature/pubkey.txt",
+    "signature/signature.json",
+}
+PACK_INSPECT_MAX_MEMBERS = 1000
+PACK_INSPECT_MAX_MEMBER_SIZE = 25 * 1024 * 1024
+PACK_INSPECT_MAX_TOTAL_SIZE = 100 * 1024 * 1024
+PACK_INSPECT_SOURCE_ID_RE = re.compile(r"\bmem_[A-Za-z0-9_:-]+\b")
+PACK_INSPECT_PACK_ID_RE = re.compile(r"^pack_\d{8}T\d{6}Z_[0-9a-f]{8}$")
+PACK_INSPECT_UTC_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 PACK_BASELINE_WARNING_MESSAGE = (
     "Redaction covered: private_key_header, jwt, aws_access_key, email, user_path, ipv4. "
     "Other secret formats such as GitHub, Slack, GCP, Stripe, Azure SAS, generic Bearer tokens, "
     "and IPv6 are not detected."
 )
+PACK_LOCAL_HMAC_WARNING_MESSAGE = (
+    "Local HMAC signing is not public-key signing and is intended for local/dev trust workflows only."
+)
 PACK_KIND_PREVIEW_ERROR_TEMPLATE = "kind '{kind}' is previewable but not exportable in v1 policy"
 PACK_ALLOW_UNSIGNED_ERROR = (
-    "Signing is not implemented yet; pass allow_unsigned=true to create an unsigned development pack."
+    "Unsigned export requires allow_unsigned=true when sign_pack is not enabled."
 )
+PACK_IMPORT_ALLOW_UNSIGNED_QUARANTINE_ERROR = (
+    "Unsigned pack import is quarantine-only in this phase; pass allow_unsigned_quarantine=true to import into quarantine."
+)
+PACK_IMPORT_TARGET_NOT_ALLOWED_ERROR = (
+    "Import target is not allowed in this phase; pass allow_trusted_import=true for trusted import or "
+    "allow_unsigned_quarantine=true for quarantine import."
+)
+PACK_IMPORT_OUTPUT_MAX_ROWS = 100
+PACK_IMPORT_FRESHNESS_VALUES = ("verified", "stale", "missing", "unknown")
+PACK_IMPORT_UNKNOWN_TEXT_FIELD_WARNING_CODE = "unknown_text_field_skipped"
+PACK_IMPORT_OUTPUT_TRUNCATED_WARNING_CODE = "imported_rows_truncated"
+PACK_SIGNATURE_MEMBER = "signature/signature.json"
+PACK_UNSIGNED_REASON_SIGNING_NOT_IMPLEMENTED = "signing_not_implemented"
+PACK_UNSIGNED_REASON_OPERATOR = "operator_chose_unsigned"
+PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL = "hmac-sha256-local-v1"
+PACK_SIGNATURE_PAYLOAD_VERSION_V1 = "memory-pack-signing-v1"
+PACK_SIGNATURE_SCHEMA_VERSION = 1
+PACK_SECRET_MIN_LENGTH = 32
+PACK_SIGNER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{3,128}$")
+SECRET_PARAM_NAMES = {"signing_secret", "verification_secret", "secret"}
+PACK_LIST_IMPORTS_LIMIT_DEFAULT = 50
+PACK_LIST_IMPORTS_LIMIT_MAX = 200
+PACK_REVIEW_LIMIT_DEFAULT = 100
+PACK_REVIEW_LIMIT_MAX = 1000
+PACK_REVIEW_SAMPLE_LIMIT_DEFAULT = 10
+PACK_REVIEW_SAMPLE_LIMIT_MAX = 50
+PACK_PROMOTE_PREVIEW_CANDIDATE_OUTPUT_MAX = 100
+PACK_PROMOTE_OUTPUT_MAX_ROWS = 100
 PACK_SAMPLES_SCAN_ORDER = tuple(PACK_REDACTION_TEXT_FIELDS)
 PACK_NAMESPACE_PREFIX = "pack:"
 PACK_QUARANTINE_PREFIX = "pack:quarantine:"
+PACK_TRUSTED_PREFIX = "pack:trusted:"
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:-]+")
 CAMEL_RE = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|[0-9]+")
 TOKEN_CHARS_PER_TOKEN = 3.7
@@ -639,6 +692,34 @@ def parse_strict_bool(value: Any, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean")
 
 
+def scrub_secret_params(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        out: dict[Any, Any] = {}
+        for key, value in payload.items():
+            key_text = str(key)
+            if key_text in SECRET_PARAM_NAMES:
+                out[key] = "[REDACTED]"
+            else:
+                out[key] = scrub_secret_params(value)
+        return out
+    if isinstance(payload, list):
+        return [scrub_secret_params(item) for item in payload]
+    if isinstance(payload, tuple):
+        return tuple(scrub_secret_params(item) for item in payload)
+    return payload
+
+
+def _secret_fingerprint(secret: str) -> str:
+    return hashlib.sha256(str(secret).encode("utf-8")).hexdigest()[:32]
+
+
+def _validate_secret_length(secret: Any, *, field_name: str) -> str:
+    value = normalize_optional_string(secret)
+    if value is None or len(value) < PACK_SECRET_MIN_LENGTH:
+        raise ValueError(f"{field_name} must be at least {PACK_SECRET_MIN_LENGTH} characters")
+    return value
+
+
 def strip_suffix(token: str) -> str:
     current = token
     for _ in range(2):
@@ -987,6 +1068,9 @@ def derive_pack_id_from_namespace(namespace: Any) -> str | None:
     namespace_text = normalize_optional_string(namespace)
     if namespace_text is None:
         return None
+    if namespace_text.startswith(PACK_TRUSTED_PREFIX):
+        pack_id = namespace_text[len(PACK_TRUSTED_PREFIX) :].strip()
+        return pack_id or None
     if namespace_text.startswith(PACK_QUARANTINE_PREFIX):
         pack_id = namespace_text[len(PACK_QUARANTINE_PREFIX) :].strip()
         return pack_id or None
@@ -1333,8 +1417,9 @@ def _sqlite_rebuild_fts_index(conn: sqlite3.Connection) -> bool:
 
 def _event_payload_dict(payload: Any) -> dict[str, Any]:
     if isinstance(payload, dict):
-        return dict(payload)
-    return {"value": payload}
+        scrubbed = scrub_secret_params(payload)
+        return dict(scrubbed) if isinstance(scrubbed, dict) else {"value": scrubbed}
+    return {"value": scrub_secret_params(payload)}
 
 
 def _event_int_value(value: Any) -> int | None:
@@ -1843,7 +1928,21 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
             namespace TEXT NOT NULL,
             imported_at TEXT NOT NULL,
             manifest_json TEXT NOT NULL,
-            freshness_summary_json TEXT
+            freshness_summary_json TEXT,
+            received_zip_sha256 TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS imported_pack_rows (
+            pack_id TEXT NOT NULL,
+            row_id_in_pack TEXT NOT NULL,
+            memory_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            PRIMARY KEY (pack_id, row_id_in_pack),
+            UNIQUE(memory_id)
         )
         """
     )
@@ -1857,6 +1956,52 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
             redaction_count INTEGER NOT NULL,
             signed INTEGER NOT NULL DEFAULT 0,
             manifest_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promoted_pack_rows (
+            pack_id TEXT NOT NULL,
+            row_id_in_pack TEXT NOT NULL,
+            imported_memory_id TEXT NOT NULL,
+            promoted_memory_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            promoted_at TEXT NOT NULL,
+            original_import_freshness TEXT,
+            promotion_id TEXT,
+            PRIMARY KEY (pack_id, row_id_in_pack),
+            UNIQUE(promoted_memory_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promotion_audit (
+            promotion_id TEXT PRIMARY KEY,
+            pack_id TEXT NOT NULL,
+            promoted_at TEXT NOT NULL,
+            filters_json TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            limited INTEGER NOT NULL DEFAULT 0,
+            allow_promote_all INTEGER NOT NULL DEFAULT 0,
+            allow_limited_promotion INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trusted_signers (
+            signer_id TEXT PRIMARY KEY,
+            label TEXT,
+            trust_level TEXT NOT NULL,
+            signature_algorithm TEXT NOT NULL,
+            secret_fingerprint TEXT,
+            public_key TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            notes TEXT
         )
         """
     )
@@ -1889,6 +2034,15 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_files_path ON memory_files(path)",
         "CREATE INDEX IF NOT EXISTS idx_memory_topics_topic ON memory_topics(topic)",
         "CREATE INDEX IF NOT EXISTS idx_memory_topics_memory_id ON memory_topics(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_imported_pack_rows_pack_id ON imported_pack_rows(pack_id)",
+        "CREATE INDEX IF NOT EXISTS idx_imported_pack_rows_memory_id ON imported_pack_rows(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_promoted_pack_rows_pack_id ON promoted_pack_rows(pack_id)",
+        "CREATE INDEX IF NOT EXISTS idx_promoted_pack_rows_imported_memory_id ON promoted_pack_rows(imported_memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_promoted_pack_rows_promoted_memory_id ON promoted_pack_rows(promoted_memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_promoted_pack_rows_promotion_id ON promoted_pack_rows(promotion_id)",
+        "CREATE INDEX IF NOT EXISTS idx_promotion_audit_pack_id ON promotion_audit(pack_id)",
+        "CREATE INDEX IF NOT EXISTS idx_trusted_signers_status ON trusted_signers(status)",
+        "CREATE INDEX IF NOT EXISTS idx_trusted_signers_trust_level ON trusted_signers(trust_level)",
     ):
         conn.execute(statement)
     conn.execute(
@@ -1980,6 +2134,12 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     for _col_name, _col_type in _git_and_pack_columns:
         if _col_name not in _existing_cols:
             conn.execute(f"ALTER TABLE memories ADD COLUMN {_col_name} {_col_type}")
+    _imported_pack_columns = {row[1] for row in conn.execute("PRAGMA table_info(imported_packs)").fetchall()}
+    if "received_zip_sha256" not in _imported_pack_columns:
+        conn.execute("ALTER TABLE imported_packs ADD COLUMN received_zip_sha256 TEXT")
+    _promoted_pack_row_columns = {row[1] for row in conn.execute("PRAGMA table_info(promoted_pack_rows)").fetchall()}
+    if "promotion_id" not in _promoted_pack_row_columns:
+        conn.execute("ALTER TABLE promoted_pack_rows ADD COLUMN promotion_id TEXT")
     for _statement in (
         "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace)",
         "CREATE INDEX IF NOT EXISTS idx_memories_origin ON memories(origin)",
@@ -2262,16 +2422,31 @@ def _store_memory_file_rows(
         )
 
 
-def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> None:
+def _sqlite_upsert_memory(
+    conn: sqlite3.Connection,
+    memory: dict[str, Any],
+    *,
+    respect_provided_git_on_new: bool = False,
+    store_touched_files: bool = True,
+) -> None:
     row = _memory_to_sqlite_row(memory)
     memory_id = str(row.get("id", "")).strip()
     existing_row = conn.execute("SELECT git_sha, git_branch, git_dirty FROM memories WHERE id = ?", (memory_id,)).fetchone()
     is_new_row = existing_row is None
     if is_new_row:
-        git_ctx = capture_git_context(_git_repo_root())
-        row["git_sha"] = normalize_optional_string(git_ctx.get("sha"))
-        row["git_branch"] = normalize_optional_string(git_ctx.get("branch"))
-        row["git_dirty"] = normalize_git_dirty(git_ctx.get("dirty"))
+        keep_provided = bool(
+            respect_provided_git_on_new
+            and (
+                row.get("git_sha") is not None
+                or row.get("git_branch") is not None
+                or row.get("git_dirty") is not None
+            )
+        )
+        if not keep_provided:
+            git_ctx = capture_git_context(_git_repo_root())
+            row["git_sha"] = normalize_optional_string(git_ctx.get("sha"))
+            row["git_branch"] = normalize_optional_string(git_ctx.get("branch"))
+            row["git_dirty"] = normalize_git_dirty(git_ctx.get("dirty"))
     else:
         row["git_sha"] = normalize_optional_string(row.get("git_sha")) or normalize_optional_string(existing_row["git_sha"])
         row["git_branch"] = normalize_optional_string(row.get("git_branch")) or normalize_optional_string(existing_row["git_branch"])
@@ -2349,7 +2524,7 @@ def _sqlite_upsert_memory(conn: sqlite3.Connection, memory: dict[str, Any]) -> N
         row,
     )
     touched_files = normalize_touched_files(memory.get("_touched_files"))
-    if is_new_row and touched_files:
+    if is_new_row and touched_files and store_touched_files:
         _store_memory_file_rows(
             conn,
             memory_table=str(row.get("kind", "")),
@@ -2665,6 +2840,20 @@ def tool_error(message: str) -> dict[str, Any]:
     }
 
 
+def tool_error_code(code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = {
+        "code": str(code),
+        "message": str(message),
+    }
+    if isinstance(details, dict) and details:
+        payload.update(details)
+    return {
+        "content": [{"type": "text", "text": f"Error [{code}]: {message}"}],
+        "isError": True,
+        "structuredContent": {"error": payload},
+    }
+
+
 def salience_unavailable_result(reason: str | None = None) -> dict[str, Any]:
     structured = {
         "error": "agent_salience_unavailable",
@@ -2951,6 +3140,7 @@ def resolve_namespace_origin_filters(
         raise ValueError("namespace and namespaces cannot both be supplied")
 
     namespaces: list[str]
+    explicit_namespace_filter = bool(has_namespace or has_namespaces)
     if has_namespace:
         namespace_value = normalize_optional_string(args.get("namespace"))
         if namespace_value is None:
@@ -2966,10 +3156,11 @@ def resolve_namespace_origin_filters(
 
     include_imported = parse_bool(args.get("include_imported"), default=False)
     include_quarantine = parse_bool(args.get("include_quarantine"), default=False)
-    if conn is not None and include_imported:
-        namespaces.extend(_imported_pack_namespaces(conn, "trusted"))
-    if conn is not None and include_quarantine:
-        namespaces.extend(_imported_pack_namespaces(conn, "quarantine"))
+    if not explicit_namespace_filter:
+        if conn is not None and include_imported:
+            namespaces.extend(_imported_pack_namespaces(conn, "trusted"))
+        if conn is not None and include_quarantine:
+            namespaces.extend(_imported_pack_namespaces(conn, "quarantine"))
 
     deduped_namespaces: list[str] = []
     seen_namespaces: set[str] = set()
@@ -3115,12 +3306,17 @@ def rank_memories_for_query(
     return ranked
 
 
+def _quote_sqlite_fts_token(token: str) -> str:
+    # SQLite FTS phrase quoting uses doubled internal quote characters.
+    return '"' + token.replace('"', '""') + '"'
+
+
 def _sqlite_fts_match_expression(query_tokens: set[str]) -> str:
     tokens = sorted(token for token in query_tokens if token)
     if not tokens:
         return ""
     limited = tokens[:24]
-    quoted = [f"\"{token.replace('\"', '\"\"')}\"" for token in limited]
+    quoted = [_quote_sqlite_fts_token(token) for token in limited]
     return " OR ".join(quoted)
 
 
@@ -3729,7 +3925,7 @@ def append_query_log(
     row = {
         "ts": now_iso(),
         "tool": tool,
-        "args": args,
+        "args": scrub_secret_params(args),
         "top_ids": top_ids,
         "top_score": float(derived_top_score),
         "n_results": n_results,
@@ -3755,6 +3951,8 @@ def append_query_log(
             row[str(key)] = value
     if phase is not None or tool in {"mnemo_search", "mnemo_compact_context"}:
         row["phase"] = phase
+
+    row = scrub_secret_params(row)
 
     if store_backend() == "sqlite":
         try:
@@ -3788,12 +3986,13 @@ def events_archive_path() -> Path:
 def append_event_log(event: str, memory_id: str, details: dict[str, Any]) -> None:
     if not event_logging_enabled() or not memory_id:
         return
+    scrubbed_details = _event_payload_dict(details)
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
                 _sqlite_ensure_schema(conn)
                 _sqlite_bootstrap_if_needed(conn)
-                _sqlite_insert_event(conn, memory_id, event, details, now_iso())
+                _sqlite_insert_event(conn, memory_id, event, scrubbed_details, now_iso())
         except Exception:
             pass
         return
@@ -3803,7 +4002,7 @@ def append_event_log(event: str, memory_id: str, details: dict[str, Any]) -> Non
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size >= EVENT_LOG_MAX_BYTES:
             _rotate_event_log(path)
-        row = {"ts": now_iso(), "event": event, "id": memory_id, "details": details}
+        row = {"ts": now_iso(), "event": event, "id": memory_id, "details": scrubbed_details}
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
     except Exception:
@@ -8547,6 +8746,40 @@ def _pack_make_pack_id() -> str:
     return f"pack_{stamp}_{secrets.token_hex(4)}"
 
 
+def _pack_make_promotion_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"promotion_{stamp}_{secrets.token_hex(4)}"
+
+
+def _normalize_signer_id(raw_signer_id: Any) -> str:
+    signer_id = normalize_optional_string(raw_signer_id)
+    if signer_id is None:
+        raise ValueError("signer_id is required")
+    if not PACK_SIGNER_ID_RE.match(signer_id):
+        raise ValueError("signer_id must match ^[A-Za-z0-9._:-]{3,128}$")
+    return signer_id
+
+
+def _normalize_signer_trust_level(raw_trust_level: Any, *, default: str = "trusted") -> str:
+    trust_level = normalize_optional_string(raw_trust_level)
+    if trust_level is None:
+        trust_level = default
+    trust_level = str(trust_level).strip().lower()
+    if trust_level not in {"trusted", "blocked"}:
+        raise ValueError("trust_level must be trusted or blocked")
+    return trust_level
+
+
+def _normalize_signer_status(raw_status: Any) -> str:
+    status = normalize_optional_string(raw_status)
+    if status is None:
+        return "active"
+    status = str(status).strip().lower()
+    if status not in {"active", "disabled"}:
+        raise ValueError("status must be active or disabled")
+    return status
+
+
 def _sanitize_pack_name(raw_name: Any) -> str:
     value = normalize_optional_string(raw_name)
     if value is None:
@@ -8586,6 +8819,227 @@ def _pack_output_path(output_dir: Path, sanitized_pack_name: str, pack_id: str) 
     return final_path
 
 
+def _signer_row_payload(row: sqlite3.Row | tuple[Any, ...] | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(row, sqlite3.Row):
+        getter = row.__getitem__
+    elif isinstance(row, dict):
+        getter = row.__getitem__
+    else:
+        raise ValueError("invalid signer row")
+    return {
+        "signer_id": str(getter("signer_id")),
+        "label": normalize_optional_string(getter("label")),
+        "trust_level": str(getter("trust_level")),
+        "signature_algorithm": str(getter("signature_algorithm")),
+        "secret_fingerprint": normalize_optional_string(getter("secret_fingerprint")),
+        "public_key": normalize_optional_string(getter("public_key")),
+        "created_at": str(getter("created_at")),
+        "updated_at": str(getter("updated_at")),
+        "status": str(getter("status")),
+        "notes": normalize_optional_string(getter("notes")),
+    }
+
+
+def signer_add(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("signer_add requires sqlite backend")
+    try:
+        signer_id = _normalize_signer_id(args.get("signer_id"))
+        label = normalize_optional_string(args.get("label"))
+        trust_level = _normalize_signer_trust_level(args.get("trust_level"), default="trusted")
+        signature_algorithm = normalize_optional_string(args.get("signature_algorithm")) or PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL
+        signature_algorithm = signature_algorithm.strip().lower()
+        if signature_algorithm != PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL:
+            return tool_error_code(
+                "unsupported_signature_algorithm",
+                f"unsupported signature_algorithm: {signature_algorithm}",
+            )
+        secret_value = _validate_secret_length(args.get("secret"), field_name="secret")
+        notes = normalize_optional_string(args.get("notes"))
+    except ValueError as exc:
+        message = str(exc)
+        if "at least" in message and "secret" in message:
+            return tool_error_code("secret_too_short", message)
+        return tool_error(message)
+
+    now_value = now_iso()
+    secret_fingerprint = _secret_fingerprint(secret_value)
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            existing = conn.execute(
+                "SELECT 1 FROM trusted_signers WHERE signer_id = ?",
+                (signer_id,),
+            ).fetchone()
+            if existing is not None:
+                return tool_error_code("signer_already_exists", f"signer {signer_id} already exists")
+            conn.execute(
+                """
+                INSERT INTO trusted_signers(
+                    signer_id, label, trust_level, signature_algorithm, secret_fingerprint,
+                    public_key, created_at, updated_at, status, notes
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signer_id,
+                    label,
+                    trust_level,
+                    signature_algorithm,
+                    secret_fingerprint,
+                    None,
+                    now_value,
+                    now_value,
+                    "active",
+                    notes,
+                ),
+            )
+    except sqlite3.IntegrityError as exc:
+        return tool_error_code("signer_add_integrity_error", str(exc))
+    except Exception as exc:
+        return tool_error_code("signer_add_failed", f"{type(exc).__name__}: {exc}")
+
+    structured = {
+        "action": "signer_add",
+        "status": "ok",
+        "signer": {
+            "signer_id": signer_id,
+            "label": label,
+            "trust_level": trust_level,
+            "signature_algorithm": signature_algorithm,
+            "secret_fingerprint": secret_fingerprint,
+            "status": "active",
+            "created_at": now_value,
+        },
+        "warnings": [_pack_local_hmac_warning()],
+    }
+    return text_result(f"Signer added: {signer_id}", structured)
+
+
+def signer_list(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("signer_list requires sqlite backend")
+    try:
+        limit = _safe_int(args.get("limit"), 100, minimum=1, maximum=500)
+        status_filter = normalize_optional_string(args.get("status"))
+        if status_filter is not None:
+            status_filter = _normalize_signer_status(status_filter)
+        trust_level_filter = normalize_optional_string(args.get("trust_level"))
+        if trust_level_filter is not None:
+            trust_level_filter = _normalize_signer_trust_level(trust_level_filter, default="")
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status_filter is not None:
+        clauses.append("status = ?")
+        params.append(status_filter)
+    if trust_level_filter is not None:
+        clauses.append("trust_level = ?")
+        params.append(trust_level_filter)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            total = int(conn.execute(f"SELECT COUNT(*) FROM trusted_signers {where_sql}", tuple(params)).fetchone()[0])
+            rows = conn.execute(
+                f"""
+                SELECT signer_id, label, trust_level, signature_algorithm, secret_fingerprint,
+                       public_key, created_at, updated_at, status, notes
+                FROM trusted_signers
+                {where_sql}
+                ORDER BY created_at DESC, signer_id ASC
+                LIMIT ?
+                """,
+                tuple(params + [limit]),
+            ).fetchall()
+    except Exception as exc:
+        return tool_error_code("signer_list_failed", f"{type(exc).__name__}: {exc}")
+
+    signers = [_signer_row_payload(row) for row in rows]
+    structured = {
+        "action": "signer_list",
+        "status": "ok",
+        "total": total,
+        "limited": bool(total > limit),
+        "signers": signers,
+    }
+    return text_result(f"Signers listed: {len(signers)} of {total}", structured)
+
+
+def _signer_set_status(args: dict[str, Any], *, action_name: str, next_status: str) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error(f"{action_name} requires sqlite backend")
+    try:
+        signer_id = _normalize_signer_id(args.get("signer_id"))
+    except ValueError as exc:
+        return tool_error(str(exc))
+    now_value = now_iso()
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            updated = conn.execute(
+                "UPDATE trusted_signers SET status = ?, updated_at = ? WHERE signer_id = ?",
+                (next_status, now_value, signer_id),
+            )
+            if int(updated.rowcount) <= 0:
+                return tool_error_code("signer_not_found", f"signer {signer_id} was not found")
+    except Exception as exc:
+        return tool_error_code(f"{action_name}_failed", f"{type(exc).__name__}: {exc}")
+    structured = {
+        "action": action_name,
+        "status": "ok",
+        "signer_id": signer_id,
+        "signer_status": next_status,
+    }
+    return text_result(f"Signer {signer_id} status set to {next_status}.", structured)
+
+
+def signer_disable(args: dict[str, Any]) -> dict[str, Any]:
+    return _signer_set_status(args, action_name="signer_disable", next_status="disabled")
+
+
+def signer_enable(args: dict[str, Any]) -> dict[str, Any]:
+    return _signer_set_status(args, action_name="signer_enable", next_status="active")
+
+
+def _trusted_signer_lookup_readonly(signer_id: str) -> dict[str, Any] | None:
+    if store_backend() != "sqlite":
+        return None
+    db_path = sqlite_path()
+    if not db_path.exists():
+        return None
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT signer_id, trust_level, status, signature_algorithm, secret_fingerprint
+            FROM trusted_signers
+            WHERE signer_id = ?
+            """,
+            (signer_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "signer_id": str(row["signer_id"]),
+            "trust_level": str(row["trust_level"]),
+            "status": str(row["status"]),
+            "signature_algorithm": str(row["signature_algorithm"]),
+            "secret_fingerprint": normalize_optional_string(row["secret_fingerprint"]),
+        }
+    except Exception:
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _pack_json_bytes(payload: Any) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -8619,6 +9073,35 @@ def _pack_content_hash(
     }
 
 
+def _pack_signing_payload_v1(manifest: dict[str, Any]) -> bytes:
+    signature = manifest.get("signature", {})
+    if not isinstance(signature, dict):
+        raise ValueError("manifest.signature must be an object")
+    content_hash = manifest.get("content_hash", {})
+    if not isinstance(content_hash, dict):
+        raise ValueError("manifest.content_hash must be an object")
+    payload_obj = {
+        "signature_payload_version": PACK_SIGNATURE_PAYLOAD_VERSION_V1,
+        "pack_id": str(manifest.get("pack_id", "")),
+        "pack_schema_version": int(manifest.get("pack_schema_version", 0)),
+        "content_hash": str(content_hash.get("value", "")),
+        "redaction_ruleset_version": str(manifest.get("redaction_ruleset_version", "")),
+        "signer_id": str(signature.get("signer_id", "")),
+        "signature_algorithm": str(signature.get("signature_algorithm", "")),
+        "secret_fingerprint": str(signature.get("secret_fingerprint", "")),
+    }
+    return json.dumps(payload_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _pack_sign_hmac_v1(manifest: dict[str, Any], secret: str) -> str:
+    payload = _pack_signing_payload_v1(manifest)
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def _pack_local_hmac_warning() -> dict[str, str]:
+    return {"code": "local_hmac_not_public_key", "message": PACK_LOCAL_HMAC_WARNING_MESSAGE}
+
+
 def _pack_validate_zip(path: Path) -> dict[str, Any]:
     with zipfile.ZipFile(path, "r") as archive:
         members = set(archive.namelist())
@@ -8637,19 +9120,55 @@ def _pack_validate_zip(path: Path) -> dict[str, Any]:
         if not isinstance(content_hash, dict):
             raise ValueError("manifest.content_hash must be an object")
         covered_members = content_hash.get("covered_members")
-        if not isinstance(covered_members, list) or not covered_members:
+        if not isinstance(covered_members, list) or not all(isinstance(item, str) for item in covered_members):
             raise ValueError("manifest.content_hash.covered_members must be a non-empty list")
+        if sorted(str(item) for item in covered_members) != sorted(PACK_CONTENT_HASH_COVERED_MEMBERS):
+            raise ValueError("manifest.content_hash.covered_members must match canonical covered members")
+        if str(content_hash.get("algorithm", "")) != "sha256":
+            raise ValueError("manifest.content_hash.algorithm must be sha256")
 
-        member_bytes: dict[str, bytes] = {}
-        for member_name in covered_members:
-            if not isinstance(member_name, str):
-                raise ValueError("manifest.content_hash.covered_members must contain strings")
-            if member_name not in members:
-                raise ValueError(f"manifest referenced missing member: {member_name}")
-            member_bytes[member_name] = archive.read(member_name)
-        recomputed = _pack_content_hash(member_bytes, covered_members=covered_members)
+        member_bytes = {name: archive.read(name) for name in PACK_CONTENT_HASH_COVERED_MEMBERS}
+        recomputed = _pack_content_hash(member_bytes, covered_members=list(PACK_CONTENT_HASH_COVERED_MEMBERS))
         if str(content_hash.get("value", "")) != str(recomputed.get("value", "")):
             raise ValueError("manifest content hash mismatch")
+
+        signed = manifest.get("signed")
+        if not isinstance(signed, bool):
+            raise ValueError("manifest.signed must be boolean")
+        if signed:
+            signature_block = manifest.get("signature", {})
+            if not isinstance(signature_block, dict):
+                raise ValueError("manifest.signature must be an object for signed packs")
+            signature_member = str(signature_block.get("signature_member", "") or "")
+            if signature_member != PACK_SIGNATURE_MEMBER:
+                raise ValueError(f"manifest.signature.signature_member must be {PACK_SIGNATURE_MEMBER}")
+            if signature_member not in members:
+                raise ValueError("missing signature/signature.json member")
+            try:
+                signature_payload = json.loads(archive.read(signature_member).decode("utf-8"))
+            except Exception as exc:
+                raise ValueError(f"invalid signature member {signature_member}: {exc}") from exc
+            if not isinstance(signature_payload, dict):
+                raise ValueError("signature/signature.json must be an object")
+            required_signature_fields = (
+                "signature_schema_version",
+                "signature_algorithm",
+                "signature_payload_version",
+                "signer_id",
+                "secret_fingerprint",
+                "signed_at",
+                "signature_value",
+            )
+            missing_signature_fields = [field for field in required_signature_fields if field not in signature_payload]
+            if missing_signature_fields:
+                raise ValueError(f"signature/signature.json missing fields: {missing_signature_fields}")
+        else:
+            unsigned_reason = str(manifest.get("unsigned_reason", "") or "")
+            if unsigned_reason not in {
+                PACK_UNSIGNED_REASON_SIGNING_NOT_IMPLEMENTED,
+                PACK_UNSIGNED_REASON_OPERATOR,
+            }:
+                raise ValueError("manifest.unsigned_reason is invalid for unsigned pack")
 
         rows_blob = archive.read("content/memories.jsonl").decode("utf-8")
         exported_rows = 0
@@ -8669,6 +9188,1034 @@ def _pack_validate_zip(path: Path) -> dict[str, Any]:
         if exported_rows != manifest_exported_rows:
             raise ValueError("manifest selection.exported_rows mismatch")
         return manifest
+
+
+class PackSnapshotError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+
+
+def _load_pack_snapshot(pack_path: Path) -> dict[str, Any]:
+    # Snapshot invariant:
+    # Validation and import must operate on the exact same bytes. The caller
+    # must not re-read pack_path after this snapshot is created.
+    try:
+        zip_bytes = pack_path.read_bytes()
+    except Exception as exc:
+        raise PackSnapshotError("pack_read_failed", f"{type(exc).__name__}: {exc}") from exc
+    received_zip_sha256 = hashlib.sha256(zip_bytes).hexdigest()
+
+    normalized_infos: dict[str, zipfile.ZipInfo] = {}
+    total_uncompressed = 0
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as archive:
+            infos = archive.infolist()
+            if len(infos) > PACK_INSPECT_MAX_MEMBERS:
+                raise PackSnapshotError(
+                    "zip_member_count_limit",
+                    f"ZIP has {len(infos)} members; max allowed is {PACK_INSPECT_MAX_MEMBERS}.",
+                )
+            for info in infos:
+                if int(info.flag_bits) & 0x1:
+                    raise PackSnapshotError("encrypted_member", f"ZIP member is encrypted: {info.filename}")
+                member_size = int(info.file_size)
+                if member_size > PACK_INSPECT_MAX_MEMBER_SIZE:
+                    raise PackSnapshotError(
+                        "member_size_limit",
+                        f"ZIP member exceeds max size ({PACK_INSPECT_MAX_MEMBER_SIZE} bytes): {info.filename}",
+                    )
+                total_uncompressed += member_size
+                if total_uncompressed > PACK_INSPECT_MAX_TOTAL_SIZE:
+                    raise PackSnapshotError(
+                        "zip_total_size_limit",
+                        f"ZIP uncompressed total exceeds max size ({PACK_INSPECT_MAX_TOTAL_SIZE} bytes).",
+                    )
+                try:
+                    normalized_name, is_dir = _pack_inspect_validate_member_name(str(info.filename))
+                except ValueError as exc:
+                    raise PackSnapshotError("unsafe_member_name", f"{info.filename}: {exc}") from exc
+                if is_dir:
+                    continue
+                if normalized_name in normalized_infos:
+                    raise PackSnapshotError(
+                        "duplicate_member",
+                        f"duplicate ZIP member after normalization: {normalized_name}",
+                    )
+                normalized_infos[normalized_name] = info
+            required_set = set(PACK_INSPECT_REQUIRED_MEMBERS)
+            present_set = set(normalized_infos)
+            missing = sorted(required_set - present_set)
+            if missing:
+                raise PackSnapshotError("missing_required_member", f"missing required members: {missing}")
+
+            member_bytes = {
+                member_name: archive.read(normalized_infos[member_name])
+                for member_name in sorted(normalized_infos)
+            }
+            required_member_bytes = {
+                member_name: member_bytes[member_name]
+                for member_name in PACK_INSPECT_REQUIRED_MEMBERS
+            }
+    except zipfile.BadZipFile as exc:
+        raise PackSnapshotError("bad_zip", f"Bad ZIP file: {exc}") from exc
+    except zipfile.LargeZipFile as exc:
+        raise PackSnapshotError("zip64_not_supported", f"ZIP too large for configured limits: {exc}") from exc
+
+    return {
+        "pack_path": pack_path,
+        "zip_bytes": zip_bytes,
+        "received_zip_sha256": received_zip_sha256,
+        "safe_zip_members": True,
+        "present_members": sorted(normalized_infos),
+        "member_bytes": member_bytes,
+        "required_member_bytes": required_member_bytes,
+    }
+
+
+def _pack_inspect_default() -> dict[str, Any]:
+    return {
+        "action": "pack_inspect",
+        "status": "invalid",
+        "pack": {
+            "pack_id": "",
+            "pack_name": "",
+            "pack_schema_version": None,
+            "created_at": "",
+            "mnemo_version": "",
+            "signed": False,
+            "unsigned_reason": "",
+        },
+        "signature": {
+            "present": False,
+            "verified": False,
+            "signature_algorithm": None,
+            "signer_id": None,
+            "signer_status": None,
+            "trust_level": None,
+            "trust_classification": "unsigned",
+            "secret_fingerprint": None,
+        },
+        "content_hash": {
+            "algorithm": "sha256",
+            "manifest_value": "",
+            "recomputed_value": "",
+            "valid": False,
+            "covered_members": [],
+            "canonical_covered_members": list(PACK_CONTENT_HASH_COVERED_MEMBERS),
+        },
+        "counts": {
+            "rows": 0,
+            "by_kind": {},
+            "by_namespace": {},
+            "by_origin": {},
+            "topics": 0,
+            "referenced_files": 0,
+            "redaction_total_matches": 0,
+            "redaction_affected_rows": 0,
+        },
+        "validation": {
+            "required_members_present": False,
+            "json_members_parse": False,
+            "jsonl_rows_parse": False,
+            "row_count_matches_manifest": False,
+            "no_source_memory_ids": False,
+            "redaction_metadata_valid": False,
+            "content_hash_valid": False,
+            "covered_members_valid": False,
+            "safe_zip_members": False,
+            "supported_schema": True,
+            "supported_signature_state": True,
+            "signature_valid": True,
+        },
+        "trusted_import_available": False,
+        "import_recommendation": "reject",
+        "warnings": [],
+        "errors": [],
+        "samples": [],
+    }
+
+
+def _pack_inspect_warning(payload: dict[str, Any], code: str, message: str) -> None:
+    warnings = payload.get("warnings", [])
+    if not isinstance(warnings, list):
+        warnings = []
+        payload["warnings"] = warnings
+    key = f"{code}:{message}"
+    existing = {
+        f"{str(item.get('code', ''))}:{str(item.get('message', ''))}"
+        for item in warnings
+        if isinstance(item, dict)
+    }
+    if key in existing:
+        return
+    warnings.append({"code": str(code), "message": str(message)})
+
+
+def _pack_inspect_error(payload: dict[str, Any], code: str, message: str) -> None:
+    errors = payload.get("errors", [])
+    if not isinstance(errors, list):
+        errors = []
+        payload["errors"] = errors
+    errors.append({"code": str(code), "message": str(message)})
+
+
+def _pack_inspect_collapse(text: Any, max_chars: int = 200) -> str:
+    return collapsed_preview_text(text, max_chars=max_chars)
+
+
+def _pack_inspect_validate_member_name(raw_name: str) -> tuple[str, bool]:
+    if "\x00" in raw_name:
+        raise ValueError("member name contains NUL byte")
+    if any(ord(ch) < 0x20 for ch in raw_name):
+        raise ValueError("member name contains control characters")
+    normalized = str(raw_name).replace("\\", "/")
+    if not normalized:
+        raise ValueError("member name is empty")
+    is_dir = normalized.endswith("/")
+    normalized = normalized.rstrip("/") if is_dir else normalized
+    if not normalized:
+        raise ValueError("member name is empty")
+    if normalized.startswith("/"):
+        raise ValueError("member path is absolute")
+    if ":" in normalized:
+        raise ValueError("member path contains ':'")
+    segments = normalized.split("/")
+    if not segments:
+        raise ValueError("member path is empty")
+    for segment in segments:
+        if segment in {"", ".", ".."}:
+            raise ValueError("member path contains invalid traversal segment")
+    return normalized, is_dir
+
+
+def _pack_inspect_rows_from_jsonl(blob: bytes) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    lines = blob.decode("utf-8").splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parsed = json.loads(line)
+        if not isinstance(parsed, dict):
+            raise ValueError("JSONL row is not an object")
+        rows.append(parsed)
+    return rows
+
+
+def _pack_inspect_parse_json(blob: bytes, field: str) -> dict[str, Any]:
+    parsed = json.loads(blob.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{field} must be a JSON object")
+    return parsed
+
+
+def _pack_inspect_sample_rows(rows: list[dict[str, Any]], sample_limit: int) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    for row in rows[:sample_limit]:
+        row_id = str(row.get("row_id_in_pack", ""))
+        kind_name = str(row.get("kind", ""))
+        topics_raw = row.get("topics", [])
+        topics = [str(item) for item in topics_raw] if isinstance(topics_raw, list) else []
+        text_fields = row.get("text_fields", {})
+        preview_source = ""
+        if isinstance(text_fields, dict):
+            preferred_keys = ["text", "title"] + sorted(
+                key
+                for key in text_fields
+                if str(key) not in {"text", "title"}
+            )
+            for key in preferred_keys:
+                if key not in text_fields:
+                    continue
+                value = text_fields.get(key)
+                if value is None:
+                    continue
+                preview_source = str(value)
+                if preview_source:
+                    break
+        samples.append(
+            {
+                "row_id_in_pack": row_id,
+                "kind": kind_name,
+                "topics": topics,
+                "text_preview": _pack_inspect_collapse(preview_source, max_chars=200),
+            }
+        )
+    return samples
+
+
+def _pack_inspect_finalize(payload: dict[str, Any], *, include_samples: bool, sample_limit: int) -> dict[str, Any]:
+    validation = payload.get("validation", {})
+    if not isinstance(validation, dict):
+        validation = {}
+        payload["validation"] = validation
+
+    signature_payload = payload.get("signature", {})
+    if not isinstance(signature_payload, dict):
+        signature_payload = {}
+    trusted_import_available = bool(
+        signature_payload.get("present") is True
+        and signature_payload.get("verified") is True
+        and str(signature_payload.get("trust_classification", "")) == "trusted_signer"
+        and str(signature_payload.get("signer_status", "")) == "active"
+        and str(signature_payload.get("trust_level", "")) == "trusted"
+    )
+    payload["trusted_import_available"] = bool(trusted_import_available)
+
+    supported_schema = bool(validation.get("supported_schema", False))
+    supported_signature_state = bool(validation.get("supported_signature_state", False))
+    if not supported_schema or not supported_signature_state:
+        payload["status"] = "unsupported"
+        payload["import_recommendation"] = "reject"
+        payload["samples"] = []
+        return payload
+
+    validation_keys = [
+        "required_members_present",
+        "json_members_parse",
+        "jsonl_rows_parse",
+        "row_count_matches_manifest",
+        "no_source_memory_ids",
+        "redaction_metadata_valid",
+        "content_hash_valid",
+        "covered_members_valid",
+        "safe_zip_members",
+        "supported_schema",
+        "supported_signature_state",
+        "signature_valid",
+    ]
+    all_valid = all(bool(validation.get(key, False)) for key in validation_keys)
+    payload["status"] = "valid" if all_valid else "invalid"
+
+    pack_payload = payload.get("pack", {})
+    signed = bool(pack_payload.get("signed", False)) if isinstance(pack_payload, dict) else False
+    payload["import_recommendation"] = "quarantine_only" if payload["status"] == "valid" else "reject"
+
+    if payload["status"] != "valid" or not include_samples:
+        payload["samples"] = []
+    else:
+        rows = payload.get("_rows_for_samples", [])
+        payload["samples"] = _pack_inspect_sample_rows(rows if isinstance(rows, list) else [], sample_limit)
+
+    signature_verified = bool(signature_payload.get("verified", False)) if isinstance(signature_payload, dict) else False
+    if isinstance(pack_payload, dict) and (not signed):
+        if str(pack_payload.get("unsigned_reason", "") or "") in {
+            PACK_UNSIGNED_REASON_SIGNING_NOT_IMPLEMENTED,
+            PACK_UNSIGNED_REASON_OPERATOR,
+        }:
+            _pack_inspect_warning(
+                payload,
+                "unsigned_pack",
+                "This pack is unsigned and can only be imported into quarantine in a later import phase.",
+            )
+    if payload["status"] == "valid" and signed and not signature_verified:
+        _pack_inspect_warning(
+            payload,
+            "signature_not_verified",
+            "Pack signature was not verified because no verification_secret was provided.",
+        )
+    if payload["status"] != "valid":
+        payload["trusted_import_available"] = False
+    payload.pop("_rows_for_samples", None)
+    return payload
+
+
+def _pack_inspect_text(payload: dict[str, Any], fallback_name: str) -> str:
+    pack_payload = payload.get("pack", {})
+    pack_id = ""
+    pack_name = ""
+    if isinstance(pack_payload, dict):
+        pack_id = str(pack_payload.get("pack_id", "") or "")
+        pack_name = str(pack_payload.get("pack_name", "") or "")
+    status_value = str(payload.get("status", "invalid"))
+    hash_valid = bool((payload.get("content_hash", {}) if isinstance(payload.get("content_hash"), dict) else {}).get("valid", False))
+    recommendation = str(payload.get("import_recommendation", "reject"))
+    rows_count = int((payload.get("counts", {}) if isinstance(payload.get("counts"), dict) else {}).get("rows", 0))
+    redaction_total = int(
+        (payload.get("counts", {}) if isinstance(payload.get("counts"), dict) else {}).get("redaction_total_matches", 0)
+    )
+    signature_payload = payload.get("signature", {}) if isinstance(payload.get("signature"), dict) else {}
+    trust_classification = str(signature_payload.get("trust_classification", "unsigned"))
+    warning_text = "; ".join(
+        f"{item.get('code')}: {item.get('message')}"
+        for item in payload.get("warnings", [])
+        if isinstance(item, dict)
+    ) or "none"
+    error_text = "; ".join(
+        f"{item.get('code')}: {item.get('message')}"
+        for item in payload.get("errors", [])
+        if isinstance(item, dict)
+    ) or "none"
+    lines = [
+        f"Pack inspect: {pack_id or fallback_name} ({pack_name or 'unknown'})",
+        f"Status: {status_value}",
+        f"Content hash valid: {str(hash_valid).lower()}",
+        f"Rows: {rows_count}",
+        f"Redaction total matches: {redaction_total}",
+        f"Signature classification: {trust_classification}",
+        f"Recommendation: {recommendation}",
+        f"Warnings: {warning_text}",
+        f"Errors: {error_text}",
+    ]
+    return "\n".join(lines)
+
+
+def _inspect_pack_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    include_samples: bool,
+    sample_limit: int,
+    verification_secret: str | None = None,
+    non_zip_suffix_warning: bool = False,
+) -> dict[str, Any]:
+    payload = _pack_inspect_default()
+    if non_zip_suffix_warning:
+        _pack_inspect_warning(
+            payload,
+            "non_zip_suffix",
+            "Pack path does not end with .zip but will be inspected because it opened as a valid ZIP.",
+        )
+
+    raw_member_bytes = snapshot.get("required_member_bytes", {})
+    if not isinstance(raw_member_bytes, dict):
+        raw_member_bytes = {}
+    all_member_bytes = snapshot.get("member_bytes", {})
+    if not isinstance(all_member_bytes, dict):
+        all_member_bytes = dict(raw_member_bytes)
+    present_members_raw = snapshot.get("present_members", [])
+    present_set = {str(item) for item in present_members_raw} if isinstance(present_members_raw, list) else set()
+    payload["validation"]["safe_zip_members"] = bool(snapshot.get("safe_zip_members", False))
+
+    required_set = set(PACK_INSPECT_REQUIRED_MEMBERS)
+    missing = sorted(required_set - present_set)
+    if missing:
+        payload["validation"]["required_members_present"] = False
+        _pack_inspect_error(payload, "missing_required_member", f"missing required members: {missing}")
+        return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+    payload["validation"]["required_members_present"] = True
+
+    for member_name in sorted(present_set - required_set):
+        if member_name in PACK_INSPECT_KNOWN_EXTRA_MEMBERS:
+            continue
+        _pack_inspect_warning(payload, "unknown_extra_member", f"Unknown extra member: {member_name}")
+
+    try:
+        manifest = _pack_inspect_parse_json(raw_member_bytes["manifest.json"], "manifest.json")
+        payload["validation"]["json_members_parse"] = True
+    except Exception as exc:
+        _pack_inspect_error(payload, "manifest_parse_error", f"manifest.json parse failed: {exc}")
+        payload["validation"]["json_members_parse"] = False
+        return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+
+    pack_payload = payload["pack"]
+    pack_payload["pack_id"] = str(manifest.get("pack_id", "") or "")
+    pack_payload["pack_name"] = str(manifest.get("pack_name", "") or "")
+    pack_payload["pack_schema_version"] = manifest.get("pack_schema_version")
+    pack_payload["created_at"] = str(manifest.get("created_at", "") or "")
+    pack_payload["mnemo_version"] = str(manifest.get("mnemo_version", "") or "")
+    pack_payload["signed"] = bool(manifest.get("signed", False))
+    pack_payload["unsigned_reason"] = str(manifest.get("unsigned_reason", "") or "")
+
+    manifest_required_fields = [
+        "pack_schema_version",
+        "pack_id",
+        "pack_name",
+        "created_at",
+        "mnemo_version",
+        "signed",
+        "content_hash",
+        "redaction_ruleset_version",
+        "redaction_rules_applied",
+        "selection",
+        "counts",
+        "files",
+        "redaction",
+    ]
+    missing_manifest_fields = [name for name in manifest_required_fields if name not in manifest]
+    if bool(manifest.get("signed", False)) is False and "unsigned_reason" not in manifest:
+        missing_manifest_fields.append("unsigned_reason")
+    if bool(manifest.get("signed", False)) is True and "signature" not in manifest:
+        missing_manifest_fields.append("signature")
+    if missing_manifest_fields:
+        _pack_inspect_error(payload, "manifest_missing_field", f"manifest missing required fields: {missing_manifest_fields}")
+        return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+
+    schema_version = manifest.get("pack_schema_version")
+    try:
+        schema_version_int = int(schema_version)
+    except Exception:
+        schema_version_int = -1
+    if schema_version_int != 1:
+        payload["validation"]["supported_schema"] = False
+        _pack_inspect_error(payload, "unsupported_schema_version", f"Unsupported pack_schema_version: {schema_version}")
+        return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+
+    pack_id = str(manifest.get("pack_id", "") or "")
+    if not PACK_INSPECT_PACK_ID_RE.match(pack_id):
+        _pack_inspect_error(payload, "invalid_pack_id", f"Invalid pack_id format: {pack_id}")
+        payload["validation"]["json_members_parse"] = False
+    created_at = str(manifest.get("created_at", "") or "")
+    if not PACK_INSPECT_UTC_TS_RE.match(created_at):
+        _pack_inspect_error(payload, "invalid_manifest_created_at", "manifest.created_at is not ISO-8601 UTC")
+        payload["validation"]["json_members_parse"] = False
+
+    if str(manifest.get("mnemo_version", "") or "") != SERVER_VERSION:
+        _pack_inspect_warning(
+            payload,
+            "mnemo_version_differs",
+            f"Pack mnemo_version {manifest.get('mnemo_version')} differs from inspector version {SERVER_VERSION}.",
+        )
+
+    signature_info = payload.get("signature", {})
+    if not isinstance(signature_info, dict):
+        signature_info = {}
+        payload["signature"] = signature_info
+
+    signed_value = manifest.get("signed", False)
+    if not isinstance(signed_value, bool):
+        _pack_inspect_error(payload, "invalid_signed_field", "manifest.signed must be boolean")
+        payload["validation"]["supported_signature_state"] = False
+        signature_info["trust_classification"] = "unsupported_signature"
+        return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+
+    if not bool(signed_value):
+        signature_info["present"] = False
+        signature_info["verified"] = False
+        signature_info["signature_algorithm"] = None
+        signature_info["signer_id"] = None
+        signature_info["signer_status"] = None
+        signature_info["trust_level"] = None
+        signature_info["trust_classification"] = "unsigned"
+        signature_info["secret_fingerprint"] = None
+        if verification_secret is not None:
+            _pack_inspect_warning(
+                payload,
+                "verification_secret_unused_for_unsigned_pack",
+                "verification_secret was provided but this pack is unsigned.",
+            )
+        unsigned_reason = str(manifest.get("unsigned_reason", "") or "")
+        if unsigned_reason not in {PACK_UNSIGNED_REASON_SIGNING_NOT_IMPLEMENTED, PACK_UNSIGNED_REASON_OPERATOR}:
+            _pack_inspect_error(
+                payload,
+                "invalid_unsigned_reason",
+                "manifest.unsigned_reason must be signing_not_implemented or operator_chose_unsigned",
+            )
+            payload["validation"]["json_members_parse"] = False
+            payload["validation"]["signature_valid"] = False
+    else:
+        signature_info["present"] = True
+        manifest_signature = manifest.get("signature", {})
+        if not isinstance(manifest_signature, dict):
+            _pack_inspect_error(payload, "invalid_signature", "manifest.signature must be an object for signed packs")
+            signature_info["trust_classification"] = "invalid_signature"
+            payload["validation"]["signature_valid"] = False
+        else:
+            signature_member = str(manifest_signature.get("signature_member", "") or "")
+            signature_algorithm = str(manifest_signature.get("signature_algorithm", "") or "")
+            signature_payload_version = str(manifest_signature.get("signature_payload_version", "") or "")
+            signer_id = str(manifest_signature.get("signer_id", "") or "")
+            secret_fingerprint = str(manifest_signature.get("secret_fingerprint", "") or "")
+            signature_info["signature_algorithm"] = signature_algorithm or None
+            signature_info["signer_id"] = signer_id or None
+            signature_info["secret_fingerprint"] = secret_fingerprint or None
+            signature_info["trust_classification"] = "signature_not_verified"
+            if signature_algorithm == PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL:
+                _pack_inspect_warning(payload, "local_hmac_not_public_key", PACK_LOCAL_HMAC_WARNING_MESSAGE)
+
+            if signature_member != PACK_SIGNATURE_MEMBER:
+                payload["validation"]["supported_signature_state"] = False
+                signature_info["trust_classification"] = "unsupported_signature"
+                _pack_inspect_error(
+                    payload,
+                    "unsupported_signature",
+                    f"manifest.signature.signature_member must be {PACK_SIGNATURE_MEMBER}",
+                )
+                return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+            if signature_algorithm != PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL:
+                payload["validation"]["supported_signature_state"] = False
+                signature_info["trust_classification"] = "unsupported_signature"
+                _pack_inspect_error(
+                    payload,
+                    "unsupported_signature",
+                    f"unsupported signature algorithm: {signature_algorithm}",
+                )
+                return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+            if signature_payload_version != PACK_SIGNATURE_PAYLOAD_VERSION_V1:
+                payload["validation"]["supported_signature_state"] = False
+                signature_info["trust_classification"] = "unsupported_signature"
+                _pack_inspect_error(
+                    payload,
+                    "unsupported_signature",
+                    f"unsupported signature payload version: {signature_payload_version}",
+                )
+                return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+            if not PACK_SIGNER_ID_RE.match(signer_id):
+                _pack_inspect_error(payload, "invalid_signature", f"invalid signer_id format: {signer_id}")
+                payload["validation"]["signature_valid"] = False
+                signature_info["trust_classification"] = "invalid_signature"
+
+            signature_blob = all_member_bytes.get(PACK_SIGNATURE_MEMBER)
+            if not isinstance(signature_blob, (bytes, bytearray)):
+                _pack_inspect_error(payload, "invalid_signature", "missing signature/signature.json member")
+                payload["validation"]["signature_valid"] = False
+                signature_info["trust_classification"] = "invalid_signature"
+            else:
+                try:
+                    signature_payload = _pack_inspect_parse_json(bytes(signature_blob), PACK_SIGNATURE_MEMBER)
+                except Exception as exc:
+                    _pack_inspect_error(payload, "invalid_signature", f"signature member parse failed: {exc}")
+                    payload["validation"]["signature_valid"] = False
+                    signature_info["trust_classification"] = "invalid_signature"
+                    signature_payload = {}
+
+                if isinstance(signature_payload, dict):
+                    required_signature_fields = (
+                        "signature_schema_version",
+                        "signature_algorithm",
+                        "signature_payload_version",
+                        "signer_id",
+                        "secret_fingerprint",
+                        "signed_at",
+                        "signature_value",
+                    )
+                    missing_signature_fields = [field for field in required_signature_fields if field not in signature_payload]
+                    if missing_signature_fields:
+                        _pack_inspect_error(
+                            payload,
+                            "invalid_signature",
+                            f"signature member missing required fields: {missing_signature_fields}",
+                        )
+                        payload["validation"]["signature_valid"] = False
+                        signature_info["trust_classification"] = "invalid_signature"
+
+                    signed_at = str(signature_payload.get("signed_at", "") or "")
+                    if signed_at and not PACK_INSPECT_UTC_TS_RE.match(signed_at):
+                        _pack_inspect_error(payload, "invalid_signature", "signature/signature.json signed_at must be ISO-8601 UTC")
+                        payload["validation"]["signature_valid"] = False
+                        signature_info["trust_classification"] = "invalid_signature"
+
+                    if int(signature_payload.get("signature_schema_version", 0)) != PACK_SIGNATURE_SCHEMA_VERSION:
+                        _pack_inspect_error(payload, "invalid_signature", "unsupported signature schema version")
+                        payload["validation"]["signature_valid"] = False
+                        signature_info["trust_classification"] = "invalid_signature"
+
+                    signature_value = str(signature_payload.get("signature_value", "") or "")
+                    if not signature_value:
+                        _pack_inspect_error(payload, "invalid_signature", "signature/signature.json signature_value is required")
+                        payload["validation"]["signature_valid"] = False
+                        signature_info["trust_classification"] = "invalid_signature"
+
+                    manifest_match = (
+                        str(signature_payload.get("signer_id", "") or "") == signer_id
+                        and str(signature_payload.get("signature_algorithm", "") or "") == signature_algorithm
+                        and str(signature_payload.get("signature_payload_version", "") or "") == signature_payload_version
+                        and str(signature_payload.get("secret_fingerprint", "") or "") == secret_fingerprint
+                    )
+                    if not manifest_match:
+                        _pack_inspect_error(
+                            payload,
+                            "invalid_signature",
+                            "manifest signature metadata does not match signature/signature.json",
+                        )
+                        payload["validation"]["signature_valid"] = False
+                        signature_info["trust_classification"] = "invalid_signature"
+                    elif payload["validation"]["signature_valid"]:
+                        signer_row = _trusted_signer_lookup_readonly(signer_id)
+                        if verification_secret is None:
+                            signature_info["verified"] = False
+                            if signer_row is None:
+                                signature_info["trust_classification"] = "unknown_signer"
+                            else:
+                                signer_status = str(signer_row.get("status", "") or "")
+                                signer_trust_level = str(signer_row.get("trust_level", "") or "")
+                                signature_info["signer_status"] = signer_status or None
+                                signature_info["trust_level"] = signer_trust_level or None
+                                if signer_status == "disabled":
+                                    _pack_inspect_error(payload, "disabled_signer", f"signer {signer_id} is disabled")
+                                    payload["validation"]["signature_valid"] = False
+                                    signature_info["trust_classification"] = "disabled_signer"
+                                elif signer_trust_level == "blocked":
+                                    _pack_inspect_error(payload, "blocked_signer", f"signer {signer_id} is blocked")
+                                    payload["validation"]["signature_valid"] = False
+                                    signature_info["trust_classification"] = "blocked_signer"
+                                else:
+                                    signature_info["trust_classification"] = "signature_not_verified"
+                        else:
+                            expected_value = _pack_sign_hmac_v1(manifest, verification_secret)
+                            if not hmac.compare_digest(expected_value, signature_value):
+                                _pack_inspect_error(payload, "invalid_signature", "signature verification failed")
+                                payload["validation"]["signature_valid"] = False
+                                signature_info["trust_classification"] = "invalid_signature"
+                            else:
+                                signature_info["verified"] = True
+                                if signer_row is None:
+                                    signature_info["trust_classification"] = "unknown_signer"
+                                else:
+                                    signer_status = str(signer_row.get("status", "") or "")
+                                    signer_trust_level = str(signer_row.get("trust_level", "") or "")
+                                    signer_registry_fingerprint = normalize_optional_string(
+                                        signer_row.get("secret_fingerprint")
+                                    )
+                                    signature_info["signer_status"] = signer_status or None
+                                    signature_info["trust_level"] = signer_trust_level or None
+                                    if signer_status == "disabled":
+                                        _pack_inspect_error(payload, "disabled_signer", f"signer {signer_id} is disabled")
+                                        payload["validation"]["signature_valid"] = False
+                                        signature_info["trust_classification"] = "disabled_signer"
+                                    elif signer_trust_level == "blocked":
+                                        _pack_inspect_error(payload, "blocked_signer", f"signer {signer_id} is blocked")
+                                        payload["validation"]["signature_valid"] = False
+                                        signature_info["trust_classification"] = "blocked_signer"
+                                    elif signer_registry_fingerprint != secret_fingerprint:
+                                        _pack_inspect_error(
+                                            payload,
+                                            "secret_fingerprint_mismatch",
+                                            f"signer {signer_id} secret_fingerprint does not match registry",
+                                        )
+                                        payload["validation"]["signature_valid"] = False
+                                        signature_info["trust_classification"] = "secret_fingerprint_mismatch"
+                                    else:
+                                        signature_info["trust_classification"] = "trusted_signer"
+
+    content_hash_payload = manifest.get("content_hash", {})
+    if not isinstance(content_hash_payload, dict):
+        _pack_inspect_error(payload, "content_hash_format", "manifest.content_hash must be an object")
+        payload["validation"]["content_hash_valid"] = False
+        payload["validation"]["covered_members_valid"] = False
+        payload["validation"]["json_members_parse"] = False
+    else:
+        payload["content_hash"]["algorithm"] = str(content_hash_payload.get("algorithm", "") or "")
+        payload["content_hash"]["manifest_value"] = str(content_hash_payload.get("value", "") or "")
+        covered_members = content_hash_payload.get("covered_members", [])
+        if not isinstance(covered_members, list) or not all(isinstance(item, str) for item in covered_members):
+            _pack_inspect_error(payload, "content_hash_covered_members_format", "manifest.content_hash.covered_members must be a string list")
+            payload["validation"]["covered_members_valid"] = False
+            payload["validation"]["content_hash_valid"] = False
+        else:
+            payload["content_hash"]["covered_members"] = list(covered_members)
+            canonical_set = sorted(PACK_CONTENT_HASH_COVERED_MEMBERS)
+            observed_set = sorted(str(item) for item in covered_members)
+            covered_valid = observed_set == canonical_set
+            payload["validation"]["covered_members_valid"] = bool(covered_valid)
+            if not covered_valid:
+                _pack_inspect_error(
+                    payload,
+                    "covered_members_mismatch",
+                    f"manifest covered_members mismatch: expected {canonical_set}, got {observed_set}",
+                )
+
+            try:
+                canonical_bytes = {name: raw_member_bytes[name] for name in PACK_CONTENT_HASH_COVERED_MEMBERS}
+                recomputed_hash_payload = _pack_content_hash(canonical_bytes, covered_members=list(PACK_CONTENT_HASH_COVERED_MEMBERS))
+                recomputed_value = str(recomputed_hash_payload.get("value", ""))
+                payload["content_hash"]["recomputed_value"] = recomputed_value
+                algorithm_valid = str(content_hash_payload.get("algorithm", "")) == "sha256"
+                if not algorithm_valid:
+                    _pack_inspect_error(payload, "content_hash_algorithm", "manifest.content_hash.algorithm must be sha256")
+                value_valid = str(content_hash_payload.get("value", "")) == recomputed_value
+                if not value_valid:
+                    _pack_inspect_error(payload, "content_hash_mismatch", "manifest content hash does not match recomputed canonical content hash")
+                payload["validation"]["content_hash_valid"] = bool(covered_valid and algorithm_valid and value_valid)
+                payload["content_hash"]["valid"] = bool(payload["validation"]["content_hash_valid"])
+            except Exception as exc:
+                _pack_inspect_error(payload, "content_hash_recompute_failed", f"{type(exc).__name__}: {exc}")
+                payload["validation"]["content_hash_valid"] = False
+                payload["content_hash"]["valid"] = False
+
+    no_source_ids = True
+    for member_name in PACK_INSPECT_REQUIRED_MEMBERS:
+        member_text = raw_member_bytes.get(member_name, b"").decode("utf-8", errors="ignore")
+        if PACK_INSPECT_SOURCE_ID_RE.search(member_text):
+            no_source_ids = False
+            _pack_inspect_error(payload, "source_memory_id_leak", f"source-like memory ID leak detected in {member_name}")
+    payload["validation"]["no_source_memory_ids"] = no_source_ids
+
+    try:
+        rows = _pack_inspect_rows_from_jsonl(raw_member_bytes["content/memories.jsonl"])
+        if not rows:
+            raise ValueError("content/memories.jsonl is empty")
+        payload["validation"]["jsonl_rows_parse"] = True
+    except Exception as exc:
+        _pack_inspect_error(payload, "memories_jsonl_parse_error", f"{type(exc).__name__}: {exc}")
+        payload["validation"]["jsonl_rows_parse"] = False
+        rows = []
+
+    try:
+        topics_json = _pack_inspect_parse_json(raw_member_bytes["content/topics.json"], "content/topics.json")
+        file_fingerprints_json = _pack_inspect_parse_json(
+            raw_member_bytes["content/file_fingerprints.json"], "content/file_fingerprints.json"
+        )
+        origin_json = _pack_inspect_parse_json(raw_member_bytes["provenance/origin.json"], "provenance/origin.json")
+        redactions_json = _pack_inspect_parse_json(raw_member_bytes["provenance/redactions.json"], "provenance/redactions.json")
+        payload["validation"]["json_members_parse"] = bool(payload["validation"].get("json_members_parse", True))
+    except Exception as exc:
+        _pack_inspect_error(payload, "json_member_parse_error", f"{type(exc).__name__}: {exc}")
+        payload["validation"]["json_members_parse"] = False
+        topics_json = {}
+        file_fingerprints_json = {}
+        origin_json = {}
+        redactions_json = {}
+
+    if origin_json:
+        exported_at = str(origin_json.get("exported_at", "") or "")
+        if exported_at and not PACK_INSPECT_UTC_TS_RE.match(exported_at):
+            _pack_inspect_error(payload, "invalid_provenance_exported_at", "provenance/origin.json exported_at must be ISO-8601 UTC")
+            payload["validation"]["json_members_parse"] = False
+
+    by_kind: dict[str, int] = {}
+    by_namespace: dict[str, int] = {}
+    by_origin: dict[str, int] = {}
+    row_ids_seen: set[str] = set()
+    redaction_rows_valid = True
+    for row in rows:
+        required_row_fields = [
+            "row_id_in_pack",
+            "kind",
+            "namespace_at_export",
+            "origin_at_export",
+            "text_fields",
+            "topics",
+            "created_at_in_source",
+            "git_sha_at_write",
+            "git_branch_at_write",
+            "git_dirty_at_write",
+            "touched_files",
+            "import_freshness_at_export",
+            "redaction_applied",
+        ]
+        missing_fields = [name for name in required_row_fields if name not in row]
+        if missing_fields:
+            _pack_inspect_error(payload, "row_missing_fields", f"row missing required fields: {missing_fields}")
+            payload["validation"]["jsonl_rows_parse"] = False
+            continue
+
+        row_id = str(row.get("row_id_in_pack", ""))
+        kind_name = str(row.get("kind", ""))
+        if row_id in row_ids_seen:
+            _pack_inspect_error(payload, "duplicate_row_id_in_pack", f"duplicate row_id_in_pack: {row_id}")
+            payload["validation"]["jsonl_rows_parse"] = False
+        row_ids_seen.add(row_id)
+
+        if row_id.startswith("mem_"):
+            _pack_inspect_error(payload, "source_memory_id_leak", f"row_id_in_pack resembles source memory ID: {row_id}")
+            payload["validation"]["no_source_memory_ids"] = False
+
+        if kind_name == "context_block":
+            if not re.match(r"^ctx_\d{3,}$", row_id):
+                _pack_inspect_error(payload, "row_id_format", f"context_block row_id_in_pack must match ctx_###: {row_id}")
+                payload["validation"]["jsonl_rows_parse"] = False
+        elif kind_name == "hippocampus_entry":
+            if not re.match(r"^hip_\d{3,}$", row_id):
+                _pack_inspect_error(payload, "row_id_format", f"hippocampus_entry row_id_in_pack must match hip_###: {row_id}")
+                payload["validation"]["jsonl_rows_parse"] = False
+        else:
+            _pack_inspect_error(payload, "non_exportable_kind", f"row kind is not exportable: {kind_name}")
+            payload["validation"]["jsonl_rows_parse"] = False
+
+        text_fields = row.get("text_fields")
+        if not isinstance(text_fields, dict):
+            _pack_inspect_error(payload, "text_fields_type", f"row {row_id} text_fields must be an object")
+            payload["validation"]["jsonl_rows_parse"] = False
+        else:
+            for key, value in text_fields.items():
+                if str(key) not in PACK_REDACTION_TEXT_FIELDS:
+                    _pack_inspect_warning(payload, "unexpected_text_field", f"row {row_id} contains unexpected text_fields key: {key}")
+                if value is not None and not isinstance(value, str):
+                    _pack_inspect_error(payload, "text_field_value_type", f"row {row_id} text_fields.{key} must be string or null")
+                    payload["validation"]["jsonl_rows_parse"] = False
+
+        topics_value = row.get("topics")
+        if not isinstance(topics_value, list) or not all(isinstance(item, str) for item in topics_value):
+            _pack_inspect_error(payload, "topics_type", f"row {row_id} topics must be a list of strings")
+            payload["validation"]["jsonl_rows_parse"] = False
+
+        touched_files = row.get("touched_files")
+        if not isinstance(touched_files, list):
+            _pack_inspect_error(payload, "touched_files_type", f"row {row_id} touched_files must be a list")
+            payload["validation"]["jsonl_rows_parse"] = False
+        else:
+            for item in touched_files:
+                if not isinstance(item, dict):
+                    _pack_inspect_error(payload, "touched_file_item_type", f"row {row_id} touched_files item must be object")
+                    payload["validation"]["jsonl_rows_parse"] = False
+                    continue
+                path_value = normalize_optional_string(item.get("path"))
+                if path_value is None:
+                    _pack_inspect_error(payload, "touched_file_path_missing", f"row {row_id} touched_files.path is required")
+                    payload["validation"]["jsonl_rows_parse"] = False
+                    continue
+                normalized_path = path_value.replace("\\", "/")
+                if normalized_path.startswith("/") or ":" in normalized_path:
+                    _pack_inspect_error(payload, "touched_file_path_invalid", f"row {row_id} touched_files.path must be relative")
+                    payload["validation"]["jsonl_rows_parse"] = False
+                    continue
+                segments = normalized_path.split("/")
+                if any(segment in {"", ".", ".."} for segment in segments):
+                    _pack_inspect_error(payload, "touched_file_path_invalid", f"row {row_id} touched_files.path contains traversal")
+                    payload["validation"]["jsonl_rows_parse"] = False
+                if "file_sha" in item and item.get("file_sha") is not None and not isinstance(item.get("file_sha"), str):
+                    _pack_inspect_error(payload, "touched_file_sha_type", f"row {row_id} touched_files.file_sha must be string")
+                    payload["validation"]["jsonl_rows_parse"] = False
+
+        if row.get("redaction_applied") is not True:
+            redaction_rows_valid = False
+            _pack_inspect_error(payload, "row_redaction_applied_false", f"row {row_id} redaction_applied must be true")
+
+        namespace_value = str(row.get("namespace_at_export", DEFAULT_MEMORY_NAMESPACE))
+        origin_value = str(row.get("origin_at_export", DEFAULT_MEMORY_ORIGIN))
+        by_kind[kind_name] = int(by_kind.get(kind_name, 0) + 1)
+        by_namespace[namespace_value] = int(by_namespace.get(namespace_value, 0) + 1)
+        by_origin[origin_value] = int(by_origin.get(origin_value, 0) + 1)
+
+    counts_payload = payload.get("counts", {})
+    if isinstance(counts_payload, dict):
+        counts_payload["rows"] = len(rows)
+        counts_payload["by_kind"] = by_kind
+        counts_payload["by_namespace"] = by_namespace
+        counts_payload["by_origin"] = by_origin
+
+    manifest_selection = manifest.get("selection", {})
+    manifest_counts = manifest.get("counts", {})
+    manifest_redaction = manifest.get("redaction", {})
+    manifest_ruleset = str(manifest.get("redaction_ruleset_version", "") or "")
+    manifest_rules_applied = manifest.get("redaction_rules_applied", [])
+    manifest_rules_applied_valid = True
+    if not isinstance(manifest_rules_applied, list) or not all(isinstance(item, str) for item in manifest_rules_applied):
+        _pack_inspect_error(payload, "manifest_rules_applied_invalid", "manifest.redaction_rules_applied must be a list of strings")
+        manifest_rules_applied_valid = False
+        manifest_rules_applied = []
+
+    row_count_matches_manifest = True
+    try:
+        exported_rows = int(manifest_selection.get("exported_rows", -1))
+        total_rows = int(manifest_selection.get("total_rows", -1))
+        limited_value = bool(manifest_selection.get("limited", False))
+        if exported_rows != len(rows):
+            row_count_matches_manifest = False
+            _pack_inspect_error(payload, "row_count_mismatch", "manifest.selection.exported_rows does not match memories.jsonl row count")
+        if exported_rows > total_rows:
+            row_count_matches_manifest = False
+            _pack_inspect_error(payload, "selection_count_invalid", "manifest.selection.exported_rows cannot exceed total_rows")
+        if exported_rows < total_rows and not limited_value:
+            _pack_inspect_warning(payload, "selection_limited_inconsistent", "manifest.selection.limited should be true when exported_rows < total_rows")
+        if exported_rows == total_rows and limited_value:
+            _pack_inspect_warning(payload, "selection_limited_inconsistent", "manifest.selection.limited is true while exported_rows == total_rows")
+    except Exception as exc:
+        row_count_matches_manifest = False
+        _pack_inspect_error(payload, "selection_parse_error", f"{type(exc).__name__}: {exc}")
+    payload["validation"]["row_count_matches_manifest"] = bool(row_count_matches_manifest)
+
+    manifest_by_kind = {}
+    if isinstance(manifest_counts, dict):
+        manifest_by_kind = manifest_counts.get("by_kind", {})
+    if not isinstance(manifest_by_kind, dict):
+        _pack_inspect_error(payload, "manifest_by_kind_invalid", "manifest.counts.by_kind must be an object")
+        payload["validation"]["row_count_matches_manifest"] = False
+    else:
+        sum_by_kind = 0
+        kind_values_valid = True
+        for value in manifest_by_kind.values():
+            if not isinstance(value, int) or int(value) < 0:
+                kind_values_valid = False
+                break
+            sum_by_kind += int(value)
+        if not kind_values_valid or sum_by_kind != len(rows):
+            _pack_inspect_error(payload, "manifest_by_kind_mismatch", "manifest.counts.by_kind totals must equal exported row count")
+            payload["validation"]["row_count_matches_manifest"] = False
+
+    topics_rows = topics_json.get("topics", []) if isinstance(topics_json, dict) else []
+    files_rows = file_fingerprints_json.get("files", []) if isinstance(file_fingerprints_json, dict) else []
+    if isinstance(counts_payload, dict):
+        counts_payload["topics"] = len(topics_rows) if isinstance(topics_rows, list) else 0
+        counts_payload["referenced_files"] = len(files_rows) if isinstance(files_rows, list) else 0
+    if isinstance(topics_rows, list):
+        for row in topics_rows:
+            if not isinstance(row, dict) or not isinstance(row.get("row_count"), int) or int(row.get("row_count")) < 0:
+                _pack_inspect_error(payload, "topics_row_invalid", "content/topics.json contains invalid topic row_count")
+                payload["validation"]["json_members_parse"] = False
+                break
+    else:
+        _pack_inspect_error(payload, "topics_payload_invalid", "content/topics.json topics must be a list")
+        payload["validation"]["json_members_parse"] = False
+
+    if isinstance(files_rows, list):
+        for row in files_rows:
+            if not isinstance(row, dict) or not isinstance(row.get("memory_count"), int) or int(row.get("memory_count")) < 0:
+                _pack_inspect_error(payload, "file_fingerprint_invalid", "content/file_fingerprints.json contains invalid memory_count")
+                payload["validation"]["json_members_parse"] = False
+                break
+    else:
+        _pack_inspect_error(payload, "file_fingerprints_payload_invalid", "content/file_fingerprints.json files must be a list")
+        payload["validation"]["json_members_parse"] = False
+
+    redaction_metadata_valid = bool(manifest_rules_applied_valid)
+    provenance_ruleset = str(redactions_json.get("ruleset_version", "") or "") if isinstance(redactions_json, dict) else ""
+    if manifest_ruleset != provenance_ruleset:
+        redaction_metadata_valid = False
+        _pack_inspect_error(payload, "redaction_ruleset_mismatch", "manifest and provenance redaction ruleset_version differ")
+    if manifest_ruleset != BASELINE_REDACTION_RULESET_VERSION:
+        payload["validation"]["supported_schema"] = False
+        redaction_metadata_valid = False
+        _pack_inspect_error(
+            payload,
+            "unsupported_redaction_ruleset",
+            f"Unsupported redaction_ruleset_version: {manifest_ruleset}",
+        )
+
+    provenance_rules_applied = redactions_json.get("rules_applied", []) if isinstance(redactions_json, dict) else []
+    if list(manifest_rules_applied) != list(provenance_rules_applied):
+        redaction_metadata_valid = False
+        _pack_inspect_error(payload, "redaction_rules_applied_mismatch", "manifest and provenance rules_applied differ")
+    if "ipv6" in list(manifest_rules_applied):
+        redaction_metadata_valid = False
+        _pack_inspect_error(payload, "unsupported_redaction_rule", "rules_applied contains unsupported rule ipv6")
+
+    def _dict_int_map(value: Any) -> dict[str, int] | None:
+        if not isinstance(value, dict):
+            return None
+        out: dict[str, int] = {}
+        for key, raw in value.items():
+            if not isinstance(raw, int):
+                return None
+            out[str(key)] = int(raw)
+        return out
+
+    manifest_total_matches = int(manifest_redaction.get("total_matches", -1)) if isinstance(manifest_redaction, dict) else -1
+    manifest_affected_rows = int(manifest_redaction.get("affected_rows", -1)) if isinstance(manifest_redaction, dict) else -1
+    prov_total_matches = int(redactions_json.get("total_matches", -1)) if isinstance(redactions_json, dict) else -1
+    prov_affected_rows = int(redactions_json.get("affected_rows", -1)) if isinstance(redactions_json, dict) else -1
+    manifest_by_category = _dict_int_map(manifest_redaction.get("by_category") if isinstance(manifest_redaction, dict) else None)
+    prov_by_category = _dict_int_map(redactions_json.get("by_category") if isinstance(redactions_json, dict) else None)
+    manifest_rows_by_category = _dict_int_map(
+        manifest_redaction.get("rows_by_category") if isinstance(manifest_redaction, dict) else None
+    )
+    prov_rows_by_category = _dict_int_map(redactions_json.get("rows_by_category") if isinstance(redactions_json, dict) else None)
+
+    if (
+        manifest_total_matches != prov_total_matches
+        or manifest_affected_rows != prov_affected_rows
+        or manifest_by_category is None
+        or prov_by_category is None
+        or manifest_rows_by_category is None
+        or prov_rows_by_category is None
+        or manifest_by_category != prov_by_category
+        or manifest_rows_by_category != prov_rows_by_category
+    ):
+        redaction_metadata_valid = False
+        _pack_inspect_error(payload, "redaction_count_mismatch", "manifest and provenance redaction metadata differ")
+
+    if not redaction_rows_valid:
+        redaction_metadata_valid = False
+
+    payload["validation"]["redaction_metadata_valid"] = bool(redaction_metadata_valid)
+    if isinstance(counts_payload, dict):
+        counts_payload["redaction_total_matches"] = max(0, manifest_total_matches)
+        counts_payload["redaction_affected_rows"] = max(0, manifest_affected_rows)
+
+    payload["_rows_for_samples"] = rows
+    return _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
 
 
 def _pack_sort_timestamp_iso(value: Any) -> float:
@@ -9081,9 +10628,16 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
     if store_backend() != "sqlite":
         return tool_error("pack_export requires sqlite backend")
 
-    if not parse_bool(args.get("allow_unsigned"), default=False):
+    sign_pack = parse_bool(args.get("sign_pack"), default=False)
+    allow_unsigned = parse_bool(args.get("allow_unsigned"), default=False)
+    if not sign_pack and not allow_unsigned:
         return tool_error(PACK_ALLOW_UNSIGNED_ERROR)
 
+    signer_id: str | None = None
+    signing_secret: str | None = None
+    signature_algorithm = normalize_optional_string(args.get("signature_algorithm")) or PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL
+    signature_algorithm = signature_algorithm.strip().lower()
+    secret_fingerprint: str | None = None
     try:
         sanitized_pack_name = _sanitize_pack_name(args.get("pack_name"))
         parsed = _pack_parse_common_filters(args)
@@ -9091,10 +10645,20 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
         allow_limited_export = parse_bool(args.get("allow_limited_export"), default=False)
         # Preflight conflict validation before any export-side effects.
         resolve_namespace_origin_filters(args, None)
+        if sign_pack:
+            signer_id = _normalize_signer_id(args.get("signer_id"))
+            if signature_algorithm != PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL:
+                raise ValueError(f"unsupported signature_algorithm: {signature_algorithm}")
+            signing_secret = _validate_secret_length(args.get("signing_secret"), field_name="signing_secret")
+            secret_fingerprint = _secret_fingerprint(signing_secret)
     except ValueError as exc:
-        return tool_error(str(exc))
+        message = str(exc)
+        if "signing_secret" in message and "at least" in message:
+            return tool_error_code("secret_too_short", message)
+        return tool_error(message)
 
     warnings: list[dict[str, str]] = []
+    signer_registry_fingerprint: str | None = None
     try:
         with _sqlite_session() as conn:
             _sqlite_ensure_schema(conn)
@@ -9118,6 +10682,15 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
             selected_row_ids = [str(row.get("id", "")) for row in selected_rows]
             topics_by_memory_id = _pack_topics_by_memory_id(conn, selected_row_ids)
             files_by_memory_id = _pack_files_by_memory_id(conn, selected_row_ids)
+            if sign_pack and signer_id is not None:
+                signer_row = conn.execute(
+                    "SELECT secret_fingerprint FROM trusted_signers WHERE signer_id = ?",
+                    (signer_id,),
+                ).fetchone()
+                if signer_row is not None:
+                    signer_registry_fingerprint = normalize_optional_string(
+                        signer_row["secret_fingerprint"] if isinstance(signer_row, sqlite3.Row) else signer_row[0]
+                    )
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
@@ -9128,12 +10701,22 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
                 "message": "Only the limited selected row set was exported.",
             }
         )
-    warnings.append(
-        {
-            "code": "unsigned_development_pack",
-            "message": "This pack is unsigned because signing is not implemented yet.",
-        }
-    )
+    if sign_pack:
+        warnings.append(_pack_local_hmac_warning())
+        if signer_registry_fingerprint and secret_fingerprint and signer_registry_fingerprint != secret_fingerprint:
+            warnings.append(
+                {
+                    "code": "secret_fingerprint_mismatch_possible",
+                    "message": "Provided signing_secret fingerprint differs from the local trusted_signers fingerprint for signer_id.",
+                }
+            )
+    else:
+        warnings.append(
+            {
+                "code": "unsigned_development_pack",
+                "message": "This pack is unsigned because signing was not requested for this export.",
+            }
+        )
     warnings.append(_pack_baseline_warning())
 
     pack_id = _pack_make_pack_id()
@@ -9296,14 +10879,14 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
         member_bytes[member_name] = _pack_json_bytes(member_payloads[member_name])
     content_hash = _pack_content_hash(member_bytes)
 
-    manifest = {
+    manifest: dict[str, Any] = {
         "pack_schema_version": 1,
         "pack_id": pack_id,
         "pack_name": sanitized_pack_name,
         "created_at": exported_at,
         "mnemo_version": SERVER_VERSION,
-        "signed": False,
-        "unsigned_reason": "signing_not_implemented",
+        "signed": bool(sign_pack),
+        "unsigned_reason": None if sign_pack else PACK_UNSIGNED_REASON_OPERATOR,
         "content_hash": content_hash,
         "redaction_ruleset_version": BASELINE_REDACTION_RULESET_VERSION,
         "redaction_rules_applied": list(PACK_REDACTION_RULE_ORDER),
@@ -9330,6 +10913,29 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
             "rows_by_category": rows_by_category,
         },
     }
+    if sign_pack:
+        assert signer_id is not None
+        assert secret_fingerprint is not None
+        manifest["signature"] = {
+            "signature_algorithm": signature_algorithm,
+            "signature_payload_version": PACK_SIGNATURE_PAYLOAD_VERSION_V1,
+            "signer_id": signer_id,
+            "secret_fingerprint": secret_fingerprint,
+            "signature_member": PACK_SIGNATURE_MEMBER,
+        }
+        assert signing_secret is not None
+        signature_value = _pack_sign_hmac_v1(manifest, signing_secret)
+        member_bytes[PACK_SIGNATURE_MEMBER] = _pack_json_bytes(
+            {
+                "signature_schema_version": PACK_SIGNATURE_SCHEMA_VERSION,
+                "signature_algorithm": signature_algorithm,
+                "signature_payload_version": PACK_SIGNATURE_PAYLOAD_VERSION_V1,
+                "signer_id": signer_id,
+                "secret_fingerprint": secret_fingerprint,
+                "signed_at": exported_at,
+                "signature_value": signature_value,
+            }
+        )
     member_bytes["manifest.json"] = _pack_json_bytes(manifest)
 
     temp_zip_path = Path(
@@ -9340,6 +10946,8 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
         with zipfile.ZipFile(temp_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for member_name in PACK_REQUIRED_MEMBERS:
                 archive.writestr(member_name, member_bytes[member_name])
+            if sign_pack:
+                archive.writestr(PACK_SIGNATURE_MEMBER, member_bytes[PACK_SIGNATURE_MEMBER])
         validated_manifest = _pack_validate_zip(temp_zip_path)
         if str(validated_manifest.get("pack_id", "")) != pack_id:
             raise ValueError("validated manifest pack_id mismatch")
@@ -9360,7 +10968,7 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
                     exported_at,
                     int(exported_rows_count),
                     int(total_matches),
-                    0,
+                    1 if sign_pack else 0,
                     json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                 ),
             )
@@ -9409,8 +11017,8 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
         "pack_id": pack_id,
         "pack_name": sanitized_pack_name,
         "output_path": str(final_zip_path),
-        "signed": False,
-        "unsigned_reason": "signing_not_implemented",
+        "signed": bool(sign_pack),
+        "unsigned_reason": None if sign_pack else PACK_UNSIGNED_REASON_OPERATOR,
         "content_hash": {
             "algorithm": "sha256",
             "value": str(content_hash["value"]),
@@ -9435,6 +11043,7 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
             "file_fingerprints": "content/file_fingerprints.json",
             "origin": "provenance/origin.json",
             "redactions": "provenance/redactions.json",
+            "signature": PACK_SIGNATURE_MEMBER if sign_pack else None,
         },
         "warnings": warnings,
     }
@@ -11243,13 +12852,1709 @@ def memory_backfill_signatures_gateway(args: dict[str, Any]) -> dict[str, Any]:
 def memory_consolidate_full_gateway(args: dict[str, Any]) -> dict[str, Any]:
     return _consolidate_full_maintenance(args)
 
+
+class PackImportError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+
+
+class PackPromoteError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+
+
+def _pack_import_add_warning(
+    warnings: list[dict[str, Any]],
+    code: str,
+    message: str,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    key = f"{code}:{message}"
+    seen = {f"{str(item.get('code', ''))}:{str(item.get('message', ''))}" for item in warnings if isinstance(item, dict)}
+    if key in seen:
+        return
+    row: dict[str, Any] = {"code": str(code), "message": str(message)}
+    if isinstance(extra, dict):
+        for name, value in extra.items():
+            if name in row:
+                continue
+            row[str(name)] = value
+    warnings.append(row)
+
+
+def _pack_error_with_warnings(
+    code: str,
+    message: str,
+    warnings: list[dict[str, Any]] | None,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "error": {"code": str(code), "message": str(message)},
+        "warnings": [dict(item) for item in (warnings or []) if isinstance(item, dict)],
+    }
+    if isinstance(extra, dict) and extra:
+        payload.update(extra)
+    return {
+        "content": [{"type": "text", "text": f"Error [{code}]: {message}"}],
+        "isError": True,
+        "structuredContent": payload,
+    }
+
+
+def _pack_import_file_freshness(repo_root: str | None, path_value: Any, file_sha: Any) -> str:
+    path_text = normalize_optional_string(path_value)
+    sha_text = normalize_optional_string(file_sha)
+    if path_text is None or sha_text is None or repo_root is None:
+        return "unknown"
+    current_sha = current_file_sha(repo_root, path_text)
+    if current_sha is None:
+        try:
+            local_path = (Path(repo_root) / path_text).resolve()
+        except Exception:
+            local_path = Path(repo_root) / path_text
+        return "missing" if not local_path.exists() else "unknown"
+    return "verified" if str(current_sha) == sha_text else "stale"
+
+
+def _pack_import_memory_freshness(
+    repo_root: str | None,
+    touched_files: list[dict[str, Any]],
+    by_file_counts: dict[str, int],
+) -> str:
+    if not touched_files:
+        return "unknown"
+    labels: list[str] = []
+    for item in touched_files:
+        if not isinstance(item, dict):
+            labels.append("unknown")
+            by_file_counts["unknown"] = int(by_file_counts.get("unknown", 0) + 1)
+            continue
+        label = _pack_import_file_freshness(repo_root, item.get("path"), item.get("file_sha"))
+        if label not in PACK_IMPORT_FRESHNESS_VALUES:
+            label = "unknown"
+        labels.append(label)
+        by_file_counts[label] = int(by_file_counts.get(label, 0) + 1)
+    if labels and all(label == "verified" for label in labels):
+        return "verified"
+    if "missing" in labels:
+        return "missing"
+    if "stale" in labels:
+        return "stale"
+    return "unknown"
+
+
+def _pack_source_label_basename(raw_value: Any) -> str:
+    value = normalize_optional_string(raw_value)
+    if value is None:
+        return ""
+    normalized = value.replace("\\", "/")
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[-1]
+    return normalized or value
+
+
+def _pack_row_id_natural_key(row_id: Any) -> tuple[str, int, int, str]:
+    value = str(row_id or "")
+    idx = len(value)
+    while idx > 0 and value[idx - 1].isdigit():
+        idx -= 1
+    if idx < len(value) and idx > 0:
+        return (value[:idx], 0, int(value[idx:]), value)
+    return (value, 1, 0, value)
+
+
+def _pack_like_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _pack_review_sample_preview(row: dict[str, Any]) -> str:
+    for key in ("text", "title"):
+        value = normalize_optional_string(row.get(key))
+        if value:
+            return collapsed_preview_text(value, max_chars=200)
+    extra_candidates = [
+        key
+        for key, value in row.items()
+        if key not in {"text", "title"}
+        and isinstance(value, str)
+        and bool(str(value).strip())
+    ]
+    for key in sorted(extra_candidates):
+        value = normalize_optional_string(row.get(key))
+        if value:
+            return collapsed_preview_text(value, max_chars=200)
+    return ""
+
+
+def _pack_row_filters_supplied(args: dict[str, Any], *, include_query: bool) -> bool:
+    list_fields = ("topics", "kinds", "import_freshness", "row_ids", "memory_ids", "touched_paths")
+    for name in list_fields:
+        values = normalize_optional_string_list(args.get(name), name) or []
+        if values:
+            return True
+    if include_query and normalize_optional_string(args.get("query")):
+        return True
+    return False
+
+
+def _get_imported_pack(conn: sqlite3.Connection, pack_id: str) -> sqlite3.Row | None:
+    row = conn.execute(
+        """
+        SELECT pack_id, pack_name, source_label, trust_level, namespace,
+               imported_at, manifest_json, freshness_summary_json, received_zip_sha256
+        FROM imported_packs
+        WHERE pack_id = ?
+        """,
+        (pack_id,),
+    ).fetchone()
+    if isinstance(row, sqlite3.Row):
+        return row
+    return None
+
+
+def _select_imported_pack_rows(
+    conn: sqlite3.Connection,
+    pack_id: str,
+    args: dict[str, Any],
+    warnings: list[dict[str, str]],
+    *,
+    allow_query: bool,
+) -> dict[str, Any]:
+    topics = normalize_optional_string_list(args.get("topics"), "topics") or []
+    kinds_raw = normalize_optional_string_list(args.get("kinds"), "kinds") or []
+    kinds: list[str] = []
+    seen_kinds: set[str] = set()
+    for item in kinds_raw:
+        value = str(item).strip().lower()
+        if not value or value in seen_kinds:
+            continue
+        seen_kinds.add(value)
+        kinds.append(value)
+
+    freshness_raw = normalize_optional_string_list(args.get("import_freshness"), "import_freshness") or []
+    import_freshness: list[str] = []
+    seen_freshness: set[str] = set()
+    allowed_freshness = set(PACK_IMPORT_FRESHNESS_VALUES)
+    for item in freshness_raw:
+        value = str(item).strip().lower()
+        if not value or value in seen_freshness:
+            continue
+        if value not in allowed_freshness:
+            raise ValueError(
+                "import_freshness must be an array containing only: "
+                + ", ".join(PACK_IMPORT_FRESHNESS_VALUES)
+            )
+        seen_freshness.add(value)
+        import_freshness.append(value)
+
+    row_ids = normalize_optional_string_list(args.get("row_ids"), "row_ids") or []
+    memory_ids_input = normalize_optional_string_list(args.get("memory_ids"), "memory_ids") or []
+    raw_touched_paths = normalize_optional_string_list(args.get("touched_paths"), "touched_paths") or []
+    touched_paths = normalize_touched_paths(args.get("touched_paths")) or []
+    query_text = normalize_optional_string(args.get("query"))
+    if query_text is not None and not allow_query:
+        _pack_import_add_warning(
+            warnings,
+            "unsupported_filter_query",
+            "query is not supported for this action and was ignored.",
+        )
+        query_text = None
+
+    limit = _safe_int(args.get("limit"), PACK_REVIEW_LIMIT_DEFAULT, minimum=1, maximum=PACK_REVIEW_LIMIT_MAX)
+
+    clauses = ["ipr.pack_id = ?"]
+    sql_params: list[Any] = [pack_id]
+
+    memory_ids_filter = list(memory_ids_input)
+    if memory_ids_input:
+        pack_memory_rows = conn.execute(
+            "SELECT memory_id FROM imported_pack_rows WHERE pack_id = ?",
+            (pack_id,),
+        ).fetchall()
+        pack_memory_ids = {
+            str(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]) for row in pack_memory_rows
+        }
+        existing_rows = conn.execute(
+            f"SELECT id FROM memories WHERE id IN ({','.join('?' for _ in memory_ids_input)})",
+            tuple(memory_ids_input),
+        ).fetchall()
+        existing_ids = {str(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in existing_rows}
+        outside_existing = sorted(existing_ids - pack_memory_ids)
+        if outside_existing:
+            _pack_import_add_warning(
+                warnings,
+                "memory_ids_outside_pack_filtered",
+                f"{len(outside_existing)} memory_ids were outside pack {pack_id} and were filtered out.",
+            )
+        memory_ids_filter = [memory_id for memory_id in memory_ids_input if memory_id in pack_memory_ids]
+
+    if kinds:
+        placeholders = ",".join("?" for _ in kinds)
+        clauses.append(f"m.kind IN ({placeholders})")
+        sql_params.extend(kinds)
+
+    if import_freshness:
+        placeholders = ",".join("?" for _ in import_freshness)
+        clauses.append(
+            "CASE WHEN m.import_freshness IS NULL OR m.import_freshness = '' THEN 'unknown' "
+            f"ELSE m.import_freshness END IN ({placeholders})"
+        )
+        sql_params.extend(import_freshness)
+
+    if row_ids:
+        placeholders = ",".join("?" for _ in row_ids)
+        clauses.append(f"ipr.row_id_in_pack IN ({placeholders})")
+        sql_params.extend(row_ids)
+
+    if memory_ids_input:
+        if not memory_ids_filter:
+            clauses.append("1 = 0")
+        else:
+            placeholders = ",".join("?" for _ in memory_ids_filter)
+            clauses.append(f"m.id IN ({placeholders})")
+            sql_params.extend(memory_ids_filter)
+
+    if topics:
+        placeholders = ",".join("?" for _ in topics)
+        clauses.append(
+            "EXISTS ("
+            "SELECT 1 FROM memory_topics mt "
+            "WHERE mt.memory_id = m.id "
+            f"AND mt.topic IN ({placeholders})"
+            ")"
+        )
+        sql_params.extend(topics)
+
+    if touched_paths:
+        path_clauses: list[str] = []
+        if raw_touched_paths:
+            raw_placeholders = ",".join("?" for _ in raw_touched_paths)
+            path_clauses.append(f"mf_path.path IN ({raw_placeholders})")
+        normalized_placeholders = ",".join("?" for _ in touched_paths)
+        normalized_expr = "REPLACE(REPLACE(mf_path.path, char(92), '/'), './', '')"
+        path_clauses.append(f"{normalized_expr} IN ({normalized_placeholders})")
+        clauses.append(
+            "EXISTS ("
+            "SELECT 1 FROM memory_files mf_path "
+            "WHERE mf_path.memory_id = m.id "
+            "AND mf_path.memory_table = m.kind "
+            f"AND ({' OR '.join(path_clauses)})"
+            ")"
+        )
+        sql_params.extend(raw_touched_paths)
+        sql_params.extend(touched_paths)
+
+    if query_text is not None:
+        like_value = f"%{_pack_like_escape(query_text.lower())}%"
+        clauses.append(
+            "(LOWER(COALESCE(m.text, '')) LIKE ? ESCAPE '\\' "
+            "OR LOWER(COALESCE(m.title, '')) LIKE ? ESCAPE '\\')"
+        )
+        sql_params.extend([like_value, like_value])
+
+    where_sql = " AND ".join(clauses)
+    from_sql = (
+        "FROM imported_pack_rows ipr "
+        "JOIN memories m ON m.id = ipr.memory_id "
+        "LEFT JOIN promoted_pack_rows ppr ON ppr.pack_id = ipr.pack_id AND ppr.row_id_in_pack = ipr.row_id_in_pack"
+    )
+
+    total_pack_row = conn.execute(
+        "SELECT COUNT(*) FROM imported_pack_rows WHERE pack_id = ?",
+        (pack_id,),
+    ).fetchone()
+    total_pack_rows = int(total_pack_row[0] if total_pack_row else 0)
+
+    selected_rows_raw = conn.execute(
+        "SELECT ipr.row_id_in_pack, ipr.memory_id, m.kind, m.namespace, m.origin, m.import_freshness, "
+        "m.text, m.title, m.preview, m.git_sha, m.git_branch, m.git_dirty, m.created_at, m.updated_at, "
+        "ppr.promoted_memory_id, ppr.promotion_id, ppr.promoted_at "
+        f"{from_sql} WHERE {where_sql}",
+        tuple(sql_params),
+    ).fetchall()
+    selected_rows_all: list[dict[str, Any]] = [
+        {
+            "row_id_in_pack": str(row["row_id_in_pack"] if isinstance(row, sqlite3.Row) else row[0]),
+            "memory_id": str(row["memory_id"] if isinstance(row, sqlite3.Row) else row[1]),
+            "kind": str(row["kind"] if isinstance(row, sqlite3.Row) else row[2]),
+            "namespace": str(row["namespace"] if isinstance(row, sqlite3.Row) else row[3]),
+            "origin": str(row["origin"] if isinstance(row, sqlite3.Row) else row[4]),
+            "import_freshness": normalize_optional_string(
+                row["import_freshness"] if isinstance(row, sqlite3.Row) else row[5]
+            )
+            or "unknown",
+            "text": str(row["text"] if isinstance(row, sqlite3.Row) else row[6]),
+            "title": normalize_optional_string(row["title"] if isinstance(row, sqlite3.Row) else row[7]),
+            "preview": normalize_optional_string(row["preview"] if isinstance(row, sqlite3.Row) else row[8]),
+            "git_sha": normalize_optional_string(row["git_sha"] if isinstance(row, sqlite3.Row) else row[9]),
+            "git_branch": normalize_optional_string(row["git_branch"] if isinstance(row, sqlite3.Row) else row[10]),
+            "git_dirty": normalize_git_dirty(row["git_dirty"] if isinstance(row, sqlite3.Row) else row[11]),
+            "created_at": normalize_optional_string(row["created_at"] if isinstance(row, sqlite3.Row) else row[12]),
+            "updated_at": normalize_optional_string(row["updated_at"] if isinstance(row, sqlite3.Row) else row[13]),
+            "promoted_to_memory_id": normalize_optional_string(
+                row["promoted_memory_id"] if isinstance(row, sqlite3.Row) else row[14]
+            ),
+            "promotion_id": normalize_optional_string(
+                row["promotion_id"] if isinstance(row, sqlite3.Row) else row[15]
+            ),
+            "promoted_at": normalize_optional_string(
+                row["promoted_at"] if isinstance(row, sqlite3.Row) else row[16]
+            ),
+        }
+        for row in selected_rows_raw
+    ]
+    selected_rows_all.sort(
+        key=lambda item: (
+            str(item.get("kind", "")),
+            _pack_row_id_natural_key(item.get("row_id_in_pack")),
+            str(item.get("memory_id", "")),
+        )
+    )
+
+    selected_total = len(selected_rows_all)
+    limited = bool(selected_total > limit)
+    limited_rows = list(selected_rows_all[:limit])
+
+    by_kind: dict[str, int] = {}
+    by_import_freshness: dict[str, int] = {name: 0 for name in PACK_IMPORT_FRESHNESS_VALUES}
+    for row in selected_rows_all:
+        kind_name = str(row.get("kind", ""))
+        freshness_label = str(row.get("import_freshness", "unknown") or "unknown")
+        if freshness_label not in by_import_freshness:
+            freshness_label = "unknown"
+        by_kind[kind_name] = int(by_kind.get(kind_name, 0) + 1)
+        by_import_freshness[freshness_label] = int(by_import_freshness.get(freshness_label, 0) + 1)
+
+    topic_rows = conn.execute(
+        "SELECT mt.topic, COUNT(*) AS count "
+        f"{from_sql} "
+        "JOIN memory_topics mt ON mt.memory_id = m.id "
+        f"WHERE {where_sql} "
+        "GROUP BY mt.topic "
+        "ORDER BY count DESC, mt.topic ASC",
+        tuple(sql_params),
+    ).fetchall()
+    by_topic: dict[str, int] = {}
+    for row in topic_rows:
+        topic_name = str(row["topic"] if isinstance(row, sqlite3.Row) else row[0])
+        topic_count = int(row["count"] if isinstance(row, sqlite3.Row) else row[1])
+        by_topic[topic_name] = topic_count
+
+    referenced_file_count_row = conn.execute(
+        "SELECT COUNT(DISTINCT mf.path) "
+        f"{from_sql} "
+        "JOIN memory_files mf ON mf.memory_id = m.id AND mf.memory_table = m.kind "
+        f"WHERE {where_sql}",
+        tuple(sql_params),
+    ).fetchone()
+    referenced_files = int(referenced_file_count_row[0] if referenced_file_count_row else 0)
+    top_files_rows = conn.execute(
+        "SELECT mf.path, COUNT(DISTINCT mf.memory_id) AS count "
+        f"{from_sql} "
+        "JOIN memory_files mf ON mf.memory_id = m.id AND mf.memory_table = m.kind "
+        f"WHERE {where_sql} "
+        "GROUP BY mf.path "
+        "ORDER BY count DESC, mf.path ASC "
+        "LIMIT 20",
+        tuple(sql_params),
+    ).fetchall()
+    top_referenced_files = [
+        {
+            "path": str(row["path"] if isinstance(row, sqlite3.Row) else row[0]),
+            "count": int(row["count"] if isinstance(row, sqlite3.Row) else row[1]),
+        }
+        for row in top_files_rows
+    ]
+
+    limited_memory_ids = [str(row.get("memory_id", "")) for row in limited_rows]
+    topics_by_memory = _pack_topics_by_memory_id(conn, limited_memory_ids)
+    files_by_memory = _pack_files_by_memory_id(conn, limited_memory_ids)
+    for row in limited_rows:
+        memory_id = str(row.get("memory_id", ""))
+        row["topics"] = list(topics_by_memory.get(memory_id, []))
+        row["touched_files"] = list(files_by_memory.get(memory_id, []))
+
+    return {
+        "pack_id": pack_id,
+        "topics_filter": topics,
+        "kinds_filter": kinds,
+        "import_freshness_filter": import_freshness,
+        "row_ids_filter": row_ids,
+        "memory_ids_filter": memory_ids_filter,
+        "memory_ids_input": memory_ids_input,
+        "touched_paths_filter": touched_paths,
+        "query_filter": query_text,
+        "limit": limit,
+        "total_pack_rows": total_pack_rows,
+        "selected_total": selected_total,
+        "limited": limited,
+        "selected_rows": limited_rows,
+        "selected_row_ids": [str(row.get("row_id_in_pack", "")) for row in limited_rows],
+        "by_kind": by_kind,
+        "by_import_freshness": by_import_freshness,
+        "by_topic": by_topic,
+        "referenced_files": referenced_files,
+        "top_referenced_files": top_referenced_files,
+    }
+
+
+def pack_list_imports(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("pack_list_imports requires sqlite backend")
+
+    try:
+        trust_level = normalize_choice(
+            args.get("trust_level"),
+            "trust_level",
+            ("quarantine", "trusted"),
+            default=None,
+            strict=True,
+        )
+        pack_id_filter = normalize_optional_string(args.get("pack_id"))
+        namespace_filter = normalize_optional_string(args.get("namespace"))
+        include_counts = parse_bool(args.get("include_counts"), default=True)
+        include_topics = parse_bool(args.get("include_topics"), default=True)
+        include_freshness = parse_bool(args.get("include_freshness"), default=True)
+        limit = _safe_int(
+            args.get("limit"),
+            PACK_LIST_IMPORTS_LIMIT_DEFAULT,
+            minimum=1,
+            maximum=PACK_LIST_IMPORTS_LIMIT_MAX,
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    warnings: list[dict[str, str]] = []
+    packs: list[dict[str, Any]] = []
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+
+            clauses = ["1 = 1"]
+            sql_params: list[Any] = []
+            if trust_level is not None:
+                clauses.append("trust_level = ?")
+                sql_params.append(trust_level)
+            if pack_id_filter is not None:
+                clauses.append("pack_id = ?")
+                sql_params.append(pack_id_filter)
+            if namespace_filter is not None:
+                clauses.append("namespace = ?")
+                sql_params.append(namespace_filter)
+
+            where_sql = " AND ".join(clauses)
+            total_row = conn.execute(
+                f"SELECT COUNT(*) FROM imported_packs WHERE {where_sql}",
+                tuple(sql_params),
+            ).fetchone()
+            total = int(total_row[0] if total_row else 0)
+
+            rows = conn.execute(
+                "SELECT pack_id, pack_name, namespace, trust_level, imported_at, source_label, "
+                "freshness_summary_json, received_zip_sha256 "
+                f"FROM imported_packs WHERE {where_sql} "
+                "ORDER BY imported_at DESC, pack_id ASC "
+                "LIMIT ?",
+                tuple(sql_params + [limit]),
+            ).fetchall()
+
+            for row in rows:
+                row_pack_id = str(row["pack_id"] if isinstance(row, sqlite3.Row) else row[0])
+                row_pack_name = str(row["pack_name"] if isinstance(row, sqlite3.Row) else row[1])
+                row_namespace = str(row["namespace"] if isinstance(row, sqlite3.Row) else row[2])
+                row_trust_level = str(row["trust_level"] if isinstance(row, sqlite3.Row) else row[3])
+                row_imported_at = str(row["imported_at"] if isinstance(row, sqlite3.Row) else row[4])
+                row_source_label = _pack_source_label_basename(row["source_label"] if isinstance(row, sqlite3.Row) else row[5])
+                freshness_raw = row["freshness_summary_json"] if isinstance(row, sqlite3.Row) else row[6]
+                received_zip_sha256 = normalize_optional_string(
+                    row["received_zip_sha256"] if isinstance(row, sqlite3.Row) else row[7]
+                ) or ""
+
+                memory_count = 0
+                topic_count = 0
+                memory_file_count = 0
+                if include_counts:
+                    memory_count_row = conn.execute(
+                        "SELECT COUNT(*) FROM imported_pack_rows WHERE pack_id = ?",
+                        (row_pack_id,),
+                    ).fetchone()
+                    memory_count = int(memory_count_row[0] if memory_count_row else 0)
+
+                    topic_count_row = conn.execute(
+                        "SELECT COUNT(*) "
+                        "FROM memory_topics mt "
+                        "JOIN imported_pack_rows ipr ON ipr.memory_id = mt.memory_id "
+                        "WHERE ipr.pack_id = ?",
+                        (row_pack_id,),
+                    ).fetchone()
+                    topic_count = int(topic_count_row[0] if topic_count_row else 0)
+
+                    memory_file_count_row = conn.execute(
+                        "SELECT COUNT(*) "
+                        "FROM memory_files "
+                        "WHERE memory_id IN (SELECT memory_id FROM imported_pack_rows WHERE pack_id = ?)",
+                        (row_pack_id,),
+                    ).fetchone()
+                    memory_file_count = int(memory_file_count_row[0] if memory_file_count_row else 0)
+
+                freshness_payload: dict[str, Any] = {"by_memory": {}, "by_file": {}}
+                if include_freshness:
+                    parsed_freshness: dict[str, Any] | None = None
+                    freshness_text = normalize_optional_string(freshness_raw)
+                    if freshness_text is not None:
+                        try:
+                            candidate = json.loads(freshness_text)
+                            if isinstance(candidate, dict):
+                                parsed_freshness = candidate
+                            else:
+                                raise ValueError("freshness summary is not an object")
+                        except Exception:
+                            _pack_import_add_warning(
+                                warnings,
+                                "malformed_freshness_summary",
+                                f"freshness_summary_json is malformed for pack {row_pack_id}",
+                            )
+                    if isinstance(parsed_freshness, dict):
+                        by_memory = parsed_freshness.get("by_memory")
+                        by_file = parsed_freshness.get("by_file")
+                        freshness_payload = {
+                            "by_memory": by_memory if isinstance(by_memory, dict) else {},
+                            "by_file": by_file if isinstance(by_file, dict) else {},
+                        }
+
+                top_topics: list[dict[str, Any]] = []
+                if include_topics:
+                    top_topic_rows = conn.execute(
+                        "SELECT mt.topic, COUNT(*) AS row_count "
+                        "FROM memory_topics mt "
+                        "JOIN imported_pack_rows ipr ON ipr.memory_id = mt.memory_id "
+                        "WHERE ipr.pack_id = ? "
+                        "GROUP BY mt.topic "
+                        "ORDER BY row_count DESC, mt.topic ASC "
+                        "LIMIT 10",
+                        (row_pack_id,),
+                    ).fetchall()
+                    top_topics = [
+                        {
+                            "topic": str(topic_row["topic"] if isinstance(topic_row, sqlite3.Row) else topic_row[0]),
+                            "row_count": int(
+                                topic_row["row_count"] if isinstance(topic_row, sqlite3.Row) else topic_row[1]
+                            ),
+                        }
+                        for topic_row in top_topic_rows
+                    ]
+
+                packs.append(
+                    {
+                        "pack_id": row_pack_id,
+                        "pack_name": row_pack_name,
+                        "namespace": row_namespace,
+                        "trust_level": row_trust_level,
+                        "imported_at": row_imported_at,
+                        "source_label": row_source_label,
+                        "received_zip_sha256": received_zip_sha256,
+                        "memory_count": int(memory_count),
+                        "topic_count": int(topic_count),
+                        "memory_file_count": int(memory_file_count),
+                        "freshness": freshness_payload,
+                        "top_topics": top_topics,
+                    }
+                )
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    structured = {
+        "action": "pack_list_imports",
+        "status": "ok",
+        "total": int(total),
+        "limited": bool(total > limit),
+        "limit": int(limit),
+        "packs": packs,
+        "warnings": warnings,
+    }
+    lines = [
+        f"Imported packs: {total} (limited={str(total > limit).lower()}, limit={limit})",
+        f"Returned: {len(packs)}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def pack_review_import(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("pack_review_import requires sqlite backend")
+
+    pack_id = normalize_optional_string(args.get("pack_id"))
+    if pack_id is None:
+        return tool_error_code("pack_not_found", "pack_id is required")
+
+    include_samples = parse_bool(args.get("include_samples"), default=True)
+    sample_limit = _safe_int(
+        args.get("sample_limit"),
+        PACK_REVIEW_SAMPLE_LIMIT_DEFAULT,
+        minimum=0,
+        maximum=PACK_REVIEW_SAMPLE_LIMIT_MAX,
+    )
+    warnings: list[dict[str, str]] = []
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            pack_row = _get_imported_pack(conn, pack_id)
+            if pack_row is None:
+                return tool_error_code("pack_not_found", f"pack {pack_id} was not found")
+            selection = _select_imported_pack_rows(
+                conn,
+                pack_id,
+                args,
+                warnings,
+                allow_query=True,
+            )
+    except ValueError as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    selected_rows = list(selection["selected_rows"])
+    samples: list[dict[str, Any]] = []
+    if include_samples and sample_limit > 0:
+        for row in selected_rows[:sample_limit]:
+            samples.append(
+                {
+                    "row_id_in_pack": str(row.get("row_id_in_pack", "")),
+                    "memory_id": str(row.get("memory_id", "")),
+                    "kind": str(row.get("kind", "")),
+                    "namespace": str(row.get("namespace", "")),
+                    "origin": str(row.get("origin", "")),
+                    "import_freshness": str(row.get("import_freshness", "unknown") or "unknown"),
+                    "topics": list(row.get("topics", [])),
+                    "touched_files": list(row.get("touched_files", [])),
+                    "git_sha": normalize_optional_string(row.get("git_sha")),
+                    "git_branch": normalize_optional_string(row.get("git_branch")),
+                    "git_dirty": normalize_git_dirty(row.get("git_dirty")),
+                    "promoted_to_memory_id": normalize_optional_string(row.get("promoted_to_memory_id")),
+                    "promotion_id": normalize_optional_string(row.get("promotion_id")),
+                    "promoted_at": normalize_optional_string(row.get("promoted_at")),
+                    "preview": _pack_review_sample_preview(row),
+                }
+            )
+
+    structured = {
+        "action": "pack_review_import",
+        "status": "ok",
+        "pack": {
+            "pack_id": str(pack_row["pack_id"]),
+            "pack_name": str(pack_row["pack_name"]),
+            "namespace": str(pack_row["namespace"]),
+            "trust_level": str(pack_row["trust_level"]),
+            "imported_at": str(pack_row["imported_at"]),
+            "source_label": _pack_source_label_basename(pack_row["source_label"]),
+            "received_zip_sha256": normalize_optional_string(pack_row["received_zip_sha256"]) or "",
+        },
+        "selection": {
+            "total_pack_rows": int(selection["total_pack_rows"]),
+            "selected_rows": int(selection["selected_total"]),
+            "limited": bool(selection["limited"]),
+            "limit": int(selection["limit"]),
+        },
+        "counts": {
+            "by_kind": dict(selection["by_kind"]),
+            "by_import_freshness": dict(selection["by_import_freshness"]),
+            "by_topic": dict(selection["by_topic"]),
+            "referenced_files": int(selection["referenced_files"]),
+        },
+        "files": {
+            "top_referenced_files": list(selection["top_referenced_files"]),
+        },
+        "samples": samples if include_samples else [],
+        "warnings": warnings,
+    }
+    lines = [
+        f"Pack review: {pack_id}",
+        f"Rows selected: {selection['selected_total']} (limited={str(selection['limited']).lower()}, limit={selection['limit']})",
+        f"By kind: {selection['by_kind']}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def pack_promote_preview(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("pack_promote_preview requires sqlite backend")
+
+    pack_id = normalize_optional_string(args.get("pack_id"))
+    if pack_id is None:
+        return tool_error_code("pack_not_found", "pack_id is required")
+
+    include_samples = parse_bool(args.get("include_samples"), default=True)
+    sample_limit = _safe_int(
+        args.get("sample_limit"),
+        PACK_REVIEW_SAMPLE_LIMIT_DEFAULT,
+        minimum=0,
+        maximum=PACK_REVIEW_SAMPLE_LIMIT_MAX,
+    )
+    warnings: list[dict[str, str]] = []
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            pack_row = _get_imported_pack(conn, pack_id)
+            if pack_row is None:
+                return tool_error_code("pack_not_found", f"pack {pack_id} was not found")
+            trust_level = str(pack_row["trust_level"])
+            if trust_level not in {"quarantine", "trusted"}:
+                return tool_error_code(
+                    "unsupported_trust_level_for_promotion_preview",
+                    f"pack {pack_id} has trust_level={pack_row['trust_level']}; only quarantine or trusted packs are eligible",
+                )
+            if trust_level == "trusted":
+                _pack_import_add_warning(
+                    warnings,
+                    "trusted_import_source",
+                    "Promotion preview source rows come from a trusted import namespace.",
+                    extra={"phase": "preview"},
+                )
+            if not _pack_row_filters_supplied(args, include_query=False):
+                _pack_import_add_warning(
+                    warnings,
+                    "preview_all_pack_rows",
+                    "No row filters were supplied; previewing all pack rows up to the provided limit.",
+                )
+            selection = _select_imported_pack_rows(
+                conn,
+                pack_id,
+                args,
+                warnings,
+                allow_query=False,
+            )
+    except ValueError as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    if bool(selection["limited"]):
+        _pack_import_add_warning(
+            warnings,
+            "promotion_preview_limited",
+            "Preview results are limited by the provided limit.",
+        )
+
+    selected_rows = list(selection["selected_rows"])
+    would_create_memory_count = len(selected_rows)
+    would_copy_topic_count = 0
+    would_copy_memory_file_count = 0
+    candidate_rows_all: list[dict[str, Any]] = []
+    for row in selected_rows:
+        topics = list(row.get("topics", []))
+        touched_files = list(row.get("touched_files", []))
+        would_copy_topic_count += len(topics)
+        would_copy_memory_file_count += len(touched_files)
+        imported_memory_id = str(row.get("memory_id", ""))
+        import_freshness = str(row.get("import_freshness", "unknown") or "unknown")
+        candidate_rows_all.append(
+            {
+                "row_id_in_pack": str(row.get("row_id_in_pack", "")),
+                "imported_memory_id": imported_memory_id,
+                "kind": str(row.get("kind", "")),
+                "import_freshness": import_freshness,
+                "topics": topics,
+                "git_sha": normalize_optional_string(row.get("git_sha")),
+                "git_branch": normalize_optional_string(row.get("git_branch")),
+                "git_dirty": normalize_git_dirty(row.get("git_dirty")),
+                "would_generate_memory_id": True,
+                "target_namespace": DEFAULT_MEMORY_NAMESPACE,
+                "target_origin": "promoted",
+                "provenance": {
+                    "promoted_from_pack_id": pack_id,
+                    "promoted_from_row_id_in_pack": str(row.get("row_id_in_pack", "")),
+                    "promoted_from_imported_memory_id": imported_memory_id,
+                    "original_import_freshness": import_freshness,
+                },
+            }
+        )
+
+    candidate_rows = list(candidate_rows_all)
+    if len(candidate_rows) > PACK_PROMOTE_PREVIEW_CANDIDATE_OUTPUT_MAX:
+        candidate_rows = candidate_rows[:PACK_PROMOTE_PREVIEW_CANDIDATE_OUTPUT_MAX]
+        _pack_import_add_warning(
+            warnings,
+            "candidate_rows_truncated",
+            f"candidate_rows output was truncated to {PACK_PROMOTE_PREVIEW_CANDIDATE_OUTPUT_MAX}",
+        )
+
+    samples: list[dict[str, Any]] = []
+    if include_samples and sample_limit > 0:
+        for row in selected_rows[:sample_limit]:
+            samples.append(
+                {
+                    "row_id_in_pack": str(row.get("row_id_in_pack", "")),
+                    "imported_memory_id": str(row.get("memory_id", "")),
+                    "kind": str(row.get("kind", "")),
+                    "import_freshness": str(row.get("import_freshness", "unknown") or "unknown"),
+                    "preview": _pack_review_sample_preview(row),
+                }
+            )
+
+    structured = {
+        "action": "pack_promote_preview",
+        "status": "ok",
+        "pack": {
+            "pack_id": str(pack_row["pack_id"]),
+            "pack_name": str(pack_row["pack_name"]),
+            "namespace": str(pack_row["namespace"]),
+            "trust_level": str(pack_row["trust_level"]),
+        },
+        "selection": {
+            "selected_rows": int(selection["selected_total"]),
+            "limited": bool(selection["limited"]),
+            "limit": int(selection["limit"]),
+        },
+        "promotion_plan": {
+            "target_namespace": DEFAULT_MEMORY_NAMESPACE,
+            "target_origin": "promoted",
+            "would_create_memory_count": int(would_create_memory_count),
+            "would_copy_topic_count": int(would_copy_topic_count),
+            "would_copy_memory_file_count": int(would_copy_memory_file_count),
+            "would_preserve_git_provenance": True,
+            "would_preserve_pack_provenance": True,
+        },
+        "candidate_rows": candidate_rows,
+        "samples": samples if include_samples else [],
+        "warnings": warnings,
+    }
+    lines = [
+        f"Pack promotion preview: {pack_id}",
+        f"Selected rows: {selection['selected_total']} (limited={str(selection['limited']).lower()}, limit={selection['limit']})",
+        f"Would create: {would_create_memory_count} local promoted rows",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def pack_promote(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("pack_promote requires sqlite backend")
+
+    pack_id = normalize_optional_string(args.get("pack_id"))
+    if pack_id is None:
+        return tool_error_code("pack_not_found", "pack_id is required")
+
+    if "query" in args and args.get("query") is not None:
+        return tool_error_code(
+            "query_filter_not_allowed_for_promotion",
+            "query filter is not allowed for pack_promote; use explicit row filters.",
+        )
+
+    confirm_promote = parse_bool(args.get("confirm_promote"), default=False)
+    if not confirm_promote:
+        return tool_error_code(
+            "confirm_promote_required",
+            "pack_promote requires confirm_promote=true to proceed.",
+        )
+
+    allow_promote_all = parse_bool(args.get("allow_promote_all"), default=False)
+    allow_limited_promotion = parse_bool(args.get("allow_limited_promotion"), default=False)
+    warnings: list[dict[str, str]] = []
+
+    if not _pack_row_filters_supplied(args, include_query=False) and not allow_promote_all:
+        return _pack_error_with_warnings(
+            "promote_all_requires_explicit_allow",
+            "No row filters were supplied; pass allow_promote_all=true to promote all selected rows.",
+            warnings,
+        )
+
+    promoted_rows_all: list[dict[str, Any]] = []
+    memory_count = 0
+    topic_count = 0
+    memory_file_count = 0
+    mapping_count = 0
+    promoted_at = now_iso()
+    promotion_id = _pack_make_promotion_id()
+    source_namespace = ""
+    pack_name = ""
+    selected_rows: list[dict[str, Any]] = []
+    selected_total_count = 0
+    limited = False
+    limit = PACK_REVIEW_LIMIT_DEFAULT
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            pack_row = _get_imported_pack(conn, pack_id)
+            if pack_row is None:
+                return tool_error_code("pack_not_found", f"pack {pack_id} was not found")
+
+            trust_level = str(pack_row["trust_level"])
+            source_namespace = normalize_optional_string(pack_row["namespace"]) or ""
+            pack_name = str(pack_row["pack_name"])
+            if trust_level not in {"quarantine", "trusted"}:
+                return tool_error_code(
+                    "unsupported_trust_level_for_promotion",
+                    f"pack {pack_id} has trust_level={trust_level}; only quarantine or trusted packs are eligible",
+                )
+            if trust_level == "quarantine":
+                if not source_namespace.startswith(PACK_QUARANTINE_PREFIX):
+                    return tool_error_code(
+                        "namespace_trust_invariant",
+                        "quarantine promotion requires namespace prefix pack:quarantine:",
+                    )
+            elif trust_level == "trusted":
+                if not source_namespace.startswith(PACK_TRUSTED_PREFIX):
+                    return tool_error_code(
+                        "namespace_trust_invariant",
+                        "trusted promotion requires namespace prefix pack:trusted:",
+                    )
+                _pack_import_add_warning(
+                    warnings,
+                    "trusted_import_source",
+                    "Promotion source rows come from a trusted import namespace.",
+                    extra={"phase": "promotion"},
+                )
+
+            source_signer_id: str | None = None
+            source_secret_fingerprint: str | None = None
+            if trust_level == "trusted":
+                manifest_payload = {}
+                try:
+                    manifest_raw = normalize_optional_string(pack_row["manifest_json"])
+                    if manifest_raw:
+                        parsed_manifest = json.loads(manifest_raw)
+                        if isinstance(parsed_manifest, dict):
+                            manifest_payload = parsed_manifest
+                except Exception:
+                    manifest_payload = {}
+                signature_payload = manifest_payload.get("signature") if isinstance(manifest_payload, dict) else None
+                if isinstance(signature_payload, dict):
+                    source_signer_id = normalize_optional_string(signature_payload.get("signer_id"))
+                    source_secret_fingerprint = normalize_optional_string(signature_payload.get("secret_fingerprint"))
+
+            selection = _select_imported_pack_rows(
+                conn,
+                pack_id,
+                args,
+                warnings,
+                allow_query=False,
+            )
+            selected_total = int(selection["selected_total"])
+            selected_total_count = selected_total
+            limit = int(selection["limit"])
+            limited = bool(selection["limited"])
+            if selected_total <= 0:
+                return _pack_error_with_warnings(
+                    "selected_rows_empty",
+                    f"No rows matched promotion filters for pack {pack_id}.",
+                    warnings,
+                )
+            if limited and not allow_limited_promotion:
+                return _pack_error_with_warnings(
+                    "limited_promotion_requires_explicit_allow",
+                    "Selection exceeds limit; increase limit or pass allow_limited_promotion=true.",
+                    warnings,
+                )
+            if limited and allow_limited_promotion:
+                _pack_import_add_warning(
+                    warnings,
+                    "limited_promotion",
+                    "Only the limited selected row set was promoted.",
+                )
+
+            selected_rows = list(selection["selected_rows"])
+            allowed_kinds = set(PACK_EXPORT_ALLOWED_KINDS)
+            invalid_kinds = sorted({str(row.get("kind", "")) for row in selected_rows if str(row.get("kind", "")) not in allowed_kinds})
+            if invalid_kinds:
+                raise PackPromoteError(
+                    "unsupported_kind_for_promotion",
+                    f"unsupported kind(s) for promotion: {', '.join(invalid_kinds)}",
+                )
+
+            # Promotion only accepts mapped imported rows for this pack namespace.
+            for row in selected_rows:
+                row_namespace = normalize_optional_string(row.get("namespace")) or ""
+                row_origin = normalize_optional_string(row.get("origin")) or ""
+                if row_namespace != source_namespace or row_origin != "imported":
+                    raise PackPromoteError(
+                        "ineligible_source_row",
+                        "selected rows must be imported rows mapped to the target pack namespace",
+                    )
+
+            selected_row_ids = [str(row.get("row_id_in_pack", "")) for row in selected_rows]
+            if selected_row_ids:
+                placeholders = ",".join("?" for _ in selected_row_ids)
+                duplicate_rows = conn.execute(
+                    f"""
+                    SELECT row_id_in_pack, imported_memory_id, promoted_memory_id, promotion_id
+                    FROM promoted_pack_rows
+                    WHERE pack_id = ? AND row_id_in_pack IN ({placeholders})
+                    ORDER BY row_id_in_pack ASC
+                    """,
+                    tuple([pack_id] + selected_row_ids),
+                ).fetchall()
+            else:
+                duplicate_rows = []
+            if duplicate_rows:
+                duplicate_details = [
+                    {
+                        "row_id_in_pack": str(row["row_id_in_pack"] if isinstance(row, sqlite3.Row) else row[0]),
+                        "imported_memory_id": str(row["imported_memory_id"] if isinstance(row, sqlite3.Row) else row[1]),
+                        "promoted_memory_id": str(row["promoted_memory_id"] if isinstance(row, sqlite3.Row) else row[2]),
+                        "promotion_id": normalize_optional_string(row["promotion_id"] if isinstance(row, sqlite3.Row) else row[3]),
+                    }
+                    for row in duplicate_rows[:50]
+                ]
+                return _pack_error_with_warnings(
+                    "pack_rows_already_promoted",
+                    "One or more selected pack rows were already promoted.",
+                    warnings,
+                    extra={
+                        "already_promoted_rows": duplicate_details,
+                        "already_promoted_rows_truncated": bool(len(duplicate_rows) > 50),
+                    },
+                )
+
+            filters_payload = {
+                "topics": list(selection["topics_filter"]),
+                "kinds": list(selection["kinds_filter"]),
+                "import_freshness": list(selection["import_freshness_filter"]),
+                "row_ids": list(selection["row_ids_filter"]),
+                "memory_ids": list(selection["memory_ids_input"]),
+                "touched_paths": list(selection["touched_paths_filter"]),
+                "limit": int(limit),
+            }
+            conn.execute(
+                """
+                INSERT INTO promotion_audit(
+                    promotion_id, pack_id, promoted_at, filters_json, row_count,
+                    limited, allow_promote_all, allow_limited_promotion
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    promotion_id,
+                    pack_id,
+                    promoted_at,
+                    json.dumps(filters_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    int(len(selected_rows)),
+                    1 if limited else 0,
+                    1 if allow_promote_all else 0,
+                    1 if allow_limited_promotion else 0,
+                ),
+            )
+
+            for row in selected_rows:
+                row_id_in_pack = str(row.get("row_id_in_pack", ""))
+                imported_memory_id = str(row.get("memory_id", ""))
+                kind_name = str(row.get("kind", ""))
+                text_value = str(row.get("text", ""))
+                title_value = normalize_optional_string(row.get("title"))
+                import_freshness_value = str(row.get("import_freshness", "unknown") or "unknown")
+
+                metadata: dict[str, Any] = {
+                    "pack_promotion": {
+                        "promoted_from_pack_id": pack_id,
+                        "promoted_from_row_id_in_pack": row_id_in_pack,
+                        "promoted_from_imported_memory_id": imported_memory_id,
+                        "promotion_id": promotion_id,
+                        "promoted_at": promoted_at,
+                        "original_import_freshness": import_freshness_value,
+                        "promotion_source": "pack_promote",
+                        "source_trust_level": trust_level,
+                    }
+                }
+                if trust_level == "trusted":
+                    if source_signer_id is not None:
+                        metadata["pack_promotion"]["source_signer_id"] = source_signer_id
+                    if source_secret_fingerprint is not None:
+                        metadata["pack_promotion"]["source_secret_fingerprint"] = source_secret_fingerprint
+                if title_value is not None:
+                    metadata["title"] = title_value
+
+                promoted_memory_id = make_id(f"{pack_id}:{row_id_in_pack}:{imported_memory_id}:{promotion_id}")
+                promoted_memory = new_memory(
+                    promoted_memory_id,
+                    kind_name,
+                    text_value,
+                    source=f"pack_promote:{pack_id}",
+                    tags=[],
+                    linked_ids=[],
+                    git_sha=normalize_optional_string(row.get("git_sha")),
+                    git_branch=normalize_optional_string(row.get("git_branch")),
+                    git_dirty=normalize_git_dirty(row.get("git_dirty")),
+                    namespace=DEFAULT_MEMORY_NAMESPACE,
+                    origin="promoted",
+                    import_freshness=import_freshness_value,
+                    metadata=metadata,
+                )
+                _sqlite_upsert_memory(
+                    conn,
+                    promoted_memory,
+                    respect_provided_git_on_new=True,
+                    store_touched_files=False,
+                )
+                memory_count += 1
+
+                for topic_value in list(row.get("topics", [])):
+                    topic_text = normalize_optional_string(topic_value)
+                    if topic_text is None:
+                        continue
+                    cur = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_topics(memory_id, topic, created_at, source)
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (promoted_memory_id, topic_text, promoted_at, "promotion"),
+                    )
+                    topic_count += max(0, int(cur.rowcount))
+
+                seen_file_keys: set[tuple[str, str]] = set()
+                for file_item in list(row.get("touched_files", [])):
+                    if not isinstance(file_item, dict):
+                        continue
+                    path_text = normalize_optional_string(file_item.get("path"))
+                    file_sha_text = normalize_optional_string(file_item.get("file_sha"))
+                    if path_text is None or file_sha_text is None:
+                        continue
+                    file_key = (path_text, file_sha_text)
+                    if file_key in seen_file_keys:
+                        continue
+                    seen_file_keys.add(file_key)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO memory_files(memory_table, memory_id, path, file_sha)
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (kind_name, promoted_memory_id, path_text, file_sha_text),
+                    )
+                    memory_file_count += 1
+
+                conn.execute(
+                    """
+                    INSERT INTO promoted_pack_rows(
+                        pack_id, row_id_in_pack, imported_memory_id, promoted_memory_id,
+                        kind, promoted_at, original_import_freshness, promotion_id
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pack_id,
+                        row_id_in_pack,
+                        imported_memory_id,
+                        promoted_memory_id,
+                        kind_name,
+                        promoted_at,
+                        import_freshness_value,
+                        promotion_id,
+                    ),
+                )
+                mapping_count += 1
+                promoted_rows_all.append(
+                    {
+                        "row_id_in_pack": row_id_in_pack,
+                        "imported_memory_id": imported_memory_id,
+                        "promoted_memory_id": promoted_memory_id,
+                        "kind": kind_name,
+                        "promotion_id": promotion_id,
+                        "original_import_freshness": import_freshness_value,
+                    }
+                )
+    except PackPromoteError as exc:
+        return _pack_error_with_warnings(exc.code, exc.message, warnings)
+    except sqlite3.IntegrityError as exc:
+        return _pack_error_with_warnings("pack_promote_integrity_error", str(exc), warnings)
+    except Exception as exc:
+        return _pack_error_with_warnings("pack_promote_failed", f"{type(exc).__name__}: {exc}", warnings)
+
+    output_rows = list(promoted_rows_all)
+    if len(output_rows) > PACK_PROMOTE_OUTPUT_MAX_ROWS:
+        output_rows = output_rows[:PACK_PROMOTE_OUTPUT_MAX_ROWS]
+        _pack_import_add_warning(
+            warnings,
+            "promoted_rows_truncated",
+            f"promoted_rows output truncated to {PACK_PROMOTE_OUTPUT_MAX_ROWS}",
+        )
+
+    structured = {
+        "action": "pack_promote",
+        "status": "ok",
+        "promotion_id": promotion_id,
+        "pack_id": pack_id,
+        "pack_name": pack_name,
+        "promoted_at": promoted_at,
+        "source_namespace": source_namespace,
+        "target_namespace": DEFAULT_MEMORY_NAMESPACE,
+        "target_origin": "promoted",
+        "selection": {
+            "selected_rows": int(selected_total_count),
+            "promoted_rows": int(memory_count),
+            "limited": bool(limited),
+            "limit": int(limit),
+        },
+        "promoted": {
+            "memory_count": int(memory_count),
+            "topic_count": int(topic_count),
+            "memory_file_count": int(memory_file_count),
+            "mapping_count": int(mapping_count),
+        },
+        "promoted_rows": output_rows,
+        "warnings": warnings,
+    }
+    lines = [
+        f"Pack promoted: {pack_id}",
+        f"Promotion id: {promotion_id}",
+        f"Promoted rows: {memory_count} (limited={str(limited).lower()}, limit={limit})",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def pack_inspect(args: dict[str, Any]) -> dict[str, Any]:
+    include_samples = parse_bool(args.get("include_samples"), default=False)
+    sample_limit = _safe_int(args.get("sample_limit"), 5, minimum=0, maximum=200)
+    if sample_limit > 20:
+        sample_limit = 20
+    verification_secret = normalize_optional_string(args.get("verification_secret"))
+    if verification_secret is not None and len(verification_secret) < PACK_SECRET_MIN_LENGTH:
+        return tool_error_code(
+            "secret_too_short",
+            f"verification_secret must be at least {PACK_SECRET_MIN_LENGTH} characters",
+        )
+
+    pack_path_text = normalize_optional_string(args.get("pack_path"))
+    if pack_path_text is None:
+        payload = _pack_inspect_default()
+        _pack_inspect_error(payload, "missing_pack_path", "pack_path is required")
+        finalized = _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+        return text_result(_pack_inspect_text(finalized, "missing"), finalized)
+
+    pack_path = Path(pack_path_text).expanduser().resolve()
+    if not pack_path.exists():
+        payload = _pack_inspect_default()
+        _pack_inspect_error(payload, "pack_path_not_found", f"pack path not found: {pack_path}")
+        finalized = _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+        return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
+    if not pack_path.is_file():
+        payload = _pack_inspect_default()
+        _pack_inspect_error(payload, "pack_path_not_file", f"pack path is not a file: {pack_path}")
+        finalized = _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+        return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
+
+    non_zip_suffix_warning = bool(pack_path.suffix.lower() != ".zip")
+    try:
+        snapshot = _load_pack_snapshot(pack_path)
+    except PackSnapshotError as exc:
+        payload = _pack_inspect_default()
+        if non_zip_suffix_warning:
+            _pack_inspect_warning(
+                payload,
+                "non_zip_suffix",
+                "Pack path does not end with .zip but will be inspected because it opened as a valid ZIP.",
+            )
+        _pack_inspect_error(payload, exc.code, exc.message)
+        finalized = _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
+        return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
+
+    finalized = _inspect_pack_snapshot(
+        snapshot,
+        include_samples=include_samples,
+        sample_limit=sample_limit,
+        verification_secret=verification_secret,
+        non_zip_suffix_warning=non_zip_suffix_warning,
+    )
+    return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
+
+
+def pack_import(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("pack_import requires sqlite backend")
+    allow_unsigned_quarantine = parse_bool(args.get("allow_unsigned_quarantine"), default=False)
+    allow_trusted_import = parse_bool(args.get("allow_trusted_import"), default=False)
+    if allow_unsigned_quarantine and allow_trusted_import:
+        return tool_error_code(
+            "ambiguous_import_target",
+            "allow_unsigned_quarantine and allow_trusted_import cannot both be true.",
+        )
+    if not allow_unsigned_quarantine and not allow_trusted_import:
+        return tool_error_code("import_target_not_allowed", PACK_IMPORT_TARGET_NOT_ALLOWED_ERROR)
+
+    verification_secret = normalize_optional_string(args.get("verification_secret"))
+    verification_secret_unused_for_quarantine = bool(
+        not allow_trusted_import and verification_secret is not None
+    )
+    if allow_trusted_import:
+        if verification_secret is None:
+            return tool_error_code(
+                "trusted_import_requires_verification_secret",
+                "allow_trusted_import=true requires verification_secret.",
+            )
+        if len(verification_secret) < PACK_SECRET_MIN_LENGTH:
+            return tool_error_code(
+                "secret_too_short",
+                f"verification_secret must be at least {PACK_SECRET_MIN_LENGTH} characters",
+                details={"field": "verification_secret"},
+            )
+
+    pack_path_text = normalize_optional_string(args.get("pack_path"))
+    if pack_path_text is None:
+        return tool_error_code("missing_pack_path", "pack_path is required")
+    pack_path = Path(pack_path_text).expanduser().resolve()
+    if not pack_path.exists():
+        return tool_error_code("pack_path_not_found", f"pack path not found: {pack_path}")
+    if not pack_path.is_file():
+        return tool_error_code("pack_path_not_file", f"pack path is not a file: {pack_path}")
+
+    try:
+        snapshot = _load_pack_snapshot(pack_path)
+    except PackSnapshotError as exc:
+        return tool_error_code(exc.code, exc.message)
+
+    inspection = _inspect_pack_snapshot(
+        snapshot,
+        include_samples=False,
+        sample_limit=0,
+        verification_secret=verification_secret if allow_trusted_import else None,
+        non_zip_suffix_warning=bool(pack_path.suffix.lower() != ".zip"),
+    )
+    # verification_secret is sensitive and not needed after classification.
+    verification_secret = None
+    inspection_status = str(inspection.get("status", "invalid"))
+    signature_payload = inspection.get("signature", {}) if isinstance(inspection.get("signature"), dict) else {}
+    trust_classification = str(signature_payload.get("trust_classification", "unsigned") or "unsigned")
+    trusted_import_available = bool(inspection.get("trusted_import_available", False))
+    if allow_trusted_import:
+        if (
+            inspection_status != "valid"
+            or
+            signature_payload.get("present") is not True
+            or signature_payload.get("verified") is not True
+            or trust_classification != "trusted_signer"
+            or not trusted_import_available
+        ):
+            return tool_error_code(
+                "trusted_import_requires_verified_trusted_signer",
+                "trusted import requires pack_inspect classification trusted_signer with verified signature.",
+            )
+    else:
+        if inspection_status != "valid":
+            return tool_error_code(
+                "pack_validation_failed",
+                f"pack validation failed with status={inspection_status}",
+            )
+        if str(inspection.get("import_recommendation", "reject")) != "quarantine_only":
+            return tool_error_code(
+                "pack_validation_failed",
+                f"pack import recommendation is {inspection.get('import_recommendation')}; expected quarantine_only",
+            )
+
+    validation = inspection.get("validation", {}) if isinstance(inspection.get("validation"), dict) else {}
+    required_true_flags = [
+        "required_members_present",
+        "json_members_parse",
+        "jsonl_rows_parse",
+        "row_count_matches_manifest",
+        "no_source_memory_ids",
+        "redaction_metadata_valid",
+        "content_hash_valid",
+        "covered_members_valid",
+        "safe_zip_members",
+        "supported_schema",
+        "supported_signature_state",
+        "signature_valid",
+    ]
+    for flag_name in required_true_flags:
+        if not bool(validation.get(flag_name, False)):
+            return tool_error_code("pack_validation_failed", f"validation flag {flag_name} is false")
+
+    raw_member_bytes = snapshot.get("required_member_bytes", {})
+    if not isinstance(raw_member_bytes, dict):
+        return tool_error_code("pack_snapshot_invalid", "pack snapshot is missing required member bytes")
+    try:
+        manifest = _pack_inspect_parse_json(raw_member_bytes["manifest.json"], "manifest.json")
+        pack_rows = _pack_inspect_rows_from_jsonl(raw_member_bytes["content/memories.jsonl"])
+    except Exception as exc:
+        return tool_error_code("pack_snapshot_parse_error", f"{type(exc).__name__}: {exc}")
+
+    if not pack_rows:
+        return tool_error_code("empty_pack_rows", "pack has no importable rows")
+
+    pack_id = str(manifest.get("pack_id", "") or "")
+    pack_name = str(manifest.get("pack_name", "") or "")
+    if allow_trusted_import:
+        trust_level = "trusted"
+        target_namespace = f"{PACK_TRUSTED_PREFIX}{pack_id}"
+        if trust_level != "trusted" or not target_namespace.startswith(PACK_TRUSTED_PREFIX):
+            return tool_error_code(
+                "namespace_trust_invariant",
+                "trust_level=trusted requires namespace prefix pack:trusted:",
+            )
+    else:
+        trust_level = "quarantine"
+        target_namespace = f"{PACK_QUARANTINE_PREFIX}{pack_id}"
+        if trust_level != "quarantine" or not target_namespace.startswith(PACK_QUARANTINE_PREFIX):
+            return tool_error_code(
+                "namespace_trust_invariant",
+                "trust_level=quarantine requires namespace prefix pack:quarantine:",
+            )
+
+    source_label = pack_path.name
+    received_zip_sha256 = str(snapshot.get("received_zip_sha256", "") or "")
+    if not received_zip_sha256:
+        return tool_error_code("missing_received_zip_sha256", "received_zip_sha256 could not be computed")
+
+    warnings: list[dict[str, str]] = []
+    if verification_secret_unused_for_quarantine:
+        _pack_import_add_warning(
+            warnings,
+            "verification_secret_unused_for_quarantine_import",
+            "verification_secret was supplied but ignored because allow_trusted_import is false.",
+        )
+    for item in inspection.get("warnings", []):
+        if isinstance(item, dict):
+            _pack_import_add_warning(warnings, str(item.get("code", "")), str(item.get("message", "")))
+
+    imported_rows_all: list[dict[str, Any]] = []
+    memory_count = 0
+    topic_count = 0
+    memory_file_count = 0
+    mapping_count = 0
+    by_memory = {name: 0 for name in PACK_IMPORT_FRESHNESS_VALUES}
+    by_file = {name: 0 for name in PACK_IMPORT_FRESHNESS_VALUES}
+    imported_at = now_iso()
+    repo_root = _git_repo_root()
+
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            existing_row = conn.execute(
+                "SELECT received_zip_sha256 FROM imported_packs WHERE pack_id = ?",
+                (pack_id,),
+            ).fetchone()
+            if existing_row is not None:
+                stored_sha = normalize_optional_string(
+                    existing_row["received_zip_sha256"] if isinstance(existing_row, sqlite3.Row) else existing_row[0]
+                )
+                if stored_sha:
+                    if stored_sha == received_zip_sha256:
+                        raise PackImportError(
+                            "pack_already_imported",
+                            f"pack {pack_id} with matching received_zip_sha256 is already imported",
+                        )
+                    raise PackImportError(
+                        "pack_id_collision_distinct_content",
+                        f"pack_id {pack_id} already exists with different received_zip_sha256",
+                    )
+                raise PackImportError(
+                    "pack_already_imported_legacy_unknown_hash",
+                    f"pack {pack_id} already exists but stored hash is unavailable",
+                )
+
+            for row in pack_rows:
+                row_id_in_pack = str(row.get("row_id_in_pack", ""))
+                kind_name = str(row.get("kind", ""))
+                if kind_name not in PACK_EXPORT_ALLOWED_KINDS:
+                    raise PackImportError(
+                        "non_exportable_kind",
+                        f"kind '{kind_name}' is previewable but not importable in this phase",
+                    )
+                text_fields = row.get("text_fields")
+                if not isinstance(text_fields, dict):
+                    raise PackImportError("text_fields_type", f"row {row_id_in_pack} text_fields must be an object")
+
+                for key in sorted(text_fields):
+                    if str(key) not in PACK_REDACTION_TEXT_FIELDS:
+                        _pack_import_add_warning(
+                            warnings,
+                            PACK_IMPORT_UNKNOWN_TEXT_FIELD_WARNING_CODE,
+                            f"row {row_id_in_pack} skipped unknown text field: {key}",
+                        )
+
+                text_value_raw = text_fields.get("text")
+                text_value = str(text_value_raw) if text_value_raw is not None else ""
+                title_value = normalize_optional_string(text_fields.get("title")) if "title" in text_fields else None
+                touched_files_raw = row.get("touched_files")
+                if not isinstance(touched_files_raw, list):
+                    raise PackImportError("touched_files_type", f"row {row_id_in_pack} touched_files must be a list")
+                touched_files: list[dict[str, Any]] = [item for item in touched_files_raw if isinstance(item, dict)]
+                memory_freshness = _pack_import_memory_freshness(repo_root, touched_files, by_file)
+                by_memory[memory_freshness] = int(by_memory.get(memory_freshness, 0) + 1)
+
+                metadata: dict[str, Any] = {
+                    "pack_import": {
+                        "pack_id": pack_id,
+                        "row_id_in_pack": row_id_in_pack,
+                        "pack_name": pack_name,
+                        "created_at_in_source": normalize_optional_string(row.get("created_at_in_source")),
+                        "redaction_applied": bool(row.get("redaction_applied", False)),
+                    }
+                }
+                if "title" in text_fields:
+                    metadata["title"] = title_value
+
+                memory_id = make_id(f"{pack_id}:{row_id_in_pack}:{text_value}")
+                memory = new_memory(
+                    memory_id,
+                    kind_name,
+                    text_value,
+                    source=f"pack_import:{pack_id}",
+                    tags=[],
+                    linked_ids=[],
+                    git_sha=normalize_optional_string(row.get("git_sha_at_write")),
+                    git_branch=normalize_optional_string(row.get("git_branch_at_write")),
+                    git_dirty=normalize_git_dirty(row.get("git_dirty_at_write")),
+                    namespace=target_namespace,
+                    origin="imported",
+                    import_freshness=memory_freshness,
+                    metadata=metadata,
+                )
+                _sqlite_upsert_memory(
+                    conn,
+                    memory,
+                    respect_provided_git_on_new=True,
+                    store_touched_files=False,
+                )
+                memory_count += 1
+
+                topics_value = row.get("topics")
+                if not isinstance(topics_value, list):
+                    raise PackImportError("topics_type", f"row {row_id_in_pack} topics must be a list")
+                for topic_value_raw in topics_value:
+                    topic_value = normalize_optional_string(topic_value_raw)
+                    if topic_value is None:
+                        continue
+                    cur = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_topics(memory_id, topic, created_at, source)
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (memory_id, topic_value, imported_at, "pack_import"),
+                    )
+                    topic_count += max(0, int(cur.rowcount))
+
+                seen_file_keys: set[tuple[str, str]] = set()
+                for file_item in touched_files:
+                    path_text = normalize_optional_string(file_item.get("path"))
+                    file_sha_text = normalize_optional_string(file_item.get("file_sha"))
+                    if path_text is None or file_sha_text is None:
+                        continue
+                    file_key = (path_text, file_sha_text)
+                    if file_key in seen_file_keys:
+                        continue
+                    seen_file_keys.add(file_key)
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO memory_files(memory_table, memory_id, path, file_sha)
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (kind_name, memory_id, path_text, file_sha_text),
+                    )
+                    memory_file_count += 1
+
+                conn.execute(
+                    """
+                    INSERT INTO imported_pack_rows(pack_id, row_id_in_pack, memory_id, kind, imported_at)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (pack_id, row_id_in_pack, memory_id, kind_name, imported_at),
+                )
+                mapping_count += 1
+                imported_rows_all.append(
+                    {
+                        "row_id_in_pack": row_id_in_pack,
+                        "memory_id": memory_id,
+                        "kind": kind_name,
+                        "import_freshness": memory_freshness,
+                    }
+                )
+
+            if memory_count <= 0:
+                raise PackImportError("empty_pack_rows", "pack has no importable rows")
+
+            freshness_summary = {
+                "by_memory": {name: int(by_memory.get(name, 0)) for name in PACK_IMPORT_FRESHNESS_VALUES},
+                "by_file": {name: int(by_file.get(name, 0)) for name in PACK_IMPORT_FRESHNESS_VALUES},
+            }
+            conn.execute(
+                """
+                INSERT INTO imported_packs(
+                    pack_id, pack_name, source_label, trust_level, namespace,
+                    imported_at, manifest_json, freshness_summary_json, received_zip_sha256
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pack_id,
+                    pack_name,
+                    source_label,
+                    trust_level,
+                    target_namespace,
+                    imported_at,
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    json.dumps(freshness_summary, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    received_zip_sha256,
+                ),
+            )
+    except PackImportError as exc:
+        return tool_error_code(exc.code, exc.message)
+    except sqlite3.IntegrityError as exc:
+        return tool_error_code("pack_import_integrity_error", str(exc))
+    except Exception as exc:
+        return tool_error_code("pack_import_failed", f"{type(exc).__name__}: {exc}")
+
+    output_rows = list(imported_rows_all)
+    if len(output_rows) > PACK_IMPORT_OUTPUT_MAX_ROWS:
+        output_rows = output_rows[:PACK_IMPORT_OUTPUT_MAX_ROWS]
+        _pack_import_add_warning(
+            warnings,
+            PACK_IMPORT_OUTPUT_TRUNCATED_WARNING_CODE,
+            f"imported_rows output truncated to {PACK_IMPORT_OUTPUT_MAX_ROWS}",
+        )
+
+    freshness_summary = {
+        "by_memory": {name: int(by_memory.get(name, 0)) for name in PACK_IMPORT_FRESHNESS_VALUES},
+        "by_file": {name: int(by_file.get(name, 0)) for name in PACK_IMPORT_FRESHNESS_VALUES},
+    }
+    structured = {
+        "action": "pack_import",
+        "status": "ok",
+        "pack_id": pack_id,
+        "pack_name": pack_name,
+        "namespace": target_namespace,
+        "trust_level": trust_level,
+        "imported_at": imported_at,
+        "received_zip_sha256": received_zip_sha256,
+        "imported": {
+            "memory_count": int(memory_count),
+            "topic_count": int(topic_count),
+            "memory_file_count": int(memory_file_count),
+            "mapping_count": int(mapping_count),
+        },
+        "freshness": freshness_summary,
+        "imported_rows": output_rows,
+        "warnings": warnings,
+    }
+    lines = [
+        f"Pack imported: {pack_id} ({pack_name or 'unknown'})",
+        f"Namespace: {target_namespace}  Trust: {trust_level}",
+        f"Imported rows: {memory_count} memories, {topic_count} topics, {memory_file_count} file links",
+        f"received_zip_sha256: {received_zip_sha256}",
+    ]
+    return text_result("\n".join(lines), structured)
+
 GATEWAY_ACTIONS: dict[str, Any] = {
     "doctor": mnemo_doctor,
     "search": search_memories,
     "salience_check": memory_salience_check,
+    "pack_list_imports": pack_list_imports,
+    "pack_review_import": pack_review_import,
+    "pack_promote_preview": pack_promote_preview,
+    "pack_promote": pack_promote,
     "pack_preview": pack_preview,
     "pack_redaction_preview": pack_redaction_preview,
     "pack_export": pack_export,
+    "pack_inspect": pack_inspect,
+    "pack_import": pack_import,
+    "signer_add": signer_add,
+    "signer_list": signer_list,
+    "signer_disable": signer_disable,
+    "signer_enable": signer_enable,
     "record": record_memory,
     "alias_hint": memory_alias_hint,
     "topic_add": topic_add,
@@ -11322,7 +14627,7 @@ TOOLS = [
         "title": "Mnemo Memory Gateway",
         "description": (
             "Mnemo project-memory gateway; not Copilot native memory. "
-            "Actions: doctor, record, alias_hint, topic_add, topic_remove, topic_list, pack_preview, pack_redaction_preview, pack_export, search, recall, get, link, export, "
+            "Actions: doctor, record, alias_hint, topic_add, topic_remove, topic_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, search, recall, get, link, export, "
             "recent_events, search_events, get_event, memory_events, "
             "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures, propose_aliases, list_alias_proposals, approve_alias, reject_alias_proposal, list_aliases, disable_alias, disable_alias_concept), "
             "inspect, lookup_symbol, salience_check, update, delete, recent."
@@ -11333,7 +14638,7 @@ TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": sorted(GATEWAY_ACTIONS),
-                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept; topic_add/topic_remove/topic_list/pack_preview/pack_redaction_preview/pack_export are first-class actions.",
+                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept; topic_add/topic_remove/topic_list/pack_list_imports/pack_review_import/pack_promote_preview/pack_promote/pack_preview/pack_redaction_preview/pack_export/pack_inspect/pack_import/signer_add/signer_list/signer_disable/signer_enable are first-class actions.",
                 },
                 "params": {
                     "type": "object",
@@ -11521,7 +14826,7 @@ def handle_request(message: dict[str, Any]) -> None:
                 },
                 "instructions": (
                     "Use the single mnemo gateway tool with action plus optional params. "
-                    "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, pack_preview, pack_redaction_preview, recall, get, link, export, "
+                    "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, recall, get, link, export, "
                     "recent_events, search_events, get_event, memory_events, compact_context, "
                     "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
                     "Do not look for individual mnemo_* tools; "

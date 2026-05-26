@@ -40,17 +40,13 @@ IDF improves proposal quality and reduces generic noise.
 
 ## Curation lifecycle
 
-Use maintenance actions instead of file editing. The safe flow is:
+Use maintenance actions instead of file editing:
 
-1. Preview candidates with `propose_aliases` and `dry_run=true`.
-2. Review evidence and reject obvious generic/common-word proposals before persistence.
-3. Persist the reviewable set with `propose_aliases` and `dry_run=false`.
-4. Inspect persisted rows with `list_alias_proposals`.
-5. Activate or reject persisted proposal ids with `approve_alias` / `reject_alias_proposal`.
-6. Inspect active vocabulary with `list_aliases`.
-7. Use `disable_alias` / `disable_alias_concept` for reversible deactivation.
-
-Important: proposals returned from `dry_run=true` are not persisted and cannot be approved or rejected by `proposal_id`.
+1. `propose_aliases`
+2. `list_alias_proposals`
+3. `approve_alias` or `reject_alias_proposal`
+4. `list_aliases` for active vocabulary inspection
+5. `disable_alias` / `disable_alias_concept` for reversible deactivation
 
 Approved aliases live in:
 

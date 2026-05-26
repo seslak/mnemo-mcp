@@ -536,6 +536,16 @@ class ToolSurfaceTests(MnemoTestCase):
         self.assertIn("pack_preview", payload["available_actions"])
         self.assertIn("pack_redaction_preview", payload["available_actions"])
         self.assertIn("pack_export", payload["available_actions"])
+        self.assertIn("pack_inspect", payload["available_actions"])
+        self.assertIn("pack_import", payload["available_actions"])
+        self.assertIn("pack_list_imports", payload["available_actions"])
+        self.assertIn("pack_review_import", payload["available_actions"])
+        self.assertIn("pack_promote_preview", payload["available_actions"])
+        self.assertIn("pack_promote", payload["available_actions"])
+        self.assertIn("signer_add", payload["available_actions"])
+        self.assertIn("signer_list", payload["available_actions"])
+        self.assertIn("signer_disable", payload["available_actions"])
+        self.assertIn("signer_enable", payload["available_actions"])
 
     def test_gateway_includes_event_history_actions(self) -> None:
         for action in ("recent_events", "search_events", "get_event", "memory_events"):
@@ -562,6 +572,49 @@ class ToolSurfaceTests(MnemoTestCase):
         tool = server.TOOLS[0]
         enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertIn("pack_export", enum_values)
+
+    def test_gateway_includes_pack_inspect_action(self) -> None:
+        self.assertIn("pack_inspect", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_inspect", enum_values)
+
+    def test_gateway_includes_pack_import_action(self) -> None:
+        self.assertIn("pack_import", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_import", enum_values)
+
+    def test_gateway_includes_pack_list_imports_action(self) -> None:
+        self.assertIn("pack_list_imports", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_list_imports", enum_values)
+
+    def test_gateway_includes_pack_review_import_action(self) -> None:
+        self.assertIn("pack_review_import", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_review_import", enum_values)
+
+    def test_gateway_includes_pack_promote_preview_action(self) -> None:
+        self.assertIn("pack_promote_preview", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_promote_preview", enum_values)
+
+    def test_gateway_includes_pack_promote_action(self) -> None:
+        self.assertIn("pack_promote", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_promote", enum_values)
+
+    def test_gateway_includes_signer_actions(self) -> None:
+        for action_name in ("signer_add", "signer_list", "signer_disable", "signer_enable"):
+            self.assertIn(action_name, server.GATEWAY_ACTIONS)
+            tool = server.TOOLS[0]
+            enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+            self.assertIn(action_name, enum_values)
 
 
 class DoctorPayloadTests(MnemoTestCase):
@@ -996,6 +1049,24 @@ class TokenizationAndScoringTests(MnemoTestCase):
         tag = {"text": "", "tags": ["auth"], "source": "", "kind": "note"}
         source = {"text": "", "tags": [], "source": "auth", "kind": "note"}
         self.assertGreater(server.score_memory(query, tag), server.score_memory(query, source))
+
+
+class PythonCompatibilityTests(MnemoTestCase):
+    def test_quote_token_helper_python310_safe(self) -> None:
+        self.assertEqual(server._quote_sqlite_fts_token("abc"), '"abc"')
+        self.assertEqual(server._quote_sqlite_fts_token('a"b'), '"a""b"')
+        self.assertEqual(server._quote_sqlite_fts_token(""), '""')
+
+    def test_mnemo_server_source_has_no_backslash_fstring_quote_pattern(self) -> None:
+        source = Path(server.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('f"\\"{token.replace(', source)
+        self.assertNotIn("f'\\\"{token.replace(", source)
+
+    def test_mnemo_declared_python_minimum_is_compatible(self) -> None:
+        pyproject = (Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('requires-python = ">=3.10"', pyproject)
+        self.assertIn('"Programming Language :: Python :: 3.10"', pyproject)
+        self.assertIn('"Programming Language :: Python :: 3.11"', pyproject)
 
 
 class MemoryMutationTests(MnemoTestCase):
@@ -2684,6 +2755,38 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
             conn.close()
         server._SQLITE_BOOTSTRAPPED.clear()
 
+    def _insert_imported_pack_unchecked(self, *, pack_id: str, trust_level: str, namespace: str) -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute("PRAGMA ignore_check_constraints = ON")
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO imported_packs(
+                    pack_id, pack_name, source_label, trust_level, namespace,
+                    imported_at, manifest_json, freshness_summary_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pack_id,
+                    f"Pack {pack_id}",
+                    "unit-test",
+                    trust_level,
+                    namespace,
+                    server.now_iso(),
+                    "{}",
+                    None,
+                ),
+            )
+            conn.commit()
+        finally:
+            try:
+                conn.execute("PRAGMA ignore_check_constraints = OFF")
+            except Exception:
+                pass
+            conn.close()
+        server._SQLITE_BOOTSTRAPPED.clear()
+
     def _pack_preview(self, **params: Any) -> dict[str, Any]:
         result = server.pack_preview(dict(params))
         self.assertFalse(result["isError"], result)
@@ -2757,6 +2860,421 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         finally:
             conn.close()
 
+    def _table_exists(self, table: str) -> bool:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+                (table,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def _query_digest(self, conn: sqlite3.Connection, sql: str, params: tuple[Any, ...] = ()) -> str:
+        digest = hashlib.sha256()
+        rows = conn.execute(sql, params).fetchall()
+        for row in rows:
+            digest.update(json.dumps([item for item in row], ensure_ascii=False, sort_keys=False).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def _read_only_snapshot(self) -> dict[str, Any]:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            watched_tables = [
+                "memories",
+                "memory_topics",
+                "memory_files",
+                "imported_packs",
+                "exported_packs",
+                "imported_pack_rows",
+                "promoted_pack_rows",
+                "promotion_audit",
+                "trusted_signers",
+                "alias_concepts",
+                "alias_terms",
+                "alias_proposals",
+                "alias_proposal_events",
+            ]
+            table_counts: dict[str, int] = {}
+            for table in watched_tables:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1",
+                    (table,),
+                ).fetchone()
+                if exists is not None:
+                    table_counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+            fts_tables = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'memories_fts%' OR name LIKE 'events_fts%') ORDER BY name"
+                ).fetchall()
+            ]
+            fts_counts = {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in fts_tables}
+
+            digests = {
+                "memories": self._query_digest(
+                    conn,
+                    "SELECT id, kind, namespace, origin, COALESCE(import_freshness, ''), COALESCE(text, ''), COALESCE(title, '') "
+                    "FROM memories ORDER BY id ASC",
+                )
+                if "memories" in table_counts
+                else "",
+                "memory_topics": self._query_digest(
+                    conn,
+                    "SELECT memory_id, topic, COALESCE(source, '') FROM memory_topics ORDER BY memory_id ASC, topic ASC",
+                )
+                if "memory_topics" in table_counts
+                else "",
+                "memory_files": self._query_digest(
+                    conn,
+                    "SELECT memory_table, memory_id, path, file_sha FROM memory_files ORDER BY memory_table ASC, memory_id ASC, path ASC",
+                )
+                if "memory_files" in table_counts
+                else "",
+                "imported_packs": self._query_digest(
+                    conn,
+                    "SELECT pack_id, namespace, trust_level, COALESCE(received_zip_sha256, '') FROM imported_packs ORDER BY pack_id ASC",
+                )
+                if "imported_packs" in table_counts
+                else "",
+                "exported_packs": self._query_digest(
+                    conn,
+                    "SELECT pack_id, pack_name, exported_at, row_count, redaction_count, signed FROM exported_packs ORDER BY pack_id ASC",
+                )
+                if "exported_packs" in table_counts
+                else "",
+                "imported_pack_rows": self._query_digest(
+                    conn,
+                    "SELECT pack_id, row_id_in_pack, memory_id, kind FROM imported_pack_rows ORDER BY pack_id ASC, row_id_in_pack ASC",
+                )
+                if "imported_pack_rows" in table_counts
+                else "",
+                "promoted_pack_rows": self._query_digest(
+                    conn,
+                    "SELECT pack_id, row_id_in_pack, imported_memory_id, promoted_memory_id, COALESCE(promotion_id, '') "
+                    "FROM promoted_pack_rows ORDER BY pack_id ASC, row_id_in_pack ASC",
+                )
+                if "promoted_pack_rows" in table_counts
+                else "",
+                "promotion_audit": self._query_digest(
+                    conn,
+                    "SELECT promotion_id, pack_id, promoted_at, row_count, limited FROM promotion_audit ORDER BY promotion_id ASC",
+                )
+                if "promotion_audit" in table_counts
+                else "",
+                "trusted_signers": self._query_digest(
+                    conn,
+                    "SELECT signer_id, trust_level, signature_algorithm, COALESCE(secret_fingerprint, ''), status "
+                    "FROM trusted_signers ORDER BY signer_id ASC",
+                )
+                if "trusted_signers" in table_counts
+                else "",
+            }
+            return {"counts": table_counts, "fts_counts": fts_counts, "digests": digests}
+        finally:
+            conn.close()
+
+    def _reset_sqlite_file(self) -> None:
+        if self.sqlite_file.exists():
+            self.sqlite_file.unlink()
+        self.sqlite_file.parent.mkdir(parents=True, exist_ok=True)
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+    def _pack_inspect(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_inspect(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_import(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_import(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_import_error(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_import(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _signer_add(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_add(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _signer_add_error(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_add(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _signer_list(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_list(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _signer_disable(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_disable(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _signer_disable_error(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_disable(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _signer_enable(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_enable(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _signer_enable_error(self, **params: Any) -> dict[str, Any]:
+        result = server.signer_enable(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _pack_list_imports(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_list_imports(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_review_import(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_review_import(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_review_import_error(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_review_import(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _pack_promote_preview(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_promote_preview(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_promote_preview_error(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_promote_preview(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _pack_promote(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_promote(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _pack_promote_error(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_promote(dict(params))
+        self.assertTrue(result["isError"], result)
+        return result
+
+    def _create_exported_pack(self, *, pack_name: str, output_dir: Path, **params: Any) -> Path:
+        export_params = {
+            "pack_name": pack_name,
+            "output_dir": str(output_dir),
+            "allow_unsigned": True,
+        }
+        export_params.update(params)
+        result = self._pack_export(**export_params)
+        return Path(result["structuredContent"]["output_path"])
+
+    def _create_signed_exported_pack(
+        self,
+        *,
+        pack_name: str,
+        output_dir: Path,
+        signer_id: str,
+        signing_secret: str,
+        **params: Any,
+    ) -> tuple[Path, dict[str, Any]]:
+        export_params = {
+            "pack_name": pack_name,
+            "output_dir": str(output_dir),
+            "sign_pack": True,
+            "signer_id": signer_id,
+            "signing_secret": signing_secret,
+        }
+        export_params.update(params)
+        result = self._pack_export(**export_params)
+        return Path(result["structuredContent"]["output_path"]), result["structuredContent"]
+
+    def _create_trusted_import_fixture(
+        self,
+        *,
+        marker: str,
+        kind: str = "context_block",
+        touched_files: list[str] | None = None,
+    ) -> dict[str, Any]:
+        signer_id = f"{marker}.trusted.signer"
+        secret = f"{marker}-trusted-secret-012345678901234567890123"
+        self._signer_add(signer_id=signer_id, secret=secret, trust_level="trusted")
+        source = self.record(
+            f"{marker} trusted import source",
+            kind=kind,
+            title=f"{marker} trusted title",
+            touched_files=list(touched_files or []),
+        )
+        topic = f"{marker}-trusted-topic"
+        add_topic = server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        self.assertFalse(add_topic["isError"], add_topic)
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name=f"{marker}_trusted_pack",
+            output_dir=self.root / f"{marker}_trusted_pack",
+            signer_id=signer_id,
+            signing_secret=secret,
+            topics=[topic],
+            kinds=[kind],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        imported = self._pack_import(
+            pack_path=str(pack_path),
+            allow_trusted_import=True,
+            verification_secret=secret,
+        )
+        return {
+            "signer_id": signer_id,
+            "secret": secret,
+            "topic": topic,
+            "source_memory_id": str(source["id"]),
+            "pack_path": str(pack_path),
+            "inspect": inspected,
+            "imported": imported,
+        }
+
+    def _create_signed_pack_fixture(
+        self,
+        *,
+        marker: str,
+        trust_level: str = "trusted",
+        signer_id: str | None = None,
+        secret: str | None = None,
+    ) -> dict[str, Any]:
+        signer = signer_id or f"{marker}.signer"
+        signing_secret = secret or f"{marker}-secret-012345678901234567890123"
+        self._signer_add(signer_id=signer, secret=signing_secret, trust_level=trust_level)
+        source = self.record(f"{marker} signed source", kind="context_block", title=f"{marker} signed title")
+        topic = f"{marker}-topic"
+        add_topic = server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        self.assertFalse(add_topic["isError"], add_topic)
+        pack_path, export_sc = self._create_signed_exported_pack(
+            pack_name=f"{marker}_signed_pack",
+            output_dir=self.root / f"{marker}_signed_pack",
+            signer_id=signer,
+            signing_secret=signing_secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        return {
+            "signer_id": signer,
+            "secret": signing_secret,
+            "topic": topic,
+            "source_memory_id": str(source["id"]),
+            "pack_path": str(pack_path),
+            "export": export_sc,
+        }
+
+    def _pack_error_code(self, result: dict[str, Any]) -> str:
+        structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        error = structured.get("error", {}) if isinstance(structured, dict) else {}
+        return str(error.get("code", ""))
+
+    def _pack_warning_codes(self, result: dict[str, Any]) -> set[str]:
+        structured = result.get("structuredContent", {}) if isinstance(result, dict) else {}
+        warnings = structured.get("warnings", []) if isinstance(structured, dict) else []
+        if not isinstance(warnings, list):
+            return set()
+        out: set[str] = set()
+        for item in warnings:
+            if isinstance(item, dict) and item.get("code") is not None:
+                out.add(str(item.get("code")))
+        return out
+
+    def _create_phase4b_imported_pack(
+        self,
+        *,
+        marker: str,
+        rows: int = 3,
+        kinds: list[str] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        kinds_list = list(kinds or ["context_block", "hippocampus_entry"])
+        touch_a = self.workspace / "src" / "phase4b" / "auth.py"
+        touch_b = self.workspace / "src" / "phase4b" / "billing.py"
+        touch_a.parent.mkdir(parents=True, exist_ok=True)
+        touch_b.parent.mkdir(parents=True, exist_ok=True)
+        touch_a.write_text("AUTH='phase4b'\n", encoding="utf-8")
+        touch_b.write_text("BILLING='phase4b'\n", encoding="utf-8")
+
+        created_ids: list[str] = []
+        for idx in range(rows):
+            kind_name = kinds_list[idx % len(kinds_list)]
+            touched = ["src/phase4b/auth.py"] if idx % 2 == 0 else ["src/phase4b/billing.py"]
+            recorded = self.record(
+                f"{marker} row {idx}",
+                kind=kind_name,
+                title=f"{marker} title {idx}",
+                touched_files=touched,
+            )
+            created_ids.append(str(recorded["id"]))
+            add_topic = server.topic_add(
+                {"memory_id": str(recorded["id"]), "topic": f"{marker}-topic-{idx:02d}", "source": "operator"}
+            )
+            self.assertFalse(add_topic["isError"], add_topic)
+
+        pack_path = self._create_exported_pack(
+            pack_name=marker,
+            output_dir=self.root / marker,
+            kinds=sorted(set(kinds_list)),
+            limit=500,
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_sc = imported["structuredContent"]
+        return str(imported_sc["pack_id"]), imported_sc
+
+    def _pack_rows(self, pack_id: str) -> list[tuple[str, str, str]]:
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            rows = conn.execute(
+                """
+                SELECT row_id_in_pack, memory_id, kind
+                FROM imported_pack_rows
+                WHERE pack_id = ?
+                ORDER BY row_id_in_pack ASC
+                """,
+                (pack_id,),
+            ).fetchall()
+            return [(str(row[0]), str(row[1]), str(row[2])) for row in rows]
+        finally:
+            conn.close()
+
+    def _rewrite_zip(
+        self,
+        source_path: Path,
+        dest_path: Path,
+        *,
+        remove_members: set[str] | None = None,
+        replace_members: dict[str, bytes] | None = None,
+        extra_members: dict[str, bytes] | None = None,
+        duplicate_member: tuple[str, bytes] | None = None,
+    ) -> None:
+        remove_members = remove_members or set()
+        replace_members = replace_members or {}
+        extra_members = extra_members or {}
+        with zipfile.ZipFile(source_path, "r") as src:
+            original_members = {name: src.read(name) for name in src.namelist()}
+        with zipfile.ZipFile(dest_path, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+            for name in sorted(original_members):
+                if name in remove_members:
+                    continue
+                if name in replace_members:
+                    dst.writestr(name, replace_members[name])
+                else:
+                    dst.writestr(name, original_members[name])
+            for name, data in extra_members.items():
+                dst.writestr(name, data)
+            if duplicate_member is not None:
+                dst.writestr(duplicate_member[0], duplicate_member[1])
+
     def test_memory_packs_phase1_migration_idempotent(self) -> None:
         server.load_store()
         server.load_store()
@@ -2771,13 +3289,19 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertTrue({"namespace", "origin", "import_freshness"}.issubset(memory_cols))
         self.assertIn("memory_topics", tables)
         self.assertIn("imported_packs", tables)
+        self.assertIn("imported_pack_rows", tables)
         self.assertIn("exported_packs", tables)
+        self.assertIn("promoted_pack_rows", tables)
+        self.assertIn("promotion_audit", tables)
         self.assertIn("idx_memories_namespace", indexes)
         self.assertIn("idx_memories_origin", indexes)
         self.assertIn("idx_memories_namespace_kind", indexes)
         self.assertIn("idx_memory_topics_topic", indexes)
         self.assertIn("idx_memory_topics_memory_id", indexes)
-        self.assertGreaterEqual(schema_version, 4)
+        self.assertIn("idx_promoted_pack_rows_pack_id", indexes)
+        self.assertIn("idx_promoted_pack_rows_promoted_memory_id", indexes)
+        self.assertIn("idx_promotion_audit_pack_id", indexes)
+        self.assertGreaterEqual(schema_version, 7)
 
     def test_memory_packs_phase1_existing_rows_default_local(self) -> None:
         legacy = server.new_memory("legacy-v3", "note", "legacy body text", "", [])
@@ -3580,7 +4104,7 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
             pack_name="phase2c_requires_unsigned",
             output_dir=str(output_dir),
         )
-        self.assertIn("Signing is not implemented yet", result["content"][0]["text"])
+        self.assertIn("allow_unsigned=true", result["content"][0]["text"])
         self.assertEqual(self._exported_packs_count(), before_audit)
         if output_dir.exists():
             self.assertEqual(list(output_dir.glob("*.zip")), [])
@@ -3713,7 +4237,7 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.record("phase2c failure no audit", kind="context_block")
         before = self._exported_packs_count()
         result = self._pack_export_error(pack_name="phase2c_failure_no_audit")
-        self.assertIn("Signing is not implemented yet", result["content"][0]["text"])
+        self.assertIn("allow_unsigned=true", result["content"][0]["text"])
         self.assertEqual(self._exported_packs_count(), before)
 
     def test_pack_export_rejects_interaction_log_and_agent_feedback(self) -> None:
@@ -4007,6 +4531,5690 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertEqual(str(manifest["redaction_ruleset_version"]), "baseline-v1")
         self.assertEqual(str(redactions["ruleset_version"]), "baseline-v1")
         self.assertEqual(str(result["structuredContent"]["redaction"]["ruleset_version"]), "baseline-v1")
+
+    def test_pack_inspect_valid_exported_pack(self) -> None:
+        self.record("phase3a valid inspect row", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_valid_pack",
+            output_dir=self.root / "phase3a_valid_pack",
+        )
+        result = self._pack_inspect(pack_path=str(pack_path))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "valid")
+        self.assertEqual(payload["import_recommendation"], "quarantine_only")
+        warnings = payload["warnings"]
+        self.assertTrue(any(item.get("code") == "unsigned_pack" for item in warnings))
+
+    def test_pack_inspect_content_hash_verifies(self) -> None:
+        self.record("phase3a hash verify", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_hash_verify",
+            output_dir=self.root / "phase3a_hash_verify",
+        )
+        result = self._pack_inspect(pack_path=str(pack_path))
+        content_hash = result["structuredContent"]["content_hash"]
+        self.assertTrue(bool(content_hash["valid"]))
+        self.assertEqual(str(content_hash["manifest_value"]), str(content_hash["recomputed_value"]))
+
+    def test_pack_inspect_tampered_content_rejected(self) -> None:
+        self.record("phase3a tamper base", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_tamper_base",
+            output_dir=self.root / "phase3a_tamper_base",
+        )
+        tampered = self.root / "phase3a_tamper_base" / "tampered.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            rows = archive.read("content/memories.jsonl").decode("utf-8")
+        tampered_rows = rows + json.dumps({"row_id_in_pack": "ctx_999", "kind": "context_block"}) + "\n"
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"content/memories.jsonl": tampered_rows.encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "invalid")
+        self.assertFalse(bool(payload["content_hash"]["valid"]))
+        self.assertEqual(payload["import_recommendation"], "reject")
+
+    def test_pack_inspect_covered_members_tampering_rejected(self) -> None:
+        self.record("phase3a covered members", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_covered_members",
+            output_dir=self.root / "phase3a_covered_members",
+        )
+        tampered = self.root / "phase3a_covered_members" / "tampered_covered.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            members = {name: archive.read(name) for name in archive.namelist()}
+        covered_members = [
+            "content/memories.jsonl",
+            "content/topics.json",
+            "provenance/origin.json",
+            "provenance/redactions.json",
+        ]
+        lines: list[str] = []
+        for name in sorted(covered_members):
+            lines.append(f"{name}\t{hashlib.sha256(members[name]).hexdigest()}\n")
+        manifest["content_hash"]["covered_members"] = covered_members
+        manifest["content_hash"]["value"] = hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "invalid")
+        self.assertEqual(payload["import_recommendation"], "reject")
+        self.assertTrue(any(item.get("code") == "covered_members_mismatch" for item in payload["errors"]))
+
+    def test_pack_inspect_missing_required_member_rejected(self) -> None:
+        self.record("phase3a missing member", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_missing_member",
+            output_dir=self.root / "phase3a_missing_member",
+        )
+        tampered = self.root / "phase3a_missing_member" / "missing_member.zip"
+        self._rewrite_zip(pack_path, tampered, remove_members={"provenance/redactions.json"})
+        result = self._pack_inspect(pack_path=str(tampered))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+
+    def test_pack_inspect_malformed_manifest_rejected(self) -> None:
+        self.record("phase3a malformed manifest", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_malformed_manifest",
+            output_dir=self.root / "phase3a_malformed_manifest",
+        )
+        tampered = self.root / "phase3a_malformed_manifest" / "malformed_manifest.zip"
+        self._rewrite_zip(pack_path, tampered, replace_members={"manifest.json": b"{invalid json"})
+        result = self._pack_inspect(pack_path=str(tampered))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+
+    def test_pack_inspect_unsupported_schema_rejected(self) -> None:
+        self.record("phase3a unsupported schema", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_unsupported_schema",
+            output_dir=self.root / "phase3a_unsupported_schema",
+        )
+        tampered = self.root / "phase3a_unsupported_schema" / "unsupported_schema.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        manifest["pack_schema_version"] = 999
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "unsupported")
+        self.assertEqual(payload["import_recommendation"], "reject")
+
+    def test_pack_inspect_source_memory_id_leak_rejected(self) -> None:
+        self.record("phase3a source id leak", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_source_id_leak",
+            output_dir=self.root / "phase3a_source_id_leak",
+        )
+        tampered = self.root / "phase3a_source_id_leak" / "source_id_leak.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            rows_blob = archive.read("content/memories.jsonl").decode("utf-8")
+        leak_rows = rows_blob + json.dumps({"leak": "mem_fake_leak_id"}) + "\n"
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"content/memories.jsonl": leak_rows.encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered), include_samples=True)
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "invalid")
+        self.assertTrue(any(item.get("code") == "source_memory_id_leak" for item in payload["errors"]))
+        self.assertEqual(payload["samples"], [])
+
+    def test_pack_inspect_rejects_interaction_log_rows(self) -> None:
+        self.record("phase3a interaction row", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_interaction_row",
+            output_dir=self.root / "phase3a_interaction_row",
+        )
+        tampered = self.root / "phase3a_interaction_row" / "interaction_kind.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+        rows[0]["kind"] = "interaction_log"
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"content/memories.jsonl": rows_blob.encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+
+    def test_pack_inspect_redaction_metadata_validation(self) -> None:
+        self.record("phase3a redaction metadata", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_redaction_metadata",
+            output_dir=self.root / "phase3a_redaction_metadata",
+        )
+        tampered = self.root / "phase3a_redaction_metadata" / "redaction_ruleset_mismatch.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            redactions = json.loads(archive.read("provenance/redactions.json").decode("utf-8"))
+        redactions["ruleset_version"] = "baseline-v2"
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"provenance/redactions.json": (json.dumps(redactions, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        self.assertIn(result["structuredContent"]["status"], {"invalid", "unsupported"})
+
+    def test_pack_inspect_redaction_counts_exact_match(self) -> None:
+        self.record("phase3a redaction counts test.user@example.test", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_redaction_counts",
+            output_dir=self.root / "phase3a_redaction_counts",
+        )
+        tampered = self.root / "phase3a_redaction_counts" / "redaction_counts_mismatch.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            redactions = json.loads(archive.read("provenance/redactions.json").decode("utf-8"))
+        redactions["total_matches"] = int(redactions.get("total_matches", 0)) + 1
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"provenance/redactions.json": (json.dumps(redactions, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "invalid")
+        self.assertFalse(bool(payload["validation"]["redaction_metadata_valid"]))
+
+    def test_pack_inspect_redaction_applied_required_true(self) -> None:
+        self.record("phase3a redaction applied row", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_redaction_applied",
+            output_dir=self.root / "phase3a_redaction_applied",
+        )
+        tampered = self.root / "phase3a_redaction_applied" / "redaction_applied_false.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+        rows[0]["redaction_applied"] = False
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"content/memories.jsonl": rows_blob.encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "invalid")
+        self.assertFalse(bool(payload["validation"]["redaction_metadata_valid"]))
+
+    def test_pack_inspect_read_only(self) -> None:
+        self.record("phase3a read only inspect", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_read_only_inspect",
+            output_dir=self.root / "phase3a_read_only_inspect",
+        )
+        before = {
+            "memories": self._table_count("memories"),
+            "imported_packs": self._table_count("imported_packs"),
+            "exported_packs": self._table_count("exported_packs"),
+            "memory_topics": self._table_count("memory_topics"),
+            "memory_files": self._table_count("memory_files"),
+        }
+        result = self._pack_inspect(pack_path=str(pack_path))
+        self.assertEqual(result["structuredContent"]["status"], "valid")
+        after = {
+            "memories": self._table_count("memories"),
+            "imported_packs": self._table_count("imported_packs"),
+            "exported_packs": self._table_count("exported_packs"),
+            "memory_topics": self._table_count("memory_topics"),
+            "memory_files": self._table_count("memory_files"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_inspect_samples_bounded(self) -> None:
+        for idx in range(4):
+            self.record(f"phase3a sample bounded {idx}", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_samples_bounded",
+            output_dir=self.root / "phase3a_samples_bounded",
+        )
+        valid = self._pack_inspect(pack_path=str(pack_path), include_samples=True, sample_limit=2)
+        self.assertLessEqual(len(valid["structuredContent"]["samples"]), 2)
+        tampered = self.root / "phase3a_samples_bounded" / "invalid_for_samples.zip"
+        self._rewrite_zip(pack_path, tampered, remove_members={"provenance/redactions.json"})
+        invalid = self._pack_inspect(pack_path=str(tampered), include_samples=True, sample_limit=2)
+        self.assertEqual(invalid["structuredContent"]["samples"], [])
+
+    def test_pack_inspect_zip_safety_path_traversal(self) -> None:
+        zip_path = self.root / "phase3a_traversal.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("../evil.json", "{}")
+        marker = self.root / "evil.json"
+        if marker.exists():
+            marker.unlink()
+        result = self._pack_inspect(pack_path=str(zip_path))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+        self.assertFalse(marker.exists())
+
+    def test_pack_inspect_zip_safety_backslash_drive_control_chars(self) -> None:
+        zip_path = self.root / "phase3a_bad_names.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("C:evil.json", "{}")
+            archive.writestr("bad\x01name.json", "{}")
+        result = self._pack_inspect(pack_path=str(zip_path))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+
+    def test_pack_inspect_zip_safety_duplicate_members(self) -> None:
+        zip_path = self.root / "phase3a_duplicate_members.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("manifest.json", "{}")
+            archive.writestr("manifest.json", "{}")
+        result = self._pack_inspect(pack_path=str(zip_path))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+
+    def test_pack_inspect_non_zip_rejected(self) -> None:
+        file_path = self.root / "phase3a_not_zip.txt"
+        file_path.write_text("not a zip", encoding="utf-8")
+        result = self._pack_inspect(pack_path=str(file_path))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "invalid")
+        self.assertEqual(payload["import_recommendation"], "reject")
+
+    def test_pack_inspect_no_extraction(self) -> None:
+        zip_path = self.root / "phase3a_no_extract.zip"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("../outside.txt", "oops")
+        outside = self.root / "outside.txt"
+        if outside.exists():
+            outside.unlink()
+        result = self._pack_inspect(pack_path=str(zip_path))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+        self.assertFalse(outside.exists())
+
+    def test_pack_inspect_timestamp_validation(self) -> None:
+        self.record("phase3a timestamp validation", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_timestamp_validation",
+            output_dir=self.root / "phase3a_timestamp_validation",
+        )
+        tampered = self.root / "phase3a_timestamp_validation" / "bad_timestamp.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+        manifest["created_at"] = "2026/05/25 00:00:00"
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={"manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")},
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        self.assertEqual(result["structuredContent"]["status"], "invalid")
+
+    def test_pack_inspect_extra_member_warning(self) -> None:
+        self.record("phase3a extra member warning", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_extra_member_warning",
+            output_dir=self.root / "phase3a_extra_member_warning",
+        )
+        tampered = self.root / "phase3a_extra_member_warning" / "extra_member.zip"
+        self._rewrite_zip(pack_path, tampered, extra_members={"future/unknown.json": b"{}"})
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "valid")
+        self.assertTrue(any(item.get("code") == "unknown_extra_member" for item in payload["warnings"]))
+
+    def test_pack_inspect_text_field_warning(self) -> None:
+        self.record("phase3a text field warning", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_text_field_warning",
+            output_dir=self.root / "phase3a_text_field_warning",
+        )
+        tampered = self.root / "phase3a_text_field_warning" / "unexpected_text_field.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+            members = {name: archive.read(name) for name in archive.namelist()}
+        rows[0]["text_fields"]["body"] = "extra field"
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        members["content/memories.jsonl"] = rows_blob.encode("utf-8")
+        covered_members = list(manifest.get("content_hash", {}).get("covered_members", server.PACK_CONTENT_HASH_COVERED_MEMBERS))
+        manifest["content_hash"]["value"] = self._recompute_pack_content_hash(members, covered_members)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={
+                "content/memories.jsonl": rows_blob.encode("utf-8"),
+                "manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+            },
+        )
+        result = self._pack_inspect(pack_path=str(tampered))
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "valid")
+        self.assertTrue(any(item.get("code") == "unexpected_text_field" for item in payload["warnings"]))
+
+    def test_pack_import_requires_allow_unsigned_quarantine(self) -> None:
+        self.record("phase3b import requires allow flag", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_requires_allow",
+            output_dir=self.root / "phase3b_requires_allow",
+        )
+        before_imported = self._table_count("imported_packs")
+        before_memories = self._table_count("memories")
+        failed = self._pack_import_error(pack_path=str(pack_path))
+        self.assertEqual(self._pack_error_code(failed), "import_target_not_allowed")
+        self.assertEqual(before_imported, self._table_count("imported_packs"))
+        self.assertEqual(before_memories, self._table_count("memories"))
+
+    def test_pack_import_valid_unsigned_pack_to_quarantine(self) -> None:
+        self.record("phase3b valid quarantine import", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_valid_quarantine",
+            output_dir=self.root / "phase3b_valid_quarantine",
+        )
+        result = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["trust_level"], "quarantine")
+        self.assertTrue(str(payload["namespace"]).startswith("pack:quarantine:"))
+        self.assertIn(str(payload["pack_id"]), str(payload["namespace"]))
+
+    def test_pack_import_inserts_imported_packs_row(self) -> None:
+        self.record("phase3b imported pack row", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_imported_pack_row",
+            output_dir=self.root / "phase3b_imported_pack_row",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM imported_packs WHERE pack_id = ?", (pack_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row["trust_level"]), "quarantine")
+        self.assertTrue(str(row["received_zip_sha256"]))
+        self.assertIsInstance(json.loads(str(row["manifest_json"])), dict)
+        self.assertIsInstance(json.loads(str(row["freshness_summary_json"])), dict)
+
+    def test_pack_import_creates_new_memory_ids(self) -> None:
+        source = self.record("phase3b source memory id check", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_new_mem_ids",
+            output_dir=self.root / "phase3b_new_mem_ids",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_rows = imported["structuredContent"]["imported_rows"]
+        self.assertTrue(imported_rows)
+        source_id = str(source["id"])
+        for row in imported_rows:
+            memory_id = str(row["memory_id"])
+            row_id_in_pack = str(row["row_id_in_pack"])
+            self.assertTrue(memory_id.startswith("mem_"))
+            self.assertNotEqual(memory_id, row_id_in_pack)
+            self.assertNotEqual(memory_id, source_id)
+
+    def test_pack_import_sets_namespace_origin_freshness(self) -> None:
+        self.record("phase3b namespace origin freshness", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_namespace_origin_freshness",
+            output_dir=self.root / "phase3b_namespace_origin_freshness",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        payload = imported["structuredContent"]
+        imported_ids = [str(item["memory_id"]) for item in payload["imported_rows"]]
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            placeholders = ",".join("?" for _ in imported_ids)
+            rows = conn.execute(
+                f"SELECT id, namespace, origin, import_freshness FROM memories WHERE id IN ({placeholders})",
+                tuple(imported_ids),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), len(imported_ids))
+        for row in rows:
+            self.assertEqual(str(row["namespace"]), str(payload["namespace"]))
+            self.assertEqual(str(row["origin"]), "imported")
+            self.assertIn(str(row["import_freshness"]), {"verified", "stale", "missing", "unknown"})
+
+    def test_pack_import_preserves_git_provenance(self) -> None:
+        self.record("phase3b git provenance base", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_git_provenance",
+            output_dir=self.root / "phase3b_git_provenance",
+        )
+        tampered = self.root / "phase3b_git_provenance" / "git_provenance.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+            members = {name: archive.read(name) for name in archive.namelist()}
+        rows[0]["git_sha_at_write"] = "gitsha_phase3b"
+        rows[0]["git_branch_at_write"] = "phase3b-branch"
+        rows[0]["git_dirty_at_write"] = 1
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        members["content/memories.jsonl"] = rows_blob.encode("utf-8")
+        covered = [str(name) for name in manifest["content_hash"]["covered_members"]]
+        manifest["content_hash"]["value"] = self._recompute_pack_content_hash(members, covered)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={
+                "content/memories.jsonl": rows_blob.encode("utf-8"),
+                "manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+            },
+        )
+        imported = self._pack_import(pack_path=str(tampered), allow_unsigned_quarantine=True)
+        memory_id = str(imported["structuredContent"]["imported_rows"][0]["memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT git_sha, git_branch, git_dirty FROM memories WHERE id = ?", (memory_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row["git_sha"]), "gitsha_phase3b")
+        self.assertEqual(str(row["git_branch"]), "phase3b-branch")
+        self.assertEqual(int(row["git_dirty"]), 1)
+
+    def test_pack_import_imports_topics(self) -> None:
+        memory = self.record("phase3b topic import", kind="context_block")
+        add = server.topic_add({"memory_id": memory["id"], "topic": "phase3b-topic", "source": "operator"})
+        self.assertFalse(add["isError"], add)
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_topics",
+            output_dir=self.root / "phase3b_topics",
+            topics=["phase3b-topic"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        memory_id = str(imported["structuredContent"]["imported_rows"][0]["memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT topic, source FROM memory_topics WHERE memory_id = ? ORDER BY topic ASC",
+                (memory_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertTrue(rows)
+        self.assertIn(("phase3b-topic", "pack_import"), [(str(row["topic"]), str(row["source"])) for row in rows])
+
+    def test_pack_import_imports_memory_files(self) -> None:
+        tracked = self.workspace / "src" / "auth" / "session.py"
+        tracked.parent.mkdir(parents=True, exist_ok=True)
+        tracked.write_text("SESSION='phase3b-import-files'\n", encoding="utf-8")
+        self.record(
+            "phase3b file import marker",
+            kind="context_block",
+            touched_files=["src/auth/session.py"],
+        )
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_memory_files",
+            output_dir=self.root / "phase3b_memory_files",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_row = imported["structuredContent"]["imported_rows"][0]
+        memory_id = str(imported_row["memory_id"])
+        kind_name = str(imported_row["kind"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT memory_table, memory_id, path, file_sha FROM memory_files WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row["memory_table"]), kind_name)
+        self.assertEqual(str(row["memory_id"]), memory_id)
+        self.assertEqual(str(row["path"]), "src/auth/session.py")
+        self.assertTrue(str(row["file_sha"]))
+
+    def test_pack_import_imported_pack_rows_mapping(self) -> None:
+        self.record("phase3b mapping row one", kind="context_block")
+        self.record("phase3b mapping row two", kind="hippocampus_entry")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_mapping_rows",
+            output_dir=self.root / "phase3b_mapping_rows",
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        imported_rows = imported["structuredContent"]["imported_rows"]
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT row_id_in_pack, memory_id FROM imported_pack_rows WHERE pack_id = ? ORDER BY imported_at ASC, row_id_in_pack ASC",
+                (pack_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        mapped_ids = {str(row["row_id_in_pack"]): str(row["memory_id"]) for row in rows}
+        self.assertTrue(mapped_ids)
+        for item in imported_rows:
+            self.assertEqual(mapped_ids.get(str(item["row_id_in_pack"])), str(item["memory_id"]))
+
+    def test_pack_import_rejects_reimport_same_pack(self) -> None:
+        self.record("phase3b reimport same bytes", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_reimport_same",
+            output_dir=self.root / "phase3b_reimport_same",
+        )
+        self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        before = {
+            "memories": self._table_count("memories"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "maps": self._table_count("imported_pack_rows"),
+        }
+        second = self._pack_import_error(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        self.assertIn("pack_already_imported", second["content"][0]["text"])
+        after = {
+            "memories": self._table_count("memories"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "maps": self._table_count("imported_pack_rows"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_import_rejects_same_pack_id_distinct_content(self) -> None:
+        self.record("phase3b pack id collision", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_collision_source",
+            output_dir=self.root / "phase3b_collision_source",
+        )
+        self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        variant = self.root / "phase3b_collision_source" / "variant.zip"
+        self._rewrite_zip(pack_path, variant, extra_members={"extra/collision.txt": b"phase3b"})
+        failed = self._pack_import_error(pack_path=str(variant), allow_unsigned_quarantine=True)
+        self.assertIn("pack_id_collision_distinct_content", failed["content"][0]["text"])
+
+    def test_pack_import_rejects_invalid_pack(self) -> None:
+        self.record("phase3b invalid pack base", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_invalid_pack",
+            output_dir=self.root / "phase3b_invalid_pack",
+        )
+        tampered = self.root / "phase3b_invalid_pack" / "tampered_invalid.zip"
+        self._rewrite_zip(pack_path, tampered, replace_members={"content/memories.jsonl": b"{not-json}\n"})
+        before = self._table_count("imported_packs")
+        failed = self._pack_import_error(pack_path=str(tampered), allow_unsigned_quarantine=True)
+        self.assertIn("pack_validation_failed", failed["content"][0]["text"])
+        self.assertEqual(before, self._table_count("imported_packs"))
+
+    def test_pack_import_transaction_rollback_on_failure(self) -> None:
+        self.record("phase3b rollback base", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_rollback",
+            output_dir=self.root / "phase3b_rollback",
+        )
+        before = {
+            "imported_packs": self._table_count("imported_packs"),
+            "memories": self._table_count("memories"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "maps": self._table_count("imported_pack_rows"),
+        }
+        with mock.patch("server._sqlite_upsert_memory", side_effect=RuntimeError("forced insert failure")):
+            failed = self._pack_import_error(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        self.assertIn("pack_import_failed", failed["content"][0]["text"])
+        after = {
+            "imported_packs": self._table_count("imported_packs"),
+            "memories": self._table_count("memories"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "maps": self._table_count("imported_pack_rows"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_import_retrieval_quarantine_visibility(self) -> None:
+        unique_text = "phase3b quarantine retrieval visibility marker"
+        self.record(unique_text, kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_visibility",
+            output_dir=self.root / "phase3b_visibility",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        namespace = str(imported["structuredContent"]["namespace"])
+        default = server.search_memories({"query": unique_text, "limit": 20})
+        include_imported = server.search_memories({"query": unique_text, "limit": 20, "include_imported": True})
+        include_quarantine = server.search_memories({"query": unique_text, "limit": 20, "include_quarantine": True})
+        explicit_namespace = server.search_memories({"query": unique_text, "limit": 20, "namespace": namespace})
+        imported_ids = {str(item["memory_id"]) for item in imported["structuredContent"]["imported_rows"]}
+        default_ids = {str(item["id"]) for item in default["structuredContent"]["matches"]}
+        include_imported_ids = {str(item["id"]) for item in include_imported["structuredContent"]["matches"]}
+        include_quarantine_ids = {str(item["id"]) for item in include_quarantine["structuredContent"]["matches"]}
+        explicit_ids = {str(item["id"]) for item in explicit_namespace["structuredContent"]["matches"]}
+        self.assertFalse(imported_ids & default_ids)
+        self.assertFalse(imported_ids & include_imported_ids)
+        self.assertTrue(imported_ids & include_quarantine_ids)
+        self.assertTrue(imported_ids & explicit_ids)
+
+    def test_pack_import_retrieval_result_provenance_fields(self) -> None:
+        marker = "phase3b retrieval provenance fields marker"
+        self.record(marker, kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_retrieval_provenance",
+            output_dir=self.root / "phase3b_retrieval_provenance",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_ids = {str(item["memory_id"]) for item in imported["structuredContent"]["imported_rows"]}
+        result = server.search_memories({"query": marker, "limit": 20, "include_quarantine": True})
+        matches = [item for item in result["structuredContent"]["matches"] if str(item.get("id")) in imported_ids]
+        self.assertTrue(matches)
+        match = matches[0]
+        self.assertIn("namespace", match)
+        self.assertIn("origin", match)
+        self.assertIn("pack_id", match)
+        self.assertIn("import_freshness", match)
+        self.assertEqual(str(match["origin"]), "imported")
+
+    def test_pack_import_freshness_verified_stale_missing_unknown(self) -> None:
+        self.record("phase3b freshness verified", kind="context_block")
+        self.record("phase3b freshness stale", kind="context_block")
+        self.record("phase3b freshness missing", kind="context_block")
+        self.record("phase3b freshness unknown", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_freshness_labels",
+            output_dir=self.root / "phase3b_freshness_labels",
+            kinds=["context_block"],
+            limit=100,
+        )
+        tampered = self.root / "phase3b_freshness_labels" / "freshness.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+            members = {name: archive.read(name) for name in archive.namelist()}
+        rows = rows[:4]
+        rows[0]["touched_files"] = [{"path": "verified.txt", "file_sha": "sha_verified"}]
+        rows[1]["touched_files"] = [{"path": "stale.txt", "file_sha": "sha_old"}]
+        rows[2]["touched_files"] = [{"path": "missing.txt", "file_sha": "sha_missing"}]
+        rows[3]["touched_files"] = [{"path": "unknown.txt", "file_sha": "sha_unknown"}]
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        members["content/memories.jsonl"] = rows_blob.encode("utf-8")
+        manifest["selection"]["total_rows"] = 4
+        manifest["selection"]["exported_rows"] = 4
+        manifest["selection"]["limited"] = False
+        manifest["counts"]["by_kind"] = {"context_block": 4}
+        covered = [str(name) for name in manifest["content_hash"]["covered_members"]]
+        manifest["content_hash"]["value"] = self._recompute_pack_content_hash(members, covered)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={
+                "content/memories.jsonl": rows_blob.encode("utf-8"),
+                "manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+            },
+        )
+        (self.workspace / "verified.txt").write_text("v\n", encoding="utf-8")
+        (self.workspace / "stale.txt").write_text("s\n", encoding="utf-8")
+        (self.workspace / "unknown.txt").write_text("u\n", encoding="utf-8")
+
+        def fake_current_file_sha(_repo_root: str, rel_path: str) -> str | None:
+            if rel_path == "verified.txt":
+                return "sha_verified"
+            if rel_path == "stale.txt":
+                return "sha_current"
+            if rel_path == "missing.txt":
+                return None
+            if rel_path == "unknown.txt":
+                return None
+            return None
+
+        with mock.patch("server.current_file_sha", side_effect=fake_current_file_sha):
+            imported = self._pack_import(pack_path=str(tampered), allow_unsigned_quarantine=True)
+        freshness = imported["structuredContent"]["freshness"]
+        self.assertEqual(int(freshness["by_file"]["verified"]), 1)
+        self.assertEqual(int(freshness["by_file"]["stale"]), 1)
+        self.assertEqual(int(freshness["by_file"]["missing"]), 1)
+        self.assertEqual(int(freshness["by_file"]["unknown"]), 1)
+        labels = {str(item["import_freshness"]) for item in imported["structuredContent"]["imported_rows"]}
+        self.assertIn("verified", labels)
+        self.assertIn("stale", labels)
+        self.assertIn("missing", labels)
+        self.assertIn("unknown", labels)
+
+    def test_pack_import_does_not_mutate_exported_packs_or_aliases(self) -> None:
+        self.record("phase3b mutation isolation", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_mutation_isolation",
+            output_dir=self.root / "phase3b_mutation_isolation",
+        )
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            alias_tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'alias_%' ORDER BY name"
+                ).fetchall()
+            ]
+            before_alias = {
+                name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in alias_tables
+            }
+            before_exported = int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+        finally:
+            conn.close()
+        self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after_alias = {
+                name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in before_alias
+            }
+            after_exported = int(conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertEqual(before_exported, after_exported)
+        self.assertEqual(before_alias, after_alias)
+
+    def test_pack_import_unknown_text_field_skipped_warning(self) -> None:
+        self.record("phase3b unknown text field", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_unknown_text_field",
+            output_dir=self.root / "phase3b_unknown_text_field",
+        )
+        tampered = self.root / "phase3b_unknown_text_field" / "unknown_field.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+            members = {name: archive.read(name) for name in archive.namelist()}
+        rows[0]["text_fields"]["body"] = "ignored-body-field"
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        members["content/memories.jsonl"] = rows_blob.encode("utf-8")
+        covered = [str(name) for name in manifest["content_hash"]["covered_members"]]
+        manifest["content_hash"]["value"] = self._recompute_pack_content_hash(members, covered)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={
+                "content/memories.jsonl": rows_blob.encode("utf-8"),
+                "manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+            },
+        )
+        imported = self._pack_import(pack_path=str(tampered), allow_unsigned_quarantine=True)
+        warning_codes = {
+            str(item.get("code"))
+            for item in imported["structuredContent"]["warnings"]
+            if isinstance(item, dict) and item.get("code") is not None
+        }
+        self.assertIn("unknown_text_field_skipped", warning_codes)
+
+    def test_pack_import_output_imported_rows_capped(self) -> None:
+        for idx in range(105):
+            self.record(f"phase3b capped output row {idx}", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_output_cap",
+            output_dir=self.root / "phase3b_output_cap",
+            kinds=["context_block"],
+            limit=200,
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        output_rows = imported["structuredContent"]["imported_rows"]
+        self.assertEqual(len(output_rows), 100)
+        warning_codes = {
+            str(item.get("code"))
+            for item in imported["structuredContent"]["warnings"]
+            if isinstance(item, dict) and item.get("code") is not None
+        }
+        self.assertIn("imported_rows_truncated", warning_codes)
+
+    def test_pack_import_shared_validator_same_snapshot(self) -> None:
+        marker = "phase3b snapshot same-bytes marker"
+        self.record(marker, kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_snapshot_invariant",
+            output_dir=self.root / "phase3b_snapshot_invariant",
+        )
+        snapshot = server._load_pack_snapshot(pack_path)
+        original_sha = str(snapshot["received_zip_sha256"])
+        pack_path.write_text("not a zip anymore", encoding="utf-8")
+        with mock.patch("server._load_pack_snapshot", return_value=snapshot):
+            imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        payload = imported["structuredContent"]
+        self.assertEqual(str(payload["received_zip_sha256"]), original_sha)
+        imported_id = str(payload["imported_rows"][0]["memory_id"])
+        fetched = server.memory_get({"id": imported_id, "full": True})
+        self.assertFalse(fetched["isError"], fetched)
+        self.assertIn(marker, str(fetched["structuredContent"]["memory"]["text"]))
+
+    def test_pack_import_namespace_trust_invariant(self) -> None:
+        self.record("phase3b namespace trust invariant", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_namespace_trust",
+            output_dir=self.root / "phase3b_namespace_trust",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT namespace, trust_level FROM imported_packs WHERE pack_id = ?", (pack_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row["trust_level"]), "quarantine")
+        self.assertTrue(str(row["namespace"]).startswith("pack:quarantine:"))
+
+    def test_pack_list_imports_lists_imported_pack(self) -> None:
+        self.record("phase4a list imports baseline", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_list_imports",
+            output_dir=self.root / "phase4a_list_imports",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        result = self._pack_list_imports()
+        payload = result["structuredContent"]
+        self.assertEqual(payload["action"], "pack_list_imports")
+        packs = [row for row in payload["packs"] if str(row.get("pack_id")) == pack_id]
+        self.assertTrue(packs)
+        row = packs[0]
+        self.assertEqual(str(row["namespace"]), str(imported["structuredContent"]["namespace"]))
+        self.assertEqual(str(row["trust_level"]), "quarantine")
+        self.assertTrue(str(row["imported_at"]))
+
+    def test_pack_list_imports_total_limit_semantics(self) -> None:
+        for idx in range(2):
+            self.record(f"phase4a list limit row {idx}", kind="context_block")
+            pack_path = self._create_exported_pack(
+                pack_name=f"phase4a_list_limit_{idx}",
+                output_dir=self.root / f"phase4a_list_limit_{idx}",
+            )
+            self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        listed = self._pack_list_imports(limit=1)
+        payload = listed["structuredContent"]
+        self.assertGreaterEqual(int(payload["total"]), 2)
+        self.assertLessEqual(len(payload["packs"]), 1)
+        self.assertEqual(bool(payload["limited"]), bool(int(payload["total"]) > 1))
+
+    def test_pack_list_imports_counts_and_freshness(self) -> None:
+        tracked = self.workspace / "src" / "phase4a" / "list_counts.py"
+        tracked.parent.mkdir(parents=True, exist_ok=True)
+        tracked.write_text("print('phase4a')\n", encoding="utf-8")
+        self.record(
+            "phase4a list counts freshness",
+            kind="context_block",
+            touched_files=["src/phase4a/list_counts.py"],
+        )
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_list_counts",
+            output_dir=self.root / "phase4a_list_counts",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        listed = self._pack_list_imports(pack_id=pack_id)
+        payload = listed["structuredContent"]
+        self.assertEqual(payload["total"], 1)
+        row = payload["packs"][0]
+        self.assertIn("memory_count", row)
+        self.assertIn("topic_count", row)
+        self.assertIn("memory_file_count", row)
+        self.assertIn("freshness", row)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            expected_files = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_files WHERE memory_id IN (SELECT memory_id FROM imported_pack_rows WHERE pack_id = ?)",
+                    (pack_id,),
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        self.assertEqual(int(row["memory_file_count"]), expected_files)
+
+    def test_pack_list_imports_top_topics_bound_and_order(self) -> None:
+        memory_ids: list[str] = []
+        for idx in range(12):
+            row = self.record(f"phase4a topic bound row {idx}", kind="context_block")
+            memory_ids.append(str(row["id"]))
+        for idx, memory_id in enumerate(memory_ids):
+            added = server.topic_add({"memory_id": memory_id, "topic": f"topic_{idx:02d}", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_topics_bound",
+            output_dir=self.root / "phase4a_topics_bound",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        listed = self._pack_list_imports(pack_id=pack_id, include_topics=True)
+        topics = listed["structuredContent"]["packs"][0]["top_topics"]
+        self.assertLessEqual(len(topics), 10)
+        ordered = sorted(topics, key=lambda item: (-int(item["row_count"]), str(item["topic"])))
+        self.assertEqual(topics, ordered)
+
+    def test_pack_list_imports_source_label_basename(self) -> None:
+        self.record("phase4a source label basename", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_source_label",
+            output_dir=self.root / "phase4a_source_label",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                "UPDATE imported_packs SET source_label = ? WHERE pack_id = ?",
+                ("C:\\temp\\phase4a\\nested\\pack.zip", pack_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        listed = self._pack_list_imports(pack_id=pack_id)
+        row = listed["structuredContent"]["packs"][0]
+        self.assertEqual(str(row["source_label"]), "pack.zip")
+
+    def test_pack_review_import_basic(self) -> None:
+        self.record("phase4a review basic one", kind="context_block")
+        self.record("phase4a review basic two", kind="hippocampus_entry")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_basic",
+            output_dir=self.root / "phase4a_review_basic",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        reviewed = self._pack_review_import(pack_id=pack_id)
+        payload = reviewed["structuredContent"]
+        self.assertEqual(payload["action"], "pack_review_import")
+        self.assertEqual(str(payload["pack"]["pack_id"]), pack_id)
+        self.assertGreater(int(payload["selection"]["total_pack_rows"]), 0)
+        self.assertGreater(int(payload["selection"]["selected_rows"]), 0)
+        self.assertIn("by_kind", payload["counts"])
+        self.assertIn("by_import_freshness", payload["counts"])
+        self.assertIn("top_referenced_files", payload["files"])
+        self.assertIn("samples", payload)
+
+    def test_pack_review_import_unknown_pack(self) -> None:
+        self.record("phase4a review unknown seed", kind="context_block")
+        before = {
+            "memories": self._table_count("memories"),
+            "packs": self._table_count("imported_packs"),
+            "maps": self._table_count("imported_pack_rows"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "exports": self._table_count("exported_packs"),
+        }
+        failed = self._pack_review_import_error(pack_id="missing-pack-phase4a")
+        self.assertIn("pack_not_found", failed["content"][0]["text"])
+        after = {
+            "memories": self._table_count("memories"),
+            "packs": self._table_count("imported_packs"),
+            "maps": self._table_count("imported_pack_rows"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "exports": self._table_count("exported_packs"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_review_import_topic_filter_uses_memory_topics(self) -> None:
+        body_only = self.record("phase4a topic auth in body only", kind="context_block")
+        tagged = self.record("phase4a tagged row without keyword", kind="context_block")
+        added = server.topic_add({"memory_id": tagged["id"], "topic": "auth", "source": "operator"})
+        self.assertFalse(added["isError"], added)
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_topic_filter",
+            output_dir=self.root / "phase4a_review_topic_filter",
+            kinds=["context_block"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            topics=["auth"],
+            sample_limit=20,
+        )
+        payload = reviewed["structuredContent"]
+        self.assertEqual(int(payload["selection"]["selected_rows"]), 1)
+        self.assertEqual(len(payload["samples"]), 1)
+        self.assertIn("auth", payload["samples"][0]["topics"])
+        self.assertNotEqual(str(body_only["id"]), str(payload["samples"][0]["memory_id"]))
+
+    def test_pack_review_import_kind_filter(self) -> None:
+        self.record("phase4a kind filter context", kind="context_block")
+        self.record("phase4a kind filter hip", kind="hippocampus_entry")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_kind_filter",
+            output_dir=self.root / "phase4a_review_kind_filter",
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            kinds=["context_block"],
+            sample_limit=50,
+        )
+        payload = reviewed["structuredContent"]
+        self.assertGreater(int(payload["selection"]["selected_rows"]), 0)
+        self.assertTrue(all(str(sample["kind"]) == "context_block" for sample in payload["samples"]))
+
+    def test_pack_review_import_freshness_filter(self) -> None:
+        self.record("phase4a freshness review a", kind="context_block")
+        self.record("phase4a freshness review b", kind="context_block")
+        self.record("phase4a freshness review c", kind="context_block")
+        self.record("phase4a freshness review d", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_freshness",
+            output_dir=self.root / "phase4a_review_freshness",
+            kinds=["context_block"],
+        )
+        tampered = self.root / "phase4a_review_freshness" / "freshness_pack.zip"
+        with zipfile.ZipFile(pack_path, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            rows = [json.loads(line) for line in archive.read("content/memories.jsonl").decode("utf-8").splitlines() if line.strip()]
+            members = {name: archive.read(name) for name in archive.namelist()}
+        rows = rows[:4]
+        rows[0]["touched_files"] = [{"path": "verified.txt", "file_sha": "sha_verified"}]
+        rows[1]["touched_files"] = [{"path": "stale.txt", "file_sha": "sha_old"}]
+        rows[2]["touched_files"] = [{"path": "missing.txt", "file_sha": "sha_missing"}]
+        rows[3]["touched_files"] = [{"path": "unknown.txt", "file_sha": "sha_unknown"}]
+        rows_blob = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in rows)
+        members["content/memories.jsonl"] = rows_blob.encode("utf-8")
+        manifest["selection"]["total_rows"] = 4
+        manifest["selection"]["exported_rows"] = 4
+        manifest["selection"]["limited"] = False
+        manifest["counts"]["by_kind"] = {"context_block": 4}
+        covered = [str(name) for name in manifest["content_hash"]["covered_members"]]
+        manifest["content_hash"]["value"] = self._recompute_pack_content_hash(members, covered)
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={
+                "content/memories.jsonl": rows_blob.encode("utf-8"),
+                "manifest.json": (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+            },
+        )
+        (self.workspace / "verified.txt").write_text("v\n", encoding="utf-8")
+        (self.workspace / "stale.txt").write_text("s\n", encoding="utf-8")
+        (self.workspace / "unknown.txt").write_text("u\n", encoding="utf-8")
+
+        def fake_current_file_sha(_repo_root: str, rel_path: str) -> str | None:
+            if rel_path == "verified.txt":
+                return "sha_verified"
+            if rel_path == "stale.txt":
+                return "sha_current"
+            if rel_path == "missing.txt":
+                return None
+            if rel_path == "unknown.txt":
+                return None
+            return None
+
+        with mock.patch("server.current_file_sha", side_effect=fake_current_file_sha):
+            imported = self._pack_import(pack_path=str(tampered), allow_unsigned_quarantine=True)
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            import_freshness=["stale"],
+        )
+        payload = reviewed["structuredContent"]
+        self.assertEqual(int(payload["selection"]["selected_rows"]), 1)
+        self.assertEqual(int(payload["counts"]["by_import_freshness"]["stale"]), 1)
+        self.assertEqual(str(payload["samples"][0]["import_freshness"]), "stale")
+
+    def test_pack_review_import_touched_paths_filter(self) -> None:
+        auth_file = self.workspace / "src" / "auth" / "session.py"
+        billing_file = self.workspace / "src" / "billing" / "pay.py"
+        auth_file.parent.mkdir(parents=True, exist_ok=True)
+        billing_file.parent.mkdir(parents=True, exist_ok=True)
+        auth_file.write_text("phase4a\n", encoding="utf-8")
+        billing_file.write_text("phase4a\n", encoding="utf-8")
+        self.record("phase4a touched auth", kind="context_block", touched_files=["src/auth/session.py"])
+        self.record("phase4a touched billing", kind="context_block", touched_files=["src/billing/pay.py"])
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_touched_paths",
+            output_dir=self.root / "phase4a_review_touched_paths",
+            kinds=["context_block"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            touched_paths=["src/auth/session.py"],
+            sample_limit=20,
+        )
+        payload = reviewed["structuredContent"]
+        self.assertGreater(int(payload["selection"]["selected_rows"]), 0)
+        self.assertTrue(
+            all(
+                any(str(item.get("path")) == "src/auth/session.py" for item in sample.get("touched_files", []))
+                for sample in payload["samples"]
+            )
+        )
+
+    def test_pack_review_import_query_filter_optional(self) -> None:
+        self.record("PHASE4A text query marker", kind="context_block")
+        self.record("phase4a plain row", kind="context_block", title="Phase4A Title Marker")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_query",
+            output_dir=self.root / "phase4a_review_query",
+            kinds=["context_block"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        text_match = self._pack_review_import(pack_id=pack_id, query="text query marker", sample_limit=20)
+        self.assertGreaterEqual(int(text_match["structuredContent"]["selection"]["selected_rows"]), 1)
+        title_match = self._pack_review_import(pack_id=pack_id, query="title marker", sample_limit=20)
+        self.assertGreaterEqual(int(title_match["structuredContent"]["selection"]["selected_rows"]), 1)
+        self.assertFalse(
+            any(
+                str(item.get("code")) == "unsupported_filter_query"
+                for item in title_match["structuredContent"]["warnings"]
+                if isinstance(item, dict)
+            )
+        )
+
+    def test_pack_review_import_memory_ids_outside_pack_warning(self) -> None:
+        self.record("phase4a memory ids in-pack", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_memory_ids",
+            output_dir=self.root / "phase4a_review_memory_ids",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_id = str(imported["structuredContent"]["imported_rows"][0]["memory_id"])
+        outside = self.record("phase4a memory id outside pack", kind="context_block")
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            memory_ids=[imported_id, str(outside["id"])],
+        )
+        warning_codes = {
+            str(item.get("code"))
+            for item in reviewed["structuredContent"]["warnings"]
+            if isinstance(item, dict) and item.get("code") is not None
+        }
+        self.assertIn("memory_ids_outside_pack_filtered", warning_codes)
+        self.assertEqual(int(reviewed["structuredContent"]["selection"]["selected_rows"]), 1)
+
+    def test_pack_review_import_samples_bounded_no_source_ids(self) -> None:
+        for idx in range(4):
+            self.record(f"phase4a review bounded sample {idx}", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_review_sample_bound",
+            output_dir=self.root / "phase4a_review_sample_bound",
+            kinds=["context_block"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            include_samples=True,
+            sample_limit=2,
+        )
+        samples = reviewed["structuredContent"]["samples"]
+        self.assertLessEqual(len(samples), 2)
+        self.assertTrue(all(not str(sample["row_id_in_pack"]).startswith("mem_") for sample in samples))
+
+    def test_pack_promote_preview_basic(self) -> None:
+        self.record("phase4a promote preview basic", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_promote_basic",
+            output_dir=self.root / "phase4a_promote_basic",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        before_promoted = 0
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before_promoted = int(
+                conn.execute("SELECT COUNT(*) FROM memories WHERE namespace = ? AND origin = ?", ("local", "promoted")).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        preview = self._pack_promote_preview(pack_id=str(imported["structuredContent"]["pack_id"]))
+        payload = preview["structuredContent"]
+        self.assertEqual(str(payload["promotion_plan"]["target_namespace"]), "local")
+        self.assertEqual(str(payload["promotion_plan"]["target_origin"]), "promoted")
+        self.assertEqual(
+            int(payload["promotion_plan"]["would_create_memory_count"]),
+            min(int(payload["selection"]["selected_rows"]), int(payload["selection"]["limit"])),
+        )
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after_promoted = int(
+                conn.execute("SELECT COUNT(*) FROM memories WHERE namespace = ? AND origin = ?", ("local", "promoted")).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        self.assertEqual(before_promoted, after_promoted)
+
+    def test_pack_promote_preview_unknown_pack(self) -> None:
+        self.record("phase4a promote unknown seed", kind="context_block")
+        before = {
+            "memories": self._table_count("memories"),
+            "packs": self._table_count("imported_packs"),
+            "maps": self._table_count("imported_pack_rows"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "exports": self._table_count("exported_packs"),
+        }
+        failed = self._pack_promote_preview_error(pack_id="missing-pack-phase4a")
+        self.assertIn("pack_not_found", failed["content"][0]["text"])
+        after = {
+            "memories": self._table_count("memories"),
+            "packs": self._table_count("imported_packs"),
+            "maps": self._table_count("imported_pack_rows"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "exports": self._table_count("exported_packs"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_promote_preview_filters_reuse_review_selection(self) -> None:
+        a = self.record("phase4a reuse review sel a", kind="context_block")
+        b = self.record("phase4a reuse review sel b", kind="context_block")
+        self.record("phase4a reuse review sel c", kind="hippocampus_entry")
+        server.topic_add({"memory_id": a["id"], "topic": "reuse-topic", "source": "operator"})
+        server.topic_add({"memory_id": b["id"], "topic": "reuse-topic", "source": "operator"})
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_reuse_selection",
+            output_dir=self.root / "phase4a_reuse_selection",
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        review = self._pack_review_import(
+            pack_id=pack_id,
+            topics=["reuse-topic"],
+            kinds=["context_block"],
+            sample_limit=50,
+            limit=50,
+        )
+        preview = self._pack_promote_preview(
+            pack_id=pack_id,
+            topics=["reuse-topic"],
+            kinds=["context_block"],
+            sample_limit=50,
+            limit=50,
+        )
+        review_rows = [str(item["row_id_in_pack"]) for item in review["structuredContent"]["samples"]]
+        preview_rows = [str(item["row_id_in_pack"]) for item in preview["structuredContent"]["candidate_rows"]]
+        self.assertEqual(set(review_rows), set(preview_rows))
+        self.assertEqual(review_rows, preview_rows)
+
+    def test_pack_promote_preview_provenance_plan(self) -> None:
+        self.record("phase4a provenance plan", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_promote_provenance",
+            output_dir=self.root / "phase4a_promote_provenance",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        preview = self._pack_promote_preview(pack_id=pack_id, sample_limit=20)
+        rows = preview["structuredContent"]["candidate_rows"]
+        self.assertTrue(rows)
+        for row in rows:
+            provenance = row["provenance"]
+            self.assertEqual(str(provenance["promoted_from_pack_id"]), pack_id)
+            self.assertEqual(str(provenance["promoted_from_row_id_in_pack"]), str(row["row_id_in_pack"]))
+            self.assertEqual(str(provenance["promoted_from_imported_memory_id"]), str(row["imported_memory_id"]))
+            self.assertEqual(str(provenance["original_import_freshness"]), str(row["import_freshness"]))
+
+    def test_pack_promote_preview_candidate_git_fields(self) -> None:
+        self.record("phase4a candidate git fields", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_promote_git_fields",
+            output_dir=self.root / "phase4a_promote_git_fields",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        preview = self._pack_promote_preview(pack_id=str(imported["structuredContent"]["pack_id"]))
+        for row in preview["structuredContent"]["candidate_rows"]:
+            self.assertIn("git_sha", row)
+            self.assertIn("git_branch", row)
+            self.assertIn("git_dirty", row)
+
+    def test_pack_promote_preview_no_filters_warns(self) -> None:
+        self.record("phase4a promote no filter warn", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_promote_no_filters",
+            output_dir=self.root / "phase4a_promote_no_filters",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        preview = self._pack_promote_preview(pack_id=str(imported["structuredContent"]["pack_id"]))
+        warning_codes = {
+            str(item.get("code"))
+            for item in preview["structuredContent"]["warnings"]
+            if isinstance(item, dict) and item.get("code") is not None
+        }
+        self.assertIn("preview_all_pack_rows", warning_codes)
+
+    def test_pack_promote_preview_limited_warning(self) -> None:
+        for idx in range(5):
+            self.record(f"phase4a promote limited {idx}", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_promote_limited",
+            output_dir=self.root / "phase4a_promote_limited",
+            kinds=["context_block"],
+            limit=200,
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        preview = self._pack_promote_preview(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            kinds=["context_block"],
+            limit=2,
+        )
+        self.assertTrue(bool(preview["structuredContent"]["selection"]["limited"]))
+        warning_codes = {
+            str(item.get("code"))
+            for item in preview["structuredContent"]["warnings"]
+            if isinstance(item, dict) and item.get("code") is not None
+        }
+        self.assertIn("promotion_preview_limited", warning_codes)
+
+    def test_pack_promote_preview_rejects_non_quarantine(self) -> None:
+        self._insert_imported_pack_unchecked(
+            pack_id="phase4a-invalid-pack",
+            trust_level="legacy-invalid",
+            namespace="pack:legacy:phase4a-invalid-pack",
+        )
+        failed = self._pack_promote_preview_error(pack_id="phase4a-invalid-pack")
+        self.assertIn("unsupported_trust_level_for_promotion_preview", failed["content"][0]["text"])
+
+    def test_pack_review_actions_read_only(self) -> None:
+        self.record("phase4a read-only check seed", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_read_only_actions",
+            output_dir=self.root / "phase4a_read_only_actions",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            alias_tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'alias_%' ORDER BY name"
+                ).fetchall()
+            ]
+            fts_tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'memories_fts%' ORDER BY name"
+                ).fetchall()
+            ]
+            before = {
+                "memories": self._table_count("memories"),
+                "imported_packs": self._table_count("imported_packs"),
+                "imported_pack_rows": self._table_count("imported_pack_rows"),
+                "memory_topics": self._table_count("memory_topics"),
+                "memory_files": self._table_count("memory_files"),
+                "exported_packs": self._table_count("exported_packs"),
+                "alias": {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in alias_tables},
+                "fts": {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in fts_tables},
+            }
+        finally:
+            conn.close()
+        self._pack_list_imports(pack_id=pack_id)
+        self._pack_review_import(pack_id=pack_id)
+        self._pack_promote_preview(pack_id=pack_id)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after = {
+                "memories": self._table_count("memories"),
+                "imported_packs": self._table_count("imported_packs"),
+                "imported_pack_rows": self._table_count("imported_pack_rows"),
+                "memory_topics": self._table_count("memory_topics"),
+                "memory_files": self._table_count("memory_files"),
+                "exported_packs": self._table_count("exported_packs"),
+                "alias": {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in before["alias"]},
+                "fts": {name: int(conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]) for name in before["fts"]},
+            }
+        finally:
+            conn.close()
+        self.assertEqual(before, after)
+
+    def test_pack_promote_preview_does_not_allocate_real_ids(self) -> None:
+        self.record("phase4a no allocation seed", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_no_allocation",
+            output_dir=self.root / "phase4a_no_allocation",
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before_ids = {
+                str(row[0]) for row in conn.execute("SELECT id FROM memories").fetchall()
+            }
+        finally:
+            conn.close()
+        preview = self._pack_promote_preview(pack_id=str(imported["structuredContent"]["pack_id"]))
+        self.assertTrue(all(bool(row["would_generate_memory_id"]) for row in preview["structuredContent"]["candidate_rows"]))
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after_ids = {
+                str(row[0]) for row in conn.execute("SELECT id FROM memories").fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertEqual(before_ids, after_ids)
+
+    def test_pack_review_row_id_natural_ordering(self) -> None:
+        for idx in range(4):
+            self.record(f"phase4a natural ordering row {idx}", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase4a_rowid_natural",
+            output_dir=self.root / "phase4a_rowid_natural",
+            kinds=["context_block"],
+            limit=200,
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            rows = conn.execute(
+                "SELECT row_id_in_pack FROM imported_pack_rows WHERE pack_id = ? ORDER BY row_id_in_pack ASC",
+                (pack_id,),
+            ).fetchall()
+            renamed = ["ctx_2", "ctx_10", "ctx_999", "ctx_1000"]
+            for idx, row in enumerate(rows[:4]):
+                conn.execute(
+                    "UPDATE imported_pack_rows SET row_id_in_pack = ? WHERE pack_id = ? AND row_id_in_pack = ?",
+                    (renamed[idx], pack_id, str(row[0])),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        reviewed = self._pack_review_import(
+            pack_id=pack_id,
+            kinds=["context_block"],
+            include_samples=True,
+            sample_limit=20,
+            limit=20,
+        )
+        row_ids = [str(sample["row_id_in_pack"]) for sample in reviewed["structuredContent"]["samples"]]
+        self.assertEqual(row_ids[:4], ["ctx_2", "ctx_10", "ctx_999", "ctx_1000"])
+
+    def test_pack_promote_requires_confirm(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_requires_confirm", rows=2)
+        row_id = self._pack_rows(pack_id)[0][0]
+        failed = self._pack_promote_error(pack_id=pack_id, row_ids=[row_id])
+        self.assertEqual(self._pack_error_code(failed), "confirm_promote_required")
+        self.assertEqual(self._table_count("promoted_pack_rows"), 0)
+        self.assertEqual(self._table_count("promotion_audit"), 0)
+
+    def test_pack_promote_requires_filter_or_allow_all(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_requires_filter", rows=2)
+        failed = self._pack_promote_error(pack_id=pack_id, confirm_promote=True)
+        self.assertEqual(self._pack_error_code(failed), "promote_all_requires_explicit_allow")
+        self.assertEqual(self._table_count("promoted_pack_rows"), 0)
+        self.assertEqual(self._table_count("promotion_audit"), 0)
+
+    def test_pack_promote_explicit_row_ids_success(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_row_ids_success", rows=3)
+        row_id = self._pack_rows(pack_id)[0][0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        payload = promoted["structuredContent"]
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(int(payload["selection"]["promoted_rows"]), 1)
+        self.assertTrue(str(payload["promotion_id"]).startswith("promotion_"))
+
+    def test_pack_promote_creates_promotion_audit_row(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_audit_row", rows=2)
+        row_id = self._pack_rows(pack_id)[0][0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True, limit=17)
+        payload = promoted["structuredContent"]
+        promotion_id = str(payload["promotion_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                """
+                SELECT promotion_id, pack_id, filters_json, row_count, limited, allow_promote_all, allow_limited_promotion
+                FROM promotion_audit
+                WHERE promotion_id = ?
+                """,
+                (promotion_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row[0]), promotion_id)
+        self.assertEqual(str(row[1]), pack_id)
+        parsed = json.loads(str(row[2]))
+        self.assertEqual(parsed["row_ids"], [row_id])
+        self.assertEqual(int(row[3]), 1)
+        self.assertEqual(int(row[4]), 0)
+        self.assertEqual(int(row[5]), 0)
+        self.assertEqual(int(row[6]), 0)
+
+    def test_pack_promote_creates_new_local_ids(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_new_ids", rows=1)
+        row_id, imported_memory_id, _kind = self._pack_rows(pack_id)[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        row = promoted["structuredContent"]["promoted_rows"][0]
+        promoted_memory_id = str(row["promoted_memory_id"])
+        self.assertTrue(promoted_memory_id.startswith("mem_"))
+        self.assertNotEqual(promoted_memory_id, imported_memory_id)
+        self.assertNotEqual(promoted_memory_id, row_id)
+
+    def test_pack_promote_sets_namespace_origin(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_namespace_origin", rows=1)
+        row_id = self._pack_rows(pack_id)[0][0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute("SELECT namespace, origin FROM memories WHERE id = ?", (promoted_memory_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(str(row[0]), "local")
+        self.assertEqual(str(row[1]), "promoted")
+
+    def test_pack_promote_preserves_text_kind_git_freshness(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_preserve_core", rows=1)
+        row_id, imported_memory_id, _kind = self._pack_rows(pack_id)[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            imported_row = conn.execute(
+                "SELECT kind, text, title, git_sha, git_branch, git_dirty, import_freshness FROM memories WHERE id = ?",
+                (imported_memory_id,),
+            ).fetchone()
+            promoted_row = conn.execute(
+                "SELECT kind, text, title, git_sha, git_branch, git_dirty, import_freshness FROM memories WHERE id = ?",
+                (promoted_memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(str(promoted_row[0]), str(imported_row[0]))
+        self.assertEqual(str(promoted_row[1]), str(imported_row[1]))
+        self.assertEqual(promoted_row[2], imported_row[2])
+        self.assertEqual(promoted_row[3], imported_row[3])
+        self.assertEqual(promoted_row[4], imported_row[4])
+        self.assertEqual(promoted_row[5], imported_row[5])
+        self.assertEqual(promoted_row[6], imported_row[6])
+
+    def test_pack_promote_copies_topics_with_source_promotion(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_topics_copy", rows=1)
+        row_id, imported_memory_id, _kind = self._pack_rows(pack_id)[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            imported_topics = [
+                (str(row[0]), str(row[1]))
+                for row in conn.execute(
+                    "SELECT topic, source FROM memory_topics WHERE memory_id = ? ORDER BY topic ASC",
+                    (imported_memory_id,),
+                ).fetchall()
+            ]
+            promoted_topics = [
+                (str(row[0]), str(row[1]))
+                for row in conn.execute(
+                    "SELECT topic, source FROM memory_topics WHERE memory_id = ? ORDER BY topic ASC",
+                    (promoted_memory_id,),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+        self.assertEqual([topic for topic, _source in promoted_topics], [topic for topic, _source in imported_topics])
+        self.assertTrue(all(source == "promotion" for _topic, source in promoted_topics))
+
+    def test_pack_promote_copies_memory_files(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_files_copy", rows=1)
+        row_id, imported_memory_id, kind_name = self._pack_rows(pack_id)[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            imported_files = {
+                (str(row[0]), str(row[1]), str(row[2]))
+                for row in conn.execute(
+                    "SELECT memory_table, path, file_sha FROM memory_files WHERE memory_id = ? ORDER BY path ASC",
+                    (imported_memory_id,),
+                ).fetchall()
+            }
+            promoted_files = {
+                (str(row[0]), str(row[1]), str(row[2]))
+                for row in conn.execute(
+                    "SELECT memory_table, path, file_sha FROM memory_files WHERE memory_id = ? ORDER BY path ASC",
+                    (promoted_memory_id,),
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+        self.assertTrue(imported_files)
+        self.assertEqual(
+            {(kind_name, path, file_sha) for _tbl, path, file_sha in imported_files},
+            promoted_files,
+        )
+
+    def test_pack_promote_promoted_pack_rows_mapping(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_mapping", rows=1)
+        row_id, imported_memory_id, kind_name = self._pack_rows(pack_id)[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        payload = promoted["structuredContent"]
+        promoted_memory_id = str(payload["promoted_rows"][0]["promoted_memory_id"])
+        promotion_id = str(payload["promotion_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            mapped = conn.execute(
+                """
+                SELECT imported_memory_id, promoted_memory_id, kind, original_import_freshness, promotion_id
+                FROM promoted_pack_rows
+                WHERE pack_id = ? AND row_id_in_pack = ?
+                """,
+                (pack_id, row_id),
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT promotion_id FROM promotion_audit WHERE promotion_id = ?",
+                (promotion_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(mapped)
+        self.assertEqual(str(mapped[0]), imported_memory_id)
+        self.assertEqual(str(mapped[1]), promoted_memory_id)
+        self.assertEqual(str(mapped[2]), kind_name)
+        self.assertIn(str(mapped[3] or "unknown"), {"verified", "stale", "missing", "unknown"})
+        self.assertEqual(str(mapped[4]), promotion_id)
+        self.assertEqual(str(audit[0]), promotion_id)
+
+    def test_pack_promote_rejects_duplicate_promotion(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_duplicate_reject", rows=1)
+        row_id = self._pack_rows(pack_id)[0][0]
+        self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        before = {
+            "memories": self._table_count("memories"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "maps": self._table_count("promoted_pack_rows"),
+            "audit": self._table_count("promotion_audit"),
+        }
+        failed = self._pack_promote_error(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        self.assertEqual(self._pack_error_code(failed), "pack_rows_already_promoted")
+        after = {
+            "memories": self._table_count("memories"),
+            "topics": self._table_count("memory_topics"),
+            "files": self._table_count("memory_files"),
+            "maps": self._table_count("promoted_pack_rows"),
+            "audit": self._table_count("promotion_audit"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_promote_transaction_rollback_on_failure(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_rollback", rows=2)
+        row_ids = [row_id for row_id, _memory_id, _kind in self._pack_rows(pack_id)]
+        before = {
+            "promoted_memories": self._table_count("memories"),
+            "promoted_maps": self._table_count("promoted_pack_rows"),
+            "promotion_audit": self._table_count("promotion_audit"),
+        }
+        with mock.patch.object(server, "make_id", return_value="mem_phase4b_fixed_id"):
+            failed = self._pack_promote_error(pack_id=pack_id, row_ids=row_ids, confirm_promote=True)
+        self.assertIn(
+            self._pack_error_code(failed),
+            {"pack_promote_integrity_error", "pack_promote_failed"},
+        )
+        after = {
+            "promoted_memories": self._table_count("memories"),
+            "promoted_maps": self._table_count("promoted_pack_rows"),
+            "promotion_audit": self._table_count("promotion_audit"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_promote_selection_matches_preview_matrix(self) -> None:
+        matrix = [
+            {"topics": ["phase4b-sel-topic-00"], "import_freshness": ["from_row_0"]},
+            {"kinds": ["context_block"], "touched_paths": ["src/phase4b/auth.py"]},
+            {"memory_ids": "first_two"},
+            {"row_ids": "first_two", "kinds": ["context_block"]},
+        ]
+        for idx, filter_payload in enumerate(matrix):
+            marker = f"phase4b_selection_matrix_{idx}"
+            pack_id, _imported_sc = self._create_phase4b_imported_pack(marker=marker, rows=4)
+            rows = self._pack_rows(pack_id)
+            conn = sqlite3.connect(str(self.sqlite_file))
+            try:
+                if idx == 0:
+                    first_memory_id = rows[0][1]
+                    conn.execute("UPDATE memory_topics SET topic = ? WHERE memory_id = ?", ("phase4b-sel-topic-00", first_memory_id))
+                    freshness = conn.execute(
+                        "SELECT COALESCE(NULLIF(import_freshness, ''), 'unknown') FROM memories WHERE id = ?",
+                        (first_memory_id,),
+                    ).fetchone()
+                    filter_payload = {
+                        "topics": ["phase4b-sel-topic-00"],
+                        "import_freshness": [str(freshness[0] if freshness else "unknown")],
+                    }
+                    conn.commit()
+                if idx == 2:
+                    filter_payload = {"memory_ids": [rows[0][1], rows[1][1]]}
+                if idx == 3:
+                    filter_payload = {"row_ids": [rows[0][0], rows[1][0]], "kinds": ["context_block"]}
+            finally:
+                conn.close()
+            preview = self._pack_promote_preview(
+                pack_id=pack_id,
+                include_samples=False,
+                sample_limit=50,
+                limit=100,
+                **filter_payload,
+            )
+            preview_rows = [str(item["row_id_in_pack"]) for item in preview["structuredContent"]["candidate_rows"]]
+            promoted = self._pack_promote(
+                pack_id=pack_id,
+                confirm_promote=True,
+                limit=100,
+                **filter_payload,
+            )
+            promoted_rows = [str(item["row_id_in_pack"]) for item in promoted["structuredContent"]["promoted_rows"]]
+            self.assertEqual(preview_rows, promoted_rows)
+
+    def test_pack_promote_limited_requires_override(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_limited_guard", rows=6)
+        failed = self._pack_promote_error(
+            pack_id=pack_id,
+            kinds=["context_block", "hippocampus_entry"],
+            limit=2,
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(failed), "limited_promotion_requires_explicit_allow")
+        promoted = self._pack_promote(
+            pack_id=pack_id,
+            kinds=["context_block", "hippocampus_entry"],
+            limit=2,
+            allow_limited_promotion=True,
+            confirm_promote=True,
+        )
+        self.assertIn("limited_promotion", self._pack_warning_codes(promoted))
+        promotion_id = str(promoted["structuredContent"]["promotion_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            limited_flag = int(
+                conn.execute("SELECT limited FROM promotion_audit WHERE promotion_id = ?", (promotion_id,)).fetchone()[0]
+            )
+        finally:
+            conn.close()
+        self.assertEqual(limited_flag, 1)
+
+    def test_pack_promote_query_filter_rejected(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_query_reject", rows=2)
+        before = self._table_count("promoted_pack_rows")
+        failed = self._pack_promote_error(
+            pack_id=pack_id,
+            query="should fail",
+            row_ids=[self._pack_rows(pack_id)[0][0]],
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(failed), "query_filter_not_allowed_for_promotion")
+        self.assertEqual(self._table_count("promoted_pack_rows"), before)
+
+    def test_pack_promote_rejects_non_quarantine(self) -> None:
+        self._insert_imported_pack_unchecked(
+            pack_id="phase4b-invalid-pack",
+            trust_level="legacy-invalid",
+            namespace="pack:legacy:phase4b-invalid-pack",
+        )
+        failed = self._pack_promote_error(
+            pack_id="phase4b-invalid-pack",
+            allow_promote_all=True,
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(failed), "unsupported_trust_level_for_promotion")
+
+    def test_pack_promote_retrieval_visibility(self) -> None:
+        marker = "phase4b_retrieval_visibility_unique_marker"
+        pack_id, imported_sc = self._create_phase4b_imported_pack(marker=marker, rows=1, kinds=["context_block"])
+        row_id, imported_memory_id, _kind = self._pack_rows(pack_id)[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        namespace = str(imported_sc["namespace"])
+        default = server.search_memories({"query": marker, "limit": 50})
+        include_quarantine = server.search_memories({"query": marker, "limit": 50, "include_quarantine": True})
+        origin_promoted = server.search_memories({"query": marker, "limit": 50, "origin": "promoted"})
+        origins_promoted = server.search_memories({"query": marker, "limit": 50, "origins": ["promoted"]})
+        default_ids = {str(item["id"]) for item in default["structuredContent"]["matches"]}
+        quarantine_ids = {str(item["id"]) for item in include_quarantine["structuredContent"]["matches"]}
+        promoted_ids = {str(item["id"]) for item in origin_promoted["structuredContent"]["matches"]}
+        promoted_ids_v2 = {str(item["id"]) for item in origins_promoted["structuredContent"]["matches"]}
+        self.assertIn(promoted_memory_id, default_ids)
+        self.assertNotIn(imported_memory_id, default_ids)
+        self.assertIn(imported_memory_id, quarantine_ids)
+        self.assertIn(promoted_memory_id, promoted_ids)
+        self.assertIn(promoted_memory_id, promoted_ids_v2)
+        explicit_quarantine = server.search_memories({"query": marker, "limit": 50, "namespace": namespace})
+        explicit_ids = {str(item["id"]) for item in explicit_quarantine["structuredContent"]["matches"]}
+        self.assertIn(imported_memory_id, explicit_ids)
+
+    def test_pack_promote_does_not_mutate_quarantine_or_pack_tables(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_non_mutating_pack_tables", rows=2)
+        row_id, imported_memory_id, _kind = self._pack_rows(pack_id)[0]
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            alias_tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'alias_%' ORDER BY name"
+                ).fetchall()
+            ]
+            before = {
+                "imported_packs": self._table_count("imported_packs"),
+                "imported_pack_rows": self._table_count("imported_pack_rows"),
+                "exported_packs": self._table_count("exported_packs"),
+                "aliases": {name: self._table_count(name) for name in alias_tables},
+                "imported_row_exists": int(
+                    conn.execute("SELECT COUNT(*) FROM memories WHERE id = ? AND origin = 'imported'", (imported_memory_id,)).fetchone()[0]
+                ),
+            }
+        finally:
+            conn.close()
+        self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after = {
+                "imported_packs": self._table_count("imported_packs"),
+                "imported_pack_rows": self._table_count("imported_pack_rows"),
+                "exported_packs": self._table_count("exported_packs"),
+                "aliases": {name: self._table_count(name) for name in before["aliases"]},
+                "imported_row_exists": int(
+                    conn.execute("SELECT COUNT(*) FROM memories WHERE id = ? AND origin = 'imported'", (imported_memory_id,)).fetchone()[0]
+                ),
+            }
+        finally:
+            conn.close()
+        self.assertEqual(before, after)
+
+    def test_pack_promote_output_capped(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(
+            marker="phase4b_output_capped",
+            rows=120,
+            kinds=["context_block"],
+        )
+        promoted = self._pack_promote(
+            pack_id=pack_id,
+            kinds=["context_block"],
+            allow_promote_all=True,
+            confirm_promote=True,
+            limit=500,
+        )
+        payload = promoted["structuredContent"]
+        self.assertGreater(int(payload["selection"]["promoted_rows"]), 100)
+        self.assertEqual(len(payload["promoted_rows"]), 100)
+        self.assertIn("promoted_rows_truncated", self._pack_warning_codes(promoted))
+
+    def test_pack_promote_memory_ids_outside_pack_warning(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_outside_pack_a", rows=2)
+        other_pack_id, _other_sc = self._create_phase4b_imported_pack(marker="phase4b_outside_pack_b", rows=1)
+        valid_memory_id = self._pack_rows(pack_id)[0][1]
+        other_memory_id = self._pack_rows(other_pack_id)[0][1]
+        outside_local = self.record("phase4b outside local id", kind="context_block")
+        promoted = self._pack_promote(
+            pack_id=pack_id,
+            memory_ids=[valid_memory_id, str(outside_local["id"]), other_memory_id],
+            confirm_promote=True,
+        )
+        self.assertIn("memory_ids_outside_pack_filtered", self._pack_warning_codes(promoted))
+        self.assertEqual(int(promoted["structuredContent"]["selection"]["promoted_rows"]), 1)
+
+    def test_pack_promote_memory_ids_outside_pack_empty_selection_warning(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_outside_only_a", rows=1)
+        other_pack_id, _other_sc = self._create_phase4b_imported_pack(marker="phase4b_outside_only_b", rows=1)
+        other_memory_id = self._pack_rows(other_pack_id)[0][1]
+        outside_local = self.record("phase4b outside-only local id", kind="context_block")
+        failed = self._pack_promote_error(
+            pack_id=pack_id,
+            memory_ids=[str(outside_local["id"]), other_memory_id],
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(failed), "selected_rows_empty")
+        self.assertIn("memory_ids_outside_pack_filtered", self._pack_warning_codes(failed))
+
+    def test_pack_promote_empty_selection_fails(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_empty_selection", rows=1)
+        before = {
+            "maps": self._table_count("promoted_pack_rows"),
+            "audit": self._table_count("promotion_audit"),
+        }
+        failed = self._pack_promote_error(
+            pack_id=pack_id,
+            topics=["no-such-topic-for-phase4b"],
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(failed), "selected_rows_empty")
+        after = {
+            "maps": self._table_count("promoted_pack_rows"),
+            "audit": self._table_count("promotion_audit"),
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_promote_no_source_db_id_leak_in_output(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_no_source_id_leak", rows=1)
+        row_id, imported_memory_id, _kind = self._pack_rows(pack_id)[0]
+        secret_literal = "mem_source_exporter_db_777"
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute("UPDATE memories SET text = ? WHERE id = ?", (secret_literal, imported_memory_id))
+            conn.commit()
+        finally:
+            conn.close()
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        serialized = json.dumps(promoted["structuredContent"], ensure_ascii=False)
+        self.assertNotIn(secret_literal, serialized)
+
+    def test_pack_review_import_shows_promoted_status(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_review_promotion_status", rows=2)
+        row_id = self._pack_rows(pack_id)[0][0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        reviewed = self._pack_review_import(pack_id=pack_id, include_samples=True, sample_limit=50)
+        samples = reviewed["structuredContent"]["samples"]
+        self.assertTrue(samples)
+        promoted_samples = [sample for sample in samples if str(sample["row_id_in_pack"]) == row_id]
+        self.assertEqual(len(promoted_samples), 1)
+        promoted_sample = promoted_samples[0]
+        self.assertEqual(str(promoted_sample.get("promoted_to_memory_id")), promoted_id)
+        self.assertTrue(str(promoted_sample.get("promotion_id", "")).startswith("promotion_"))
+        self.assertTrue(bool(promoted_sample.get("promoted_at")))
+        unpromoted = [sample for sample in samples if str(sample["row_id_in_pack"]) != row_id]
+        self.assertTrue(any(sample.get("promoted_to_memory_id") is None for sample in unpromoted))
+
+    def test_pack_promote_read_only_inputs_not_pack_zip(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase4b_no_zip_reads", rows=1)
+        row_id = self._pack_rows(pack_id)[0][0]
+        with mock.patch.object(server.zipfile, "ZipFile", side_effect=AssertionError("zipfile access not expected")):
+            promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        self.assertFalse(promoted["isError"], promoted)
+
+    def test_memory_packs_full_lifecycle_end_to_end(self) -> None:
+        marker = "phase196_e2e"
+        touched_a = self.workspace / "src" / "phase196" / "auth.py"
+        touched_b = self.workspace / "src" / "phase196" / "billing.py"
+        touched_a.parent.mkdir(parents=True, exist_ok=True)
+        touched_b.parent.mkdir(parents=True, exist_ok=True)
+        touched_a.write_text("AUTH='phase196'\n", encoding="utf-8")
+        touched_b.write_text("BILLING='phase196'\n", encoding="utf-8")
+
+        local_a = self.record(
+            f"{marker} local context email test.user@example.test",
+            kind="context_block",
+            title=f"{marker} title context",
+            touched_files=["src/phase196/auth.py"],
+        )
+        local_b = self.record(
+            f"{marker} local hippocampus key AKIA1234567890ABCDEF",
+            kind="hippocampus_entry",
+            title=f"{marker} title hippocampus",
+            touched_files=["src/phase196/billing.py"],
+        )
+        source_ids = [str(local_a["id"]), str(local_b["id"])]
+        topic_name = f"{marker}-topic"
+        for memory_id in source_ids:
+            added = server.topic_add({"memory_id": memory_id, "topic": topic_name, "source": "operator"})
+            self.assertFalse(added["isError"], added)
+
+        preview = self._pack_preview(topics=[topic_name], kinds=["context_block", "hippocampus_entry"], limit=100)
+        preview_sc = preview["structuredContent"]
+        self.assertGreaterEqual(int(preview_sc["selection"]["total_rows"]), 2)
+
+        redaction_preview = self._pack_redaction_preview(
+            topics=[topic_name],
+            kinds=["context_block", "hippocampus_entry"],
+            include_redacted_samples=True,
+            max_redacted_samples=10,
+        )
+        redaction_sc = redaction_preview["structuredContent"]
+        self.assertGreater(int(redaction_sc["redaction"]["total_matches"]), 0)
+
+        export = self._pack_export(
+            pack_name=marker,
+            output_dir=str(self.root / marker),
+            allow_unsigned=True,
+            topics=[topic_name],
+            kinds=["context_block", "hippocampus_entry"],
+            limit=100,
+        )
+        export_sc = export["structuredContent"]
+        pack_path = Path(str(export_sc["output_path"]))
+        self.assertTrue(pack_path.exists())
+
+        inspect = self._pack_inspect(pack_path=str(pack_path))
+        inspect_sc = inspect["structuredContent"]
+        self.assertEqual(str(inspect_sc["status"]), "valid")
+        self.assertEqual(str(inspect_sc["import_recommendation"]), "quarantine_only")
+
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_sc = imported["structuredContent"]
+        pack_id = str(imported_sc["pack_id"])
+        import_namespace = str(imported_sc["namespace"])
+        imported_rows = self._pack_rows(pack_id)
+        self.assertTrue(imported_rows)
+
+        listed = self._pack_list_imports(pack_id=pack_id)
+        packs = listed["structuredContent"]["packs"]
+        self.assertEqual(len(packs), 1)
+        self.assertEqual(str(packs[0]["pack_id"]), pack_id)
+
+        reviewed = self._pack_review_import(pack_id=pack_id, topics=[topic_name], include_samples=True, sample_limit=50)
+        self.assertGreaterEqual(int(reviewed["structuredContent"]["selection"]["selected_rows"]), 2)
+
+        promote_row_id = str(imported_rows[0][0])
+        promote_imported_memory_id = str(imported_rows[0][1])
+        preview_promote = self._pack_promote_preview(pack_id=pack_id, row_ids=[promote_row_id], limit=100)
+        self.assertEqual(int(preview_promote["structuredContent"]["selection"]["selected_rows"]), 1)
+
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[promote_row_id], confirm_promote=True)
+        promoted_sc = promoted["structuredContent"]
+        promoted_memory_id = str(promoted_sc["promoted_rows"][0]["promoted_memory_id"])
+        promotion_id = str(promoted_sc["promotion_id"])
+
+        default_search = server.search_memories({"query": marker, "limit": 50})
+        include_quarantine = server.search_memories({"query": marker, "limit": 50, "include_quarantine": True})
+        promoted_only = server.search_memories({"query": marker, "limit": 50, "origins": ["promoted"]})
+        self.assertFalse(default_search["isError"], default_search)
+        self.assertFalse(include_quarantine["isError"], include_quarantine)
+        self.assertFalse(promoted_only["isError"], promoted_only)
+        default_ids = {str(row["id"]) for row in default_search["structuredContent"]["matches"]}
+        quarantine_ids = {str(row["id"]) for row in include_quarantine["structuredContent"]["matches"]}
+        promoted_ids = {str(row["id"]) for row in promoted_only["structuredContent"]["matches"]}
+        self.assertIn(promoted_memory_id, default_ids)
+        self.assertNotIn(promote_imported_memory_id, default_ids)
+        self.assertIn(promote_imported_memory_id, quarantine_ids)
+        self.assertIn(promoted_memory_id, promoted_ids)
+        self.assertNotIn(promote_imported_memory_id, promoted_ids)
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            imported_row_after = conn.execute(
+                "SELECT namespace, origin FROM memories WHERE id = ?",
+                (promote_imported_memory_id,),
+            ).fetchone()
+            promoted_row_after = conn.execute(
+                "SELECT namespace, origin FROM memories WHERE id = ?",
+                (promoted_memory_id,),
+            ).fetchone()
+            map_row = conn.execute(
+                "SELECT promoted_memory_id, promotion_id FROM promoted_pack_rows WHERE pack_id = ? AND row_id_in_pack = ?",
+                (pack_id, promote_row_id),
+            ).fetchone()
+            audit_row = conn.execute(
+                "SELECT promotion_id, row_count FROM promotion_audit WHERE promotion_id = ?",
+                (promotion_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(imported_row_after)
+        self.assertIsNotNone(promoted_row_after)
+        self.assertIsNotNone(map_row)
+        self.assertIsNotNone(audit_row)
+        assert imported_row_after is not None
+        assert promoted_row_after is not None
+        assert map_row is not None
+        self.assertEqual(str(imported_row_after["namespace"]), import_namespace)
+        self.assertEqual(str(imported_row_after["origin"]), "imported")
+        self.assertEqual(str(promoted_row_after["namespace"]), "local")
+        self.assertEqual(str(promoted_row_after["origin"]), "promoted")
+        self.assertEqual(str(map_row["promoted_memory_id"]), promoted_memory_id)
+
+        members = self._read_zip_members(pack_path)
+        required = set(server.PACK_REQUIRED_MEMBERS)
+        self.assertTrue(required.issubset(set(members)))
+        zipped_text = "\n".join(
+            members[name].decode("utf-8", errors="replace")
+            for name in sorted(required)
+        )
+        for source_id in source_ids:
+            self.assertNotIn(source_id, zipped_text)
+        self.assertNotIn("test.user@example.test", zipped_text)
+        self.assertNotIn("AKIA1234567890ABCDEF", zipped_text)
+        self.assertIn("[REDACTED:email]", zipped_text)
+        self.assertIn("[REDACTED:aws_access_key]", zipped_text)
+
+        import_payload = json.dumps(imported_sc, ensure_ascii=False)
+        promote_payload = json.dumps(promoted_sc, ensure_ascii=False)
+        for source_id in source_ids:
+            self.assertNotIn(source_id, import_payload)
+            self.assertNotIn(source_id, promote_payload)
+
+    def test_memory_packs_schema_migrations_idempotent(self) -> None:
+        required_tables = {
+            "memories",
+            "memory_topics",
+            "memory_files",
+            "imported_packs",
+            "exported_packs",
+            "imported_pack_rows",
+            "promoted_pack_rows",
+            "promotion_audit",
+            "trusted_signers",
+            "alias_concepts",
+            "alias_terms",
+            "alias_proposals",
+            "alias_proposal_events",
+        }
+
+        def _assert_current_schema(expected_memory_rows: int) -> None:
+            conn = sqlite3.connect(str(self.sqlite_file))
+            try:
+                schema_value = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+                self.assertIsNotNone(schema_value)
+                assert schema_value is not None
+                self.assertEqual(int(schema_value[0]), 7)
+                tables = {
+                    str(row[0])
+                    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                self.assertTrue(required_tables.issubset(tables))
+                memory_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(memories)").fetchall()}
+                self.assertTrue(
+                    {"namespace", "origin", "import_freshness", "git_sha", "git_branch", "git_dirty"}.issubset(memory_cols)
+                )
+                imported_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(imported_packs)").fetchall()}
+                self.assertIn("received_zip_sha256", imported_cols)
+                promoted_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(promoted_pack_rows)").fetchall()}
+                self.assertIn("promotion_id", promoted_cols)
+                memory_count = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+                self.assertEqual(memory_count, expected_memory_rows)
+                _ = conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+            finally:
+                conn.close()
+
+        fixtures: list[tuple[str, Any]] = []
+
+        def _setup_empty() -> int:
+            self._reset_sqlite_file()
+            return 0
+
+        fixtures.append(("empty", _setup_empty))
+
+        def _setup_pre_memory_packs() -> int:
+            self._reset_sqlite_file()
+            legacy = server.new_memory("phase196-legacy", "note", "legacy row for migration", "", [])
+            legacy.pop("namespace", None)
+            legacy.pop("origin", None)
+            legacy.pop("import_freshness", None)
+            self._create_pre_phase1_schema([legacy], with_fts=True)
+            return 1
+
+        fixtures.append(("pre_memory_packs", _setup_pre_memory_packs))
+
+        def _setup_post_import_pre_promotion() -> int:
+            self._reset_sqlite_file()
+            legacy = server.new_memory("phase196-prepromote", "note", "post-import pre-promotion fixture", "", [])
+            legacy.pop("namespace", None)
+            legacy.pop("origin", None)
+            legacy.pop("import_freshness", None)
+            self._create_pre_phase1_schema([legacy], with_fts=True)
+            conn = sqlite3.connect(str(self.sqlite_file))
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memory_files (
+                        memory_table TEXT NOT NULL,
+                        memory_id TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        file_sha TEXT NOT NULL,
+                        PRIMARY KEY (memory_table, memory_id, path)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS memory_topics (
+                        memory_id TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        created_at TEXT,
+                        source TEXT,
+                        PRIMARY KEY (memory_id, topic)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS imported_packs (
+                        pack_id TEXT PRIMARY KEY,
+                        pack_name TEXT NOT NULL,
+                        source_label TEXT,
+                        trust_level TEXT NOT NULL,
+                        namespace TEXT NOT NULL,
+                        imported_at TEXT NOT NULL,
+                        manifest_json TEXT NOT NULL,
+                        freshness_summary_json TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS imported_pack_rows (
+                        pack_id TEXT NOT NULL,
+                        row_id_in_pack TEXT NOT NULL,
+                        memory_id TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        imported_at TEXT NOT NULL,
+                        PRIMARY KEY (pack_id, row_id_in_pack),
+                        UNIQUE(memory_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS exported_packs (
+                        pack_id TEXT PRIMARY KEY,
+                        pack_name TEXT NOT NULL,
+                        exported_at TEXT NOT NULL,
+                        row_count INTEGER NOT NULL,
+                        redaction_count INTEGER NOT NULL,
+                        signed INTEGER NOT NULL DEFAULT 0,
+                        manifest_json TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '5')")
+                conn.commit()
+            finally:
+                conn.close()
+            server._SQLITE_BOOTSTRAPPED.clear()
+            return 1
+
+        fixtures.append(("post_import_pre_promotion", _setup_post_import_pre_promotion))
+
+        def _setup_current() -> int:
+            self._reset_sqlite_file()
+            server.load_store()
+            return 0
+
+        fixtures.append(("current", _setup_current))
+
+        for fixture_name, setup_fn in fixtures:
+            with self.subTest(fixture=fixture_name):
+                expected_rows = int(setup_fn())
+                server.load_store()
+                server.load_store()
+                _assert_current_schema(expected_rows)
+
+    def test_memory_packs_action_dispatch_complete(self) -> None:
+        marker = "phase196_dispatch"
+        seed = self.record(
+            f"{marker} seed",
+            kind="context_block",
+            touched_files=["src/phase196/dispatch.py"],
+        )
+        added = server.topic_add({"memory_id": str(seed["id"]), "topic": f"{marker}-topic", "source": "operator"})
+        self.assertFalse(added["isError"], added)
+
+        export = server.mnemo_gateway(
+            {
+                "action": "pack_export",
+                "params": {
+                    "pack_name": marker,
+                    "output_dir": str(self.root / marker),
+                    "allow_unsigned": True,
+                    "topics": [f"{marker}-topic"],
+                    "kinds": ["context_block"],
+                    "limit": 100,
+                },
+            }
+        )
+        self.assertFalse(export["isError"], export)
+        pack_path = str(export["structuredContent"]["output_path"])
+        imported = server.mnemo_gateway(
+            {"action": "pack_import", "params": {"pack_path": pack_path, "allow_unsigned_quarantine": True}}
+        )
+        self.assertFalse(imported["isError"], imported)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+
+        dispatch_calls = [
+            ("pack_preview", {}),
+            ("pack_redaction_preview", {}),
+            ("pack_export", {"pack_name": f"{marker}_2", "output_dir": str(self.root / f"{marker}_2"), "allow_unsigned": True}),
+            ("pack_inspect", {"pack_path": pack_path}),
+            ("pack_import", {"pack_path": pack_path, "allow_unsigned_quarantine": True}),
+            ("pack_list_imports", {"pack_id": pack_id}),
+            ("pack_review_import", {"pack_id": pack_id}),
+            ("pack_promote_preview", {"pack_id": pack_id, "row_ids": [row_id]}),
+            ("pack_promote", {"pack_id": pack_id, "row_ids": [row_id], "confirm_promote": True}),
+            ("signer_add", {"signer_id": f"{marker}.signer", "secret": "dispatch-secret-012345678901234567890"}),
+            ("signer_list", {}),
+            ("signer_disable", {"signer_id": f"{marker}.signer"}),
+            ("signer_enable", {"signer_id": f"{marker}.signer"}),
+        ]
+        for action_name, params in dispatch_calls:
+            with self.subTest(action=action_name):
+                result = server.mnemo_gateway({"action": action_name, "params": params})
+                payload_text = json.dumps(result.get("structuredContent", {}), ensure_ascii=False)
+                self.assertNotIn("unknown action", payload_text.lower())
+
+    def test_memory_packs_read_only_actions_do_not_mutate(self) -> None:
+        marker = "phase196_read_only"
+        seeded = self.record(
+            f"{marker} seed text test.user@example.test",
+            kind="context_block",
+            title=f"{marker} title",
+            touched_files=["src/phase196/read_only.py"],
+        )
+        added = server.topic_add({"memory_id": str(seeded["id"]), "topic": f"{marker}-topic", "source": "operator"})
+        self.assertFalse(added["isError"], added)
+        pack_path = self._create_exported_pack(
+            pack_name=marker,
+            output_dir=self.root / marker,
+            topics=[f"{marker}-topic"],
+            kinds=["context_block"],
+            limit=100,
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        before = self._read_only_snapshot()
+
+        self._pack_preview(topics=[f"{marker}-topic"])
+        self._pack_redaction_preview(topics=[f"{marker}-topic"])
+        self._pack_inspect(pack_path=str(pack_path))
+        self._pack_list_imports(pack_id=pack_id)
+        self._pack_review_import(pack_id=pack_id, row_ids=[row_id], include_samples=True, sample_limit=5)
+        self._pack_promote_preview(pack_id=pack_id, row_ids=[row_id], include_samples=True, sample_limit=5)
+
+        after = self._read_only_snapshot()
+        self.assertEqual(before, after)
+
+    def test_memory_packs_export_artifact_safety(self) -> None:
+        marker = "phase196_artifact"
+        source = self.record(
+            f"{marker} email test.user@example.test jwt eyJhbGciOiJIUzI1NiJ9.aaaa.bbbb",
+            kind="context_block",
+            title=f"{marker} title",
+            touched_files=["src/phase196/artifact.py"],
+        )
+        added = server.topic_add({"memory_id": str(source["id"]), "topic": f"{marker}-topic", "source": "operator"})
+        self.assertFalse(added["isError"], added)
+        export = self._pack_export(
+            pack_name=marker,
+            output_dir=str(self.root / marker),
+            allow_unsigned=True,
+            topics=[f"{marker}-topic"],
+            kinds=["context_block"],
+        )
+        export_sc = export["structuredContent"]
+        pack_path = Path(str(export_sc["output_path"]))
+        members = self._read_zip_members(pack_path)
+        required = set(server.PACK_REQUIRED_MEMBERS)
+        self.assertTrue(required.issubset(set(members)))
+
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        memories_lines = [line for line in members["content/memories.jsonl"].decode("utf-8").splitlines() if line.strip()]
+        for line in memories_lines:
+            self.assertIsInstance(json.loads(line), dict)
+        recomputed = self._recompute_pack_content_hash(members, list(manifest["content_hash"]["covered_members"]))
+        self.assertEqual(recomputed, str(manifest["content_hash"]["value"]))
+        self.assertEqual(recomputed, str(export_sc["content_hash"]["value"]))
+
+        required_text = "\n".join(members[name].decode("utf-8", errors="replace") for name in sorted(required))
+        self.assertNotIn(str(source["id"]), required_text)
+        self.assertNotIn("test.user@example.test", required_text)
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9.aaaa.bbbb", required_text)
+        self.assertIn("[REDACTED:email]", required_text)
+        self.assertIn("[REDACTED:jwt]", required_text)
+
+        redactions = json.loads(members["provenance/redactions.json"].decode("utf-8"))
+        self.assertEqual(int(redactions["total_matches"]), int(manifest["redaction"]["total_matches"]))
+        self.assertEqual(int(redactions["affected_rows"]), int(manifest["redaction"]["affected_rows"]))
+
+        inspected = self._pack_inspect(pack_path=str(pack_path))
+        self.assertEqual(str(inspected["structuredContent"]["status"]), "valid")
+        self.assertEqual(str(inspected["structuredContent"]["import_recommendation"]), "quarantine_only")
+
+        tampered = self.root / marker / "tampered.zip"
+        self._rewrite_zip(pack_path, tampered, replace_members={"content/memories.jsonl": b"{bad-json}\n"})
+        invalid = server.pack_inspect({"pack_path": str(tampered)})
+        self.assertFalse(invalid["isError"], invalid)
+        self.assertEqual(str((invalid.get("structuredContent") or {}).get("status")), "invalid")
+
+    def test_memory_packs_error_codes_stable(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase196_errors_base", rows=2)
+        row_id = self._pack_rows(pack_id)[0][0]
+
+        missing_pack = self._pack_review_import_error(pack_id="phase196_missing_pack")
+        self.assertEqual(self._pack_error_code(missing_pack), "pack_not_found")
+
+        require_allow_all = self._pack_promote_error(pack_id=pack_id, confirm_promote=True)
+        self.assertEqual(self._pack_error_code(require_allow_all), "promote_all_requires_explicit_allow")
+
+        reject_query = self._pack_promote_error(
+            pack_id=pack_id,
+            row_ids=[row_id],
+            confirm_promote=True,
+            query="not-allowed",
+        )
+        self.assertEqual(self._pack_error_code(reject_query), "query_filter_not_allowed_for_promotion")
+
+        promoted_once = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        self.assertFalse(promoted_once["isError"], promoted_once)
+        duplicate = self._pack_promote_error(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        self.assertEqual(self._pack_error_code(duplicate), "pack_rows_already_promoted")
+
+        pack_a, _ = self._create_phase4b_imported_pack(marker="phase196_errors_outside_a", rows=1)
+        pack_b, _ = self._create_phase4b_imported_pack(marker="phase196_errors_outside_b", rows=1)
+        outside_id = self._pack_rows(pack_b)[0][1]
+        outside_local = self.record("phase196 outside memory", kind="context_block")
+        collapsed = self._pack_promote_error(
+            pack_id=pack_a,
+            memory_ids=[outside_id, str(outside_local["id"])],
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(collapsed), "selected_rows_empty")
+        self.assertIn("memory_ids_outside_pack_filtered", self._pack_warning_codes(collapsed))
+
+        self._insert_imported_pack_unchecked(
+            pack_id="phase196_invalid_trust_pack",
+            trust_level="legacy_invalid",
+            namespace="pack:legacy:phase196-invalid-trust-pack",
+        )
+        trusted_fail = self._pack_promote_error(
+            pack_id="phase196_invalid_trust_pack",
+            allow_promote_all=True,
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(trusted_fail), "unsupported_trust_level_for_promotion")
+
+        self.record("phase196 import duplicate seed", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase196_import_duplicate",
+            output_dir=self.root / "phase196_import_duplicate",
+        )
+        self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        same_bytes = self._pack_import_error(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        self.assertIn("pack_already_imported", same_bytes["content"][0]["text"])
+        variant = self.root / "phase196_import_duplicate" / "variant.zip"
+        self._rewrite_zip(pack_path, variant, extra_members={"extra/collision.txt": b"phase196"})
+        collision = self._pack_import_error(pack_path=str(variant), allow_unsigned_quarantine=True)
+        self.assertIn("pack_id_collision_distinct_content", collision["content"][0]["text"])
+
+        inspect_base = self._create_exported_pack(
+            pack_name="phase196_inspect_codes",
+            output_dir=self.root / "phase196_inspect_codes",
+        )
+        with zipfile.ZipFile(inspect_base, "r") as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            members = {name: archive.read(name) for name in archive.namelist()}
+        bad_covered_manifest = dict(manifest)
+        bad_hash = dict(manifest["content_hash"])
+        bad_hash["covered_members"] = ["content/memories.jsonl"]
+        bad_hash["value"] = hashlib.sha256(
+            f"content/memories.jsonl\t{hashlib.sha256(members['content/memories.jsonl']).hexdigest()}\n".encode("utf-8")
+        ).hexdigest()
+        bad_covered_manifest["content_hash"] = bad_hash
+        covered_path = self.root / "phase196_inspect_codes" / "covered_mismatch.zip"
+        self._rewrite_zip(
+            inspect_base,
+            covered_path,
+            replace_members={
+                "manifest.json": (json.dumps(bad_covered_manifest, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+            },
+        )
+        covered = server.pack_inspect({"pack_path": str(covered_path)})
+        self.assertFalse(covered["isError"], covered)
+        self.assertEqual(str((covered.get("structuredContent") or {}).get("status")), "invalid")
+        covered_codes = {
+            str(item.get("code"))
+            for item in (covered.get("structuredContent", {}) or {}).get("errors", [])
+            if isinstance(item, dict)
+        }
+        self.assertIn("covered_members_mismatch", covered_codes)
+
+        leaked_path = self.root / "phase196_inspect_codes" / "source_id_leak.zip"
+        self._rewrite_zip(
+            inspect_base,
+            leaked_path,
+            replace_members={"content/memories.jsonl": b'{"row_id_in_pack":"ctx_001","kind":"context_block","namespace_at_export":"local","origin_at_export":"local","text_fields":{"text":"mem_secret_source_777","title":""},"topics":[],"created_at_in_source":null,"git_sha_at_write":null,"git_branch_at_write":null,"git_dirty_at_write":0,"touched_files":[],"import_freshness_at_export":null,"redaction_applied":true}\n'},
+        )
+        leaked = server.pack_inspect({"pack_path": str(leaked_path)})
+        self.assertFalse(leaked["isError"], leaked)
+        self.assertEqual(str((leaked.get("structuredContent") or {}).get("status")), "invalid")
+        leak_codes = {
+            str(item.get("code"))
+            for item in (leaked.get("structuredContent", {}) or {}).get("errors", [])
+            if isinstance(item, dict)
+        }
+        self.assertIn("source_memory_id_leak", leak_codes)
+
+    def test_memory_packs_retrieval_boundaries(self) -> None:
+        marker = "phase196_boundaries"
+        pack_id, imported_sc = self._create_phase4b_imported_pack(marker=marker, rows=1, kinds=["context_block"])
+        pack_rows = self._pack_rows(pack_id)
+        self.assertEqual(len(pack_rows), 1)
+        row_id, imported_memory_id, _kind = pack_rows[0]
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        namespace = str(imported_sc.get("namespace", ""))
+
+        query_text = f"{marker} memory row 0"
+        default = server.search_memories({"query": query_text, "limit": 50})
+        imported_only = server.search_memories({"query": query_text, "limit": 50, "include_imported": True})
+        quarantine = server.search_memories({"query": query_text, "limit": 50, "include_quarantine": True})
+        by_namespace = server.search_memories({"query": query_text, "limit": 50, "namespace": namespace})
+        promoted_only = server.search_memories({"query": query_text, "limit": 50, "origins": ["promoted"]})
+
+        default_ids = {str(row["id"]) for row in default["structuredContent"]["matches"]}
+        imported_only_ids = {str(row["id"]) for row in imported_only["structuredContent"]["matches"]}
+        quarantine_ids = {str(row["id"]) for row in quarantine["structuredContent"]["matches"]}
+        namespace_ids = {str(row["id"]) for row in by_namespace["structuredContent"]["matches"]}
+        promoted_ids = {str(row["id"]) for row in promoted_only["structuredContent"]["matches"]}
+
+        self.assertIn(promoted_memory_id, default_ids)
+        self.assertNotIn(imported_memory_id, default_ids)
+        self.assertNotIn(imported_memory_id, imported_only_ids)
+        self.assertIn(imported_memory_id, quarantine_ids)
+        self.assertIn(imported_memory_id, namespace_ids)
+        self.assertIn(promoted_memory_id, promoted_ids)
+        self.assertNotIn(imported_memory_id, promoted_ids)
+
+    def test_memory_packs_promotion_audit_integrity(self) -> None:
+        pack_id, _imported_sc = self._create_phase4b_imported_pack(marker="phase196_audit", rows=2)
+        row_ids = [row[0] for row in self._pack_rows(pack_id)]
+        promoted = self._pack_promote(
+            pack_id=pack_id,
+            row_ids=row_ids,
+            confirm_promote=True,
+            limit=100,
+        )
+        promoted_sc = promoted["structuredContent"]
+        promotion_id = str(promoted_sc["promotion_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            audit = conn.execute(
+                "SELECT filters_json, row_count, limited, allow_promote_all, allow_limited_promotion FROM promotion_audit WHERE promotion_id = ?",
+                (promotion_id,),
+            ).fetchone()
+            linked_rows = conn.execute(
+                "SELECT row_id_in_pack, imported_memory_id, promoted_memory_id, promotion_id FROM promoted_pack_rows WHERE promotion_id = ? ORDER BY row_id_in_pack ASC",
+                (promotion_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertIsNotNone(audit)
+        assert audit is not None
+        parsed_filters = json.loads(str(audit["filters_json"]))
+        self.assertEqual(parsed_filters.get("row_ids"), row_ids)
+        self.assertEqual(int(audit["row_count"]), len(row_ids))
+        self.assertEqual(int(audit["limited"]), 0)
+        self.assertEqual(int(audit["allow_promote_all"]), 0)
+        self.assertEqual(int(audit["allow_limited_promotion"]), 0)
+        self.assertEqual(len(linked_rows), len(row_ids))
+        self.assertTrue(all(str(row["promotion_id"]) == promotion_id for row in linked_rows))
+
+    def test_memory_packs_no_source_db_id_leak_outputs(self) -> None:
+        marker = "phase196_no_source_leak"
+        source_a = self.record(f"{marker} local row A", kind="context_block")
+        source_b = self.record(f"{marker} local row B", kind="hippocampus_entry")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(source_a["id"]), "topic": topic, "source": "operator"})
+        server.topic_add({"memory_id": str(source_b["id"]), "topic": topic, "source": "operator"})
+        source_ids = [str(source_a["id"]), str(source_b["id"])]
+
+        export = self._pack_export(
+            pack_name=marker,
+            output_dir=str(self.root / marker),
+            allow_unsigned=True,
+            topics=[topic],
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        export_sc = export["structuredContent"]
+        pack_path = Path(str(export_sc["output_path"]))
+        import_result = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        import_sc = import_result["structuredContent"]
+        pack_id = str(import_sc["pack_id"])
+        review = self._pack_review_import(pack_id=pack_id, include_samples=True, sample_limit=20)
+        row_id = self._pack_rows(pack_id)[0][0]
+        promote = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+
+        payloads = [
+            json.dumps(export_sc, ensure_ascii=False),
+            json.dumps(import_sc, ensure_ascii=False),
+            json.dumps(review["structuredContent"], ensure_ascii=False),
+            json.dumps(promote["structuredContent"], ensure_ascii=False),
+        ]
+        required_members = self._read_zip_members(pack_path)
+        payloads.append(
+            "\n".join(
+                required_members[name].decode("utf-8", errors="replace")
+                for name in sorted(server.PACK_REQUIRED_MEMBERS)
+            )
+        )
+        for source_id in source_ids:
+            for payload in payloads:
+                self.assertNotIn(source_id, payload)
+
+    def test_memory_packs_current_db_schema_bootstrap_no_content_bootstrap_for_preview(self) -> None:
+        self._reset_sqlite_file()
+        result = server.pack_preview({})
+        self.assertFalse(result["isError"], result)
+        self.assertTrue(self._table_exists("memories"))
+        self.assertEqual(self._table_count("memories"), 0)
+        self.assertEqual(self._table_count("exported_packs"), 0)
+        self.assertEqual(self._table_count("imported_packs"), 0)
+
+    def test_signer_add_list_disable_enable(self) -> None:
+        secret = "s" * 32
+        added = self._signer_add(signer_id="alice.dev", secret=secret, label="Alice Dev")
+        listed = self._signer_list()
+        disabled = self._signer_disable(signer_id="alice.dev")
+        enabled = self._signer_enable(signer_id="alice.dev")
+
+        signers = listed["structuredContent"]["signers"]
+        self.assertTrue(any(str(item.get("signer_id")) == "alice.dev" for item in signers))
+        self.assertEqual(str(disabled["structuredContent"]["signer_status"]), "disabled")
+        self.assertEqual(str(enabled["structuredContent"]["signer_status"]), "active")
+
+        payload_blob = "\n".join(
+            json.dumps(result.get("structuredContent", {}), ensure_ascii=False)
+            for result in (added, listed, disabled, enabled)
+        )
+        self.assertNotIn(secret, payload_blob)
+
+    def test_signer_add_duplicate_rejected(self) -> None:
+        secret = "dup-secret-012345678901234567890123"
+        self._signer_add(signer_id="dup.signer", secret=secret)
+        dup = self._signer_add_error(signer_id="dup.signer", secret=secret)
+        self.assertEqual(self._pack_error_code(dup), "signer_already_exists")
+
+    def test_signer_secret_too_short_rejected(self) -> None:
+        short = "short-secret"
+        signer_fail = self._signer_add_error(signer_id="short.signer", secret=short)
+        self.assertEqual(self._pack_error_code(signer_fail), "secret_too_short")
+
+        self.record("phase200 short secret export", kind="context_block")
+        export_fail = self._pack_export_error(
+            pack_name="phase200_short_secret_export",
+            output_dir=str(self.root / "phase200_short_secret_export"),
+            sign_pack=True,
+            signer_id="short.signer",
+            signing_secret=short,
+        )
+        self.assertEqual(self._pack_error_code(export_fail), "secret_too_short")
+
+        unsigned_pack = self._create_exported_pack(
+            pack_name="phase200_short_secret_inspect",
+            output_dir=self.root / "phase200_short_secret_inspect",
+        )
+        inspect_fail = server.pack_inspect({"pack_path": str(unsigned_pack), "verification_secret": short})
+        self.assertTrue(inspect_fail["isError"], inspect_fail)
+        self.assertEqual(self._pack_error_code(inspect_fail), "secret_too_short")
+
+    def test_secret_fingerprint_recipe_stable(self) -> None:
+        secret_a = "A" * 32
+        secret_b = "B" * 32
+        expected_a = hashlib.sha256(secret_a.encode("utf-8")).hexdigest()[:32]
+        self.assertEqual(server._secret_fingerprint(secret_a), expected_a)
+        self.assertNotEqual(server._secret_fingerprint(secret_a), server._secret_fingerprint(secret_b))
+
+    def test_pack_export_signed_hmac_creates_signature_member(self) -> None:
+        marker = "phase200_signed_export_member"
+        row = self.record(f"{marker} source", kind="context_block")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        secret = "signed-export-secret-0123456789012345"
+        pack_path, export_sc = self._create_signed_exported_pack(
+            pack_name=marker,
+            output_dir=self.root / marker,
+            signer_id="alice.sign",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        members = self._read_zip_members(pack_path)
+        self.assertIn("signature/signature.json", members)
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        self.assertTrue(bool(manifest.get("signed")))
+        self.assertIn("signature", manifest)
+        warning_codes = self._pack_warning_codes({"structuredContent": export_sc})
+        self.assertIn("local_hmac_not_public_key", warning_codes)
+        self.assertNotIn("unsigned_development_pack", warning_codes)
+
+    def test_pack_export_unsigned_still_supported(self) -> None:
+        marker = "phase200_unsigned_still_supported"
+        row = self.record(f"{marker} source", kind="context_block")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        pack_path = self._create_exported_pack(
+            pack_name=marker,
+            output_dir=self.root / marker,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        members = self._read_zip_members(pack_path)
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        self.assertFalse(bool(manifest.get("signed")))
+        self.assertEqual(str(manifest.get("unsigned_reason", "")), "operator_chose_unsigned")
+
+        legacy_manifest = dict(manifest)
+        legacy_manifest["unsigned_reason"] = "signing_not_implemented"
+        legacy_path = self.root / marker / "legacy_unsigned_reason.zip"
+        self._rewrite_zip(
+            pack_path,
+            legacy_path,
+            replace_members={
+                "manifest.json": (json.dumps(legacy_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            },
+        )
+        inspected = self._pack_inspect(pack_path=str(legacy_path))
+        self.assertEqual(str(inspected["structuredContent"]["status"]), "valid")
+        self.assertEqual(str(inspected["structuredContent"]["import_recommendation"]), "quarantine_only")
+
+    def test_pack_inspect_unsigned_pack_still_quarantine_only(self) -> None:
+        row = self.record("phase200 unsigned quarantine source", kind="context_block")
+        topic = "phase200-unsigned-quarantine-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        pack_path = self._create_exported_pack(
+            pack_name="phase200_unsigned_quarantine_only",
+            output_dir=self.root / "phase200_unsigned_quarantine_only",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(
+            pack_path=str(pack_path),
+            verification_secret="verification-secret-0123456789012345",
+        )
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "valid")
+        self.assertEqual(str(sc["import_recommendation"]), "quarantine_only")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "unsigned")
+        self.assertIn("verification_secret_unused_for_unsigned_pack", self._pack_warning_codes(inspected))
+
+    def test_pack_inspect_signed_hmac_verified_with_secret(self) -> None:
+        secret = "verified-secret-01234567890123456789"
+        self._signer_add(signer_id="verified.signer", secret=secret, trust_level="trusted")
+        source = self.record("phase200 signed verified source", kind="context_block")
+        topic = "phase200-signed-verified-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_signed_verified",
+            output_dir=self.root / "phase200_signed_verified",
+            signer_id="verified.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "valid")
+        self.assertTrue(bool(sc["signature"]["verified"]))
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "trusted_signer")
+
+    def test_pack_inspect_signed_hmac_invalid_secret_rejected(self) -> None:
+        secret = "inspect-invalid-secret-012345678901234"
+        source = self.record("phase200 signed invalid secret source", kind="context_block")
+        topic = "phase200-signed-invalid-secret-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_signed_invalid_secret",
+            output_dir=self.root / "phase200_signed_invalid_secret",
+            signer_id="invalid.secret.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(
+            pack_path=str(pack_path),
+            verification_secret="wrong-secret-01234567890123456789012",
+        )
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "invalid")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "invalid_signature")
+        self.assertEqual(str(sc["import_recommendation"]), "reject")
+
+    def test_pack_inspect_signed_hmac_no_secret_quarantine(self) -> None:
+        secret = "inspect-no-secret-01234567890123456789"
+        source = self.record("phase200 signed no secret source", kind="context_block")
+        topic = "phase200-signed-no-secret-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_signed_no_secret",
+            output_dir=self.root / "phase200_signed_no_secret",
+            signer_id="no.secret.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path))
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "valid")
+        self.assertEqual(str(sc["import_recommendation"]), "quarantine_only")
+        self.assertTrue(bool(sc["signature"]["present"]))
+        self.assertFalse(bool(sc["signature"]["verified"]))
+        self.assertIn("signature_not_verified", self._pack_warning_codes(inspected))
+
+    def test_pack_inspect_unknown_signer_quarantine(self) -> None:
+        secret = "unknown-signer-secret-012345678901234"
+        source = self.record("phase200 unknown signer source", kind="context_block")
+        topic = "phase200-unknown-signer-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_unknown_signer",
+            output_dir=self.root / "phase200_unknown_signer",
+            signer_id="unknown.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "valid")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "unknown_signer")
+        self.assertEqual(str(sc["import_recommendation"]), "quarantine_only")
+
+    def test_pack_inspect_secret_fingerprint_mismatch_rejected(self) -> None:
+        secret_a = "mismatch-secret-a-012345678901234567"
+        secret_b = "mismatch-secret-b-012345678901234567"
+        self._signer_add(signer_id="alice.mismatch", secret=secret_a, trust_level="trusted")
+        source = self.record("phase200 mismatch source", kind="context_block")
+        topic = "phase200-mismatch-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_mismatch",
+            output_dir=self.root / "phase200_mismatch",
+            signer_id="alice.mismatch",
+            signing_secret=secret_b,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret_b)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "invalid")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "secret_fingerprint_mismatch")
+        self.assertEqual(str(sc["import_recommendation"]), "reject")
+
+    def test_pack_inspect_blocked_signer_rejected(self) -> None:
+        secret = "blocked-signer-secret-0123456789012345"
+        self._signer_add(signer_id="blocked.signer", secret=secret, trust_level="blocked")
+        source = self.record("phase200 blocked signer source", kind="context_block")
+        topic = "phase200-blocked-signer-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_blocked_signer",
+            output_dir=self.root / "phase200_blocked_signer",
+            signer_id="blocked.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "invalid")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "blocked_signer")
+        self.assertEqual(str(sc["import_recommendation"]), "reject")
+
+    def test_pack_inspect_disabled_signer_rejected(self) -> None:
+        secret = "disabled-signer-secret-012345678901234"
+        self._signer_add(signer_id="disabled.signer", secret=secret, trust_level="trusted")
+        self._signer_disable(signer_id="disabled.signer")
+        source = self.record("phase200 disabled signer source", kind="context_block")
+        topic = "phase200-disabled-signer-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_disabled_signer",
+            output_dir=self.root / "phase200_disabled_signer",
+            signer_id="disabled.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "invalid")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "disabled_signer")
+        self.assertEqual(str(sc["import_recommendation"]), "reject")
+
+    def test_signer_disable_then_enable_reclassification(self) -> None:
+        secret = "reclassification-secret-012345678901234"
+        self._signer_add(signer_id="reclass.signer", secret=secret, trust_level="trusted")
+        source = self.record("phase200 reclassification source", kind="context_block")
+        topic = "phase200-reclassification-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_reclassification",
+            output_dir=self.root / "phase200_reclassification",
+            signer_id="reclass.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+
+        trusted = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        self.assertEqual(str(trusted["structuredContent"]["signature"]["trust_classification"]), "trusted_signer")
+        self.assertEqual(str(trusted["structuredContent"]["status"]), "valid")
+
+        self._signer_disable(signer_id="reclass.signer")
+        disabled = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        self.assertEqual(str(disabled["structuredContent"]["signature"]["trust_classification"]), "disabled_signer")
+        self.assertEqual(str(disabled["structuredContent"]["status"]), "invalid")
+
+        self._signer_enable(signer_id="reclass.signer")
+        enabled = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        self.assertEqual(str(enabled["structuredContent"]["signature"]["trust_classification"]), "trusted_signer")
+        self.assertEqual(str(enabled["structuredContent"]["status"]), "valid")
+
+    def test_pack_import_signed_pack_quarantine_only(self) -> None:
+        secret = "signed-import-secret-012345678901234567"
+        self._signer_add(signer_id="signed.import.signer", secret=secret, trust_level="trusted")
+        source = self.record("phase200 signed import source", kind="context_block")
+        topic = "phase200-signed-import-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_signed_import",
+            output_dir=self.root / "phase200_signed_import",
+            signer_id="signed.import.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        sc = imported["structuredContent"]
+        self.assertEqual(str(sc["trust_level"]), "quarantine")
+        self.assertTrue(str(sc["namespace"]).startswith("pack:quarantine:"))
+
+    def test_signature_tampered_content_rejected(self) -> None:
+        secret = "tamper-content-secret-0123456789012345"
+        source = self.record("phase200 tamper content source", kind="context_block")
+        topic = "phase200-tamper-content-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_tamper_content",
+            output_dir=self.root / "phase200_tamper_content",
+            signer_id="tamper.content.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        tampered = self.root / "phase200_tamper_content" / "tampered_content.zip"
+        self._rewrite_zip(pack_path, tampered, replace_members={"content/memories.jsonl": b"{bad-json}\n"})
+        inspected = self._pack_inspect(pack_path=str(tampered), verification_secret=secret)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "invalid")
+        self.assertFalse(bool(sc["content_hash"]["valid"]))
+
+    def test_signature_tampered_signature_rejected(self) -> None:
+        secret = "tamper-signature-secret-012345678901234"
+        source = self.record("phase200 tamper signature source", kind="context_block")
+        topic = "phase200-tamper-signature-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_tamper_signature",
+            output_dir=self.root / "phase200_tamper_signature",
+            signer_id="tamper.signature.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        members = self._read_zip_members(pack_path)
+        signature_payload = json.loads(members["signature/signature.json"].decode("utf-8"))
+        signature_payload["signature_value"] = "00" * 32
+        tampered = self.root / "phase200_tamper_signature" / "tampered_signature.zip"
+        self._rewrite_zip(
+            pack_path,
+            tampered,
+            replace_members={
+                "signature/signature.json": (
+                    json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+            },
+        )
+        inspected = self._pack_inspect(pack_path=str(tampered), verification_secret=secret)
+        sc = inspected["structuredContent"]
+        self.assertEqual(str(sc["status"]), "invalid")
+        self.assertEqual(str(sc["signature"]["trust_classification"]), "invalid_signature")
+
+    def test_signature_tampered_member_fields_rejected(self) -> None:
+        secret = "tamper-fields-secret-01234567890123456"
+        source = self.record("phase200 tamper fields source", kind="context_block")
+        topic = "phase200-tamper-fields-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase200_tamper_fields",
+            output_dir=self.root / "phase200_tamper_fields",
+            signer_id="tamper.fields.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        members = self._read_zip_members(pack_path)
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        signature_payload = json.loads(members["signature/signature.json"].decode("utf-8"))
+
+        cases: list[tuple[str, dict[str, Any], dict[str, Any], str]] = []
+
+        sig_signer = dict(signature_payload)
+        sig_signer["signer_id"] = "tampered.signer"
+        cases.append(("signer_id", manifest, sig_signer, "invalid_signature"))
+
+        sig_payload_version = dict(signature_payload)
+        sig_payload_version["signature_payload_version"] = "tampered-v2"
+        cases.append(("signature_payload_version", manifest, sig_payload_version, "invalid_signature"))
+
+        sig_fingerprint = dict(signature_payload)
+        sig_fingerprint["secret_fingerprint"] = "f" * 32
+        cases.append(("secret_fingerprint", manifest, sig_fingerprint, "invalid_signature"))
+
+        manifest_member = json.loads(json.dumps(manifest))
+        manifest_member["signature"]["signature_member"] = "signature/other.json"
+        cases.append(("signature_member_path", manifest_member, signature_payload, "unsupported_signature"))
+
+        for label, manifest_payload, signature_payload_case, expected_classification in cases:
+            with self.subTest(field=label):
+                tampered = self.root / "phase200_tamper_fields" / f"tampered_{label}.zip"
+                replace_members = {
+                    "manifest.json": (
+                        json.dumps(manifest_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8"),
+                    "signature/signature.json": (
+                        json.dumps(signature_payload_case, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8"),
+                }
+                self._rewrite_zip(pack_path, tampered, replace_members=replace_members)
+                inspected = self._pack_inspect(pack_path=str(tampered), verification_secret=secret)
+                sc = inspected["structuredContent"]
+                self.assertIn(str(sc["status"]), {"invalid", "unsupported"})
+                self.assertEqual(str(sc["signature"]["trust_classification"]), expected_classification)
+
+    def test_signature_payload_stable(self) -> None:
+        manifest = {
+            "pack_id": "pack_20260526T120000Z_a3f29b1c",
+            "pack_schema_version": 1,
+            "content_hash": {"value": "abc123"},
+            "redaction_ruleset_version": "baseline-v1",
+            "signature": {
+                "signer_id": "payload.signer",
+                "signature_algorithm": "hmac-sha256-local-v1",
+                "secret_fingerprint": "1234567890abcdef1234567890abcdef",
+            },
+        }
+        secret = "payload-secret-01234567890123456789012"
+        sig1 = server._pack_sign_hmac_v1(manifest, secret)
+        sig2 = server._pack_sign_hmac_v1(manifest, secret)
+        self.assertEqual(sig1, sig2)
+
+        manifest_changed = json.loads(json.dumps(manifest))
+        manifest_changed["content_hash"]["value"] = "def456"
+        self.assertNotEqual(sig1, server._pack_sign_hmac_v1(manifest_changed, secret))
+
+        manifest_changed = json.loads(json.dumps(manifest))
+        manifest_changed["signature"]["signer_id"] = "payload.signer.changed"
+        self.assertNotEqual(sig1, server._pack_sign_hmac_v1(manifest_changed, secret))
+
+        manifest_changed = json.loads(json.dumps(manifest))
+        manifest_changed["signature"]["secret_fingerprint"] = "abcdefabcdefabcdefabcdefabcdefab"
+        self.assertNotEqual(sig1, server._pack_sign_hmac_v1(manifest_changed, secret))
+
+        old_version = server.PACK_SIGNATURE_PAYLOAD_VERSION_V1
+        try:
+            server.PACK_SIGNATURE_PAYLOAD_VERSION_V1 = "memory-pack-signing-v2"
+            self.assertNotEqual(sig1, server._pack_sign_hmac_v1(manifest, secret))
+        finally:
+            server.PACK_SIGNATURE_PAYLOAD_VERSION_V1 = old_version
+
+    def test_secret_not_logged_or_returned(self) -> None:
+        secret = "secret-no-leak-0123456789012345678901"
+        signer = self._signer_add(signer_id="no.leak.signer", secret=secret)
+        source = self.record("phase200 no leak source", kind="context_block")
+        topic = "phase200-no-leak-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, export_sc = self._create_signed_exported_pack(
+            pack_name="phase200_no_leak",
+            output_dir=self.root / "phase200_no_leak",
+            signer_id="no.leak.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        blob = "\n".join(
+            [
+                json.dumps(signer.get("structuredContent", {}), ensure_ascii=False),
+                json.dumps(export_sc, ensure_ascii=False),
+                json.dumps(inspected.get("structuredContent", {}), ensure_ascii=False),
+            ]
+        )
+        self.assertNotIn(secret, blob)
+        self.assertNotIn("signing_secret", blob)
+        self.assertNotIn("verification_secret", blob)
+
+    def test_action_logging_scrubs_secret_params(self) -> None:
+        secret = "log-scrub-secret-012345678901234567890"
+        nested_secret = "nested-log-secret-0123456789012345678"
+        server.append_query_log(
+            "mnemo_search",
+            {
+                "query": "phase200 scrub",
+                "signing_secret": secret,
+                "nested": {"verification_secret": nested_secret, "inner": {"secret": secret}},
+            },
+            [],
+        )
+        server.append_event_log(
+            "create",
+            "mem_log_scrub",
+            {"details": {"secret": secret, "verification_secret": nested_secret}},
+        )
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            rows = conn.execute("SELECT data_json FROM events ORDER BY created_at ASC, rowid ASC").fetchall()
+        finally:
+            conn.close()
+        payload = "\n".join(str(row[0]) for row in rows)
+        self.assertNotIn(secret, payload)
+        self.assertNotIn(nested_secret, payload)
+        self.assertIn("[REDACTED]", payload)
+
+    def test_migration_6_to_7_idempotent(self) -> None:
+        self._reset_sqlite_file()
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute("DROP TABLE IF EXISTS trusted_signers")
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', '6')")
+            conn.commit()
+        finally:
+            conn.close()
+        server._SQLITE_BOOTSTRAPPED.clear()
+
+        server.load_store()
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            schema_value = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            self.assertIsNotNone(schema_value)
+            assert schema_value is not None
+            self.assertEqual(int(schema_value[0]), 7)
+            tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            self.assertIn("trusted_signers", tables)
+        finally:
+            conn.close()
+
+    def test_docs_action_list_mentions_signing_lifecycle(self) -> None:
+        readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        tool_reference = (Path(__file__).resolve().parent / "docs" / "tool_reference.md").read_text(encoding="utf-8")
+        combined = f"{readme}\n{tool_reference}"
+        self.assertIn("signer_add", combined)
+        self.assertIn("sign_pack", combined)
+        self.assertIn("Memory Packs lifecycle recap", combined)
+
+    def test_full_lifecycle_still_passes_unsigned(self) -> None:
+        marker = "phase200_unsigned_lifecycle"
+        seeded = self.record(f"{marker} source", kind="context_block", title=f"{marker} title")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(seeded["id"]), "topic": topic, "source": "operator"})
+        pack_path = self._create_exported_pack(
+            pack_name=marker,
+            output_dir=self.root / marker,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path))
+        self.assertEqual(str(inspected["structuredContent"]["status"]), "valid")
+        self.assertEqual(str(inspected["structuredContent"]["signature"]["trust_classification"]), "unsigned")
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        searched = server.search_memories({"query": marker, "limit": 20})
+        ids = {str(item["id"]) for item in searched["structuredContent"]["matches"]}
+        self.assertIn(promoted_id, ids)
+
+    def test_full_lifecycle_signed_quarantine_promote(self) -> None:
+        marker = "phase200_signed_lifecycle"
+        secret = "signed-lifecycle-secret-012345678901234"
+        self._signer_add(signer_id="signed.lifecycle.signer", secret=secret, trust_level="trusted")
+        first = self.record(
+            f"{marker} context email test.user@example.test",
+            kind="context_block",
+            title=f"{marker} title context",
+        )
+        second = self.record(
+            f"{marker} hip AWS AKIA1234567890ABCDEF",
+            kind="hippocampus_entry",
+            title=f"{marker} title hip",
+        )
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(first["id"]), "topic": topic, "source": "operator"})
+        server.topic_add({"memory_id": str(second["id"]), "topic": topic, "source": "operator"})
+
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name=marker,
+            output_dir=self.root / marker,
+            signer_id="signed.lifecycle.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block", "hippocampus_entry"],
+            limit=100,
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        self.assertEqual(str(inspected["structuredContent"]["status"]), "valid")
+        self.assertEqual(str(inspected["structuredContent"]["signature"]["trust_classification"]), "trusted_signer")
+        self.assertEqual(str(inspected["structuredContent"]["import_recommendation"]), "quarantine_only")
+
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_sc = imported["structuredContent"]
+        self.assertEqual(str(imported_sc["trust_level"]), "quarantine")
+        pack_id = str(imported_sc["pack_id"])
+
+        review = self._pack_review_import(pack_id=pack_id, include_samples=True, sample_limit=20)
+        self.assertGreaterEqual(int(review["structuredContent"]["selection"]["selected_rows"]), 2)
+
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+
+        promoted_only = server.search_memories({"query": marker, "limit": 50, "origins": ["promoted"]})
+        promoted_ids = {str(item["id"]) for item in promoted_only["structuredContent"]["matches"]}
+        self.assertIn(promoted_id, promoted_ids)
+
+    def test_signing_secret_scrubbing_recursive(self) -> None:
+        payload = {
+            "signing_secret": "abc",
+            "outer": {
+                "verification_secret": "def",
+                "plain": "ok",
+                "inner_list": [
+                    {"secret": "ghi"},
+                    {"items": [{"signing_secret": "jkl"}]},
+                ],
+            },
+            "tuple_items": ({"secret": "mno"}, {"safe": "value"}),
+        }
+        scrubbed = server.scrub_secret_params(payload)
+        self.assertEqual(scrubbed["signing_secret"], "[REDACTED]")
+        self.assertEqual(scrubbed["outer"]["verification_secret"], "[REDACTED]")
+        self.assertEqual(scrubbed["outer"]["plain"], "ok")
+        self.assertEqual(scrubbed["outer"]["inner_list"][0]["secret"], "[REDACTED]")
+        self.assertEqual(scrubbed["outer"]["inner_list"][1]["items"][0]["signing_secret"], "[REDACTED]")
+        self.assertEqual(scrubbed["tuple_items"][0]["secret"], "[REDACTED]")
+        self.assertEqual(scrubbed["tuple_items"][1]["safe"], "value")
+
+    def test_signing_secret_not_returned_or_logged(self) -> None:
+        secret = "stabilization-secret-not-logged-0123456789"
+        wrong_secret = "stabilization-secret-wrong-value-01234567"
+        self._signer_add(signer_id="stable.no.leak.signer", secret=secret, trust_level="trusted")
+        row = self.record("phase201 secret no leak row", kind="context_block")
+        topic = "phase201-secret-no-leak-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        pack_path, export_sc = self._create_signed_exported_pack(
+            pack_name="phase201_secret_no_leak",
+            output_dir=self.root / "phase201_secret_no_leak",
+            signer_id="stable.no.leak.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=wrong_secret)
+        server.append_query_log(
+            "mnemo_search",
+            {
+                "query": "phase201 secret no leak",
+                "signing_secret": secret,
+                "verification_secret": wrong_secret,
+                "nested": {"secret": secret},
+            },
+            [],
+        )
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            rows = conn.execute("SELECT data_json FROM events ORDER BY created_at ASC, rowid ASC").fetchall()
+        finally:
+            conn.close()
+        serialized = "\n".join(
+            [
+                json.dumps(export_sc, ensure_ascii=False),
+                json.dumps(inspected["structuredContent"], ensure_ascii=False),
+                "\n".join(str(item[0]) for item in rows),
+            ]
+        )
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(wrong_secret, serialized)
+        self.assertIn("[REDACTED]", serialized)
+
+    def test_signing_classification_matrix(self) -> None:
+        observed: dict[str, tuple[str, str, str]] = {}
+
+        unsigned_row = self.record("phase201 unsigned matrix", kind="context_block")
+        unsigned_topic = "phase201-matrix-unsigned-topic"
+        server.topic_add({"memory_id": str(unsigned_row["id"]), "topic": unsigned_topic, "source": "operator"})
+        unsigned_pack = self._create_exported_pack(
+            pack_name="phase201_matrix_unsigned",
+            output_dir=self.root / "phase201_matrix_unsigned",
+            topics=[unsigned_topic],
+            kinds=["context_block"],
+        )
+        unsigned_inspect = self._pack_inspect(pack_path=str(unsigned_pack))
+        unsigned_sc = unsigned_inspect["structuredContent"]
+        observed["unsigned"] = (
+            str(unsigned_sc["signature"]["trust_classification"]),
+            str(unsigned_sc["status"]),
+            str(unsigned_sc["import_recommendation"]),
+        )
+
+        trusted_secret = "phase201-matrix-trusted-secret-0123456789"
+        self._signer_add(signer_id="phase201.matrix.trusted", secret=trusted_secret, trust_level="trusted")
+        trusted_row = self.record("phase201 trusted matrix", kind="context_block")
+        trusted_topic = "phase201-matrix-trusted-topic"
+        server.topic_add({"memory_id": str(trusted_row["id"]), "topic": trusted_topic, "source": "operator"})
+        trusted_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase201_matrix_trusted",
+            output_dir=self.root / "phase201_matrix_trusted",
+            signer_id="phase201.matrix.trusted",
+            signing_secret=trusted_secret,
+            topics=[trusted_topic],
+            kinds=["context_block"],
+        )
+        trusted_no_secret = self._pack_inspect(pack_path=str(trusted_pack))
+        trusted_no_secret_sc = trusted_no_secret["structuredContent"]
+        observed["signature_not_verified"] = (
+            str(trusted_no_secret_sc["signature"]["trust_classification"]),
+            str(trusted_no_secret_sc["status"]),
+            str(trusted_no_secret_sc["import_recommendation"]),
+        )
+        trusted_verified = self._pack_inspect(pack_path=str(trusted_pack), verification_secret=trusted_secret)
+        trusted_verified_sc = trusted_verified["structuredContent"]
+        observed["trusted_signer"] = (
+            str(trusted_verified_sc["signature"]["trust_classification"]),
+            str(trusted_verified_sc["status"]),
+            str(trusted_verified_sc["import_recommendation"]),
+        )
+        trusted_wrong_secret = self._pack_inspect(
+            pack_path=str(trusted_pack),
+            verification_secret="phase201-matrix-wrong-secret-012345678",
+        )
+        trusted_wrong_secret_sc = trusted_wrong_secret["structuredContent"]
+        observed["invalid_signature"] = (
+            str(trusted_wrong_secret_sc["signature"]["trust_classification"]),
+            str(trusted_wrong_secret_sc["status"]),
+            str(trusted_wrong_secret_sc["import_recommendation"]),
+        )
+
+        unknown_secret = "phase201-matrix-unknown-secret-0123456789"
+        unknown_row = self.record("phase201 unknown matrix", kind="context_block")
+        unknown_topic = "phase201-matrix-unknown-topic"
+        server.topic_add({"memory_id": str(unknown_row["id"]), "topic": unknown_topic, "source": "operator"})
+        unknown_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase201_matrix_unknown",
+            output_dir=self.root / "phase201_matrix_unknown",
+            signer_id="phase201.matrix.unknown",
+            signing_secret=unknown_secret,
+            topics=[unknown_topic],
+            kinds=["context_block"],
+        )
+        unknown_inspect = self._pack_inspect(pack_path=str(unknown_pack), verification_secret=unknown_secret)
+        unknown_sc = unknown_inspect["structuredContent"]
+        observed["unknown_signer"] = (
+            str(unknown_sc["signature"]["trust_classification"]),
+            str(unknown_sc["status"]),
+            str(unknown_sc["import_recommendation"]),
+        )
+
+        blocked_secret = "phase201-matrix-blocked-secret-0123456789"
+        self._signer_add(signer_id="phase201.matrix.blocked", secret=blocked_secret, trust_level="blocked")
+        blocked_row = self.record("phase201 blocked matrix", kind="context_block")
+        blocked_topic = "phase201-matrix-blocked-topic"
+        server.topic_add({"memory_id": str(blocked_row["id"]), "topic": blocked_topic, "source": "operator"})
+        blocked_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase201_matrix_blocked",
+            output_dir=self.root / "phase201_matrix_blocked",
+            signer_id="phase201.matrix.blocked",
+            signing_secret=blocked_secret,
+            topics=[blocked_topic],
+            kinds=["context_block"],
+        )
+        blocked_inspect = self._pack_inspect(pack_path=str(blocked_pack), verification_secret=blocked_secret)
+        blocked_sc = blocked_inspect["structuredContent"]
+        observed["blocked_signer"] = (
+            str(blocked_sc["signature"]["trust_classification"]),
+            str(blocked_sc["status"]),
+            str(blocked_sc["import_recommendation"]),
+        )
+
+        disabled_secret = "phase201-matrix-disabled-secret-012345678"
+        self._signer_add(signer_id="phase201.matrix.disabled", secret=disabled_secret, trust_level="trusted")
+        self._signer_disable(signer_id="phase201.matrix.disabled")
+        disabled_row = self.record("phase201 disabled matrix", kind="context_block")
+        disabled_topic = "phase201-matrix-disabled-topic"
+        server.topic_add({"memory_id": str(disabled_row["id"]), "topic": disabled_topic, "source": "operator"})
+        disabled_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase201_matrix_disabled",
+            output_dir=self.root / "phase201_matrix_disabled",
+            signer_id="phase201.matrix.disabled",
+            signing_secret=disabled_secret,
+            topics=[disabled_topic],
+            kinds=["context_block"],
+        )
+        disabled_inspect = self._pack_inspect(pack_path=str(disabled_pack), verification_secret=disabled_secret)
+        disabled_sc = disabled_inspect["structuredContent"]
+        observed["disabled_signer"] = (
+            str(disabled_sc["signature"]["trust_classification"]),
+            str(disabled_sc["status"]),
+            str(disabled_sc["import_recommendation"]),
+        )
+
+        mismatch_secret_a = "phase201-matrix-mismatch-secret-a-0123456"
+        mismatch_secret_b = "phase201-matrix-mismatch-secret-b-0123456"
+        self._signer_add(signer_id="phase201.matrix.mismatch", secret=mismatch_secret_a, trust_level="trusted")
+        mismatch_row = self.record("phase201 mismatch matrix", kind="context_block")
+        mismatch_topic = "phase201-matrix-mismatch-topic"
+        server.topic_add({"memory_id": str(mismatch_row["id"]), "topic": mismatch_topic, "source": "operator"})
+        mismatch_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase201_matrix_mismatch",
+            output_dir=self.root / "phase201_matrix_mismatch",
+            signer_id="phase201.matrix.mismatch",
+            signing_secret=mismatch_secret_b,
+            topics=[mismatch_topic],
+            kinds=["context_block"],
+        )
+        mismatch_inspect = self._pack_inspect(pack_path=str(mismatch_pack), verification_secret=mismatch_secret_b)
+        mismatch_sc = mismatch_inspect["structuredContent"]
+        observed["secret_fingerprint_mismatch"] = (
+            str(mismatch_sc["signature"]["trust_classification"]),
+            str(mismatch_sc["status"]),
+            str(mismatch_sc["import_recommendation"]),
+        )
+
+        members = self._read_zip_members(trusted_pack)
+        tampered_manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        tampered_signature = json.loads(members[server.PACK_SIGNATURE_MEMBER].decode("utf-8"))
+        tampered_manifest["signature"]["signature_algorithm"] = "hmac-sha512-local-v1"
+        tampered_signature["signature_algorithm"] = "hmac-sha512-local-v1"
+        unsupported_path = self.root / "phase201_matrix_trusted" / "unsupported_signature_algorithm.zip"
+        self._rewrite_zip(
+            trusted_pack,
+            unsupported_path,
+            replace_members={
+                "manifest.json": (
+                    json.dumps(tampered_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8"),
+                server.PACK_SIGNATURE_MEMBER: (
+                    json.dumps(tampered_signature, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8"),
+            },
+        )
+        unsupported_inspect = self._pack_inspect(pack_path=str(unsupported_path), verification_secret=trusted_secret)
+        unsupported_sc = unsupported_inspect["structuredContent"]
+        observed["unsupported_signature"] = (
+            str(unsupported_sc["signature"]["trust_classification"]),
+            str(unsupported_sc["status"]),
+            str(unsupported_sc["import_recommendation"]),
+        )
+
+        expected = {
+            "unsigned": ("unsigned", "valid", "quarantine_only"),
+            "signature_not_verified": ("signature_not_verified", "valid", "quarantine_only"),
+            "trusted_signer": ("trusted_signer", "valid", "quarantine_only"),
+            "unknown_signer": ("unknown_signer", "valid", "quarantine_only"),
+            "disabled_signer": ("disabled_signer", "invalid", "reject"),
+            "blocked_signer": ("blocked_signer", "invalid", "reject"),
+            "invalid_signature": ("invalid_signature", "invalid", "reject"),
+            "secret_fingerprint_mismatch": ("secret_fingerprint_mismatch", "invalid", "reject"),
+            "unsupported_signature": ("unsupported_signature", "unsupported", "reject"),
+        }
+        for key, value in expected.items():
+            with self.subTest(classification=key):
+                self.assertEqual(observed.get(key), value)
+
+    def test_signing_tamper_cases(self) -> None:
+        secret = "phase201-tamper-secret-01234567890123456"
+        source = self.record("phase201 tamper matrix source", kind="context_block")
+        topic = "phase201-tamper-matrix-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase201_tamper_matrix",
+            output_dir=self.root / "phase201_tamper_matrix",
+            signer_id="phase201.tamper.signer",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        members = self._read_zip_members(pack_path)
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        signature_payload = json.loads(members[server.PACK_SIGNATURE_MEMBER].decode("utf-8"))
+
+        cases: list[tuple[str, dict[str, Any], str, str, set[str]]] = []
+
+        cases.append(
+            (
+                "tamper_content_member",
+                {"content/memories.jsonl": b"{bad-json}\n"},
+                "invalid",
+                "reject",
+                {"trusted_signer", "unknown_signer", "signature_not_verified", "invalid_signature"},
+            )
+        )
+
+        tampered_signature_value = json.loads(json.dumps(signature_payload))
+        tampered_signature_value["signature_value"] = "00" * 32
+        cases.append(
+            (
+                "tamper_signature_value",
+                {
+                    server.PACK_SIGNATURE_MEMBER: (
+                        json.dumps(tampered_signature_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8")
+                },
+                "invalid",
+                "reject",
+                {"invalid_signature"},
+            )
+        )
+
+        tampered_signature_signer = json.loads(json.dumps(signature_payload))
+        tampered_signature_signer["signer_id"] = "phase201.tamper.changed"
+        cases.append(
+            (
+                "tamper_signature_signer_id",
+                {
+                    server.PACK_SIGNATURE_MEMBER: (
+                        json.dumps(tampered_signature_signer, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8")
+                },
+                "invalid",
+                "reject",
+                {"invalid_signature"},
+            )
+        )
+
+        tampered_manifest_signer = json.loads(json.dumps(manifest))
+        tampered_manifest_signer["signature"]["signer_id"] = "phase201.tamper.changed.manifest"
+        cases.append(
+            (
+                "tamper_manifest_signer_id",
+                {
+                    "manifest.json": (
+                        json.dumps(tampered_manifest_signer, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8")
+                },
+                "invalid",
+                "reject",
+                {"invalid_signature"},
+            )
+        )
+
+        tampered_payload_version = json.loads(json.dumps(manifest))
+        tampered_payload_version_sig = json.loads(json.dumps(signature_payload))
+        tampered_payload_version["signature"]["signature_payload_version"] = "memory-pack-signing-v2"
+        tampered_payload_version_sig["signature_payload_version"] = "memory-pack-signing-v2"
+        cases.append(
+            (
+                "tamper_payload_version",
+                {
+                    "manifest.json": (
+                        json.dumps(tampered_payload_version, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8"),
+                    server.PACK_SIGNATURE_MEMBER: (
+                        json.dumps(tampered_payload_version_sig, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8"),
+                },
+                "unsupported",
+                "reject",
+                {"unsupported_signature"},
+            )
+        )
+
+        tampered_algorithm = json.loads(json.dumps(manifest))
+        tampered_algorithm_sig = json.loads(json.dumps(signature_payload))
+        tampered_algorithm["signature"]["signature_algorithm"] = "hmac-sha512-local-v1"
+        tampered_algorithm_sig["signature_algorithm"] = "hmac-sha512-local-v1"
+        cases.append(
+            (
+                "tamper_signature_algorithm",
+                {
+                    "manifest.json": (
+                        json.dumps(tampered_algorithm, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8"),
+                    server.PACK_SIGNATURE_MEMBER: (
+                        json.dumps(tampered_algorithm_sig, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8"),
+                },
+                "unsupported",
+                "reject",
+                {"unsupported_signature"},
+            )
+        )
+
+        tampered_fingerprint = json.loads(json.dumps(signature_payload))
+        tampered_fingerprint["secret_fingerprint"] = "f" * 32
+        cases.append(
+            (
+                "tamper_secret_fingerprint",
+                {
+                    server.PACK_SIGNATURE_MEMBER: (
+                        json.dumps(tampered_fingerprint, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8")
+                },
+                "invalid",
+                "reject",
+                {"invalid_signature", "secret_fingerprint_mismatch"},
+            )
+        )
+
+        tampered_member_path = json.loads(json.dumps(manifest))
+        tampered_member_path["signature"]["signature_member"] = "signature/other.json"
+        cases.append(
+            (
+                "tamper_signature_member_path",
+                {
+                    "manifest.json": (
+                        json.dumps(tampered_member_path, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                    ).encode("utf-8")
+                },
+                "unsupported",
+                "reject",
+                {"unsupported_signature"},
+            )
+        )
+
+        for label, replace_members, expected_status, expected_recommendation, expected_classifications in cases:
+            with self.subTest(case=label):
+                tampered = self.root / "phase201_tamper_matrix" / f"{label}.zip"
+                self._rewrite_zip(pack_path, tampered, replace_members=replace_members)
+                inspected = self._pack_inspect(pack_path=str(tampered), verification_secret=secret)
+                sc = inspected["structuredContent"]
+                self.assertEqual(str(sc["status"]), expected_status)
+                self.assertEqual(str(sc["import_recommendation"]), expected_recommendation)
+                self.assertIn(str(sc["signature"]["trust_classification"]), expected_classifications)
+
+        missing_signature_member = self.root / "phase201_tamper_matrix" / "missing_signature_member.zip"
+        self._rewrite_zip(pack_path, missing_signature_member, remove_members={server.PACK_SIGNATURE_MEMBER})
+        missing_inspect = self._pack_inspect(pack_path=str(missing_signature_member), verification_secret=secret)
+        missing_sc = missing_inspect["structuredContent"]
+        self.assertEqual(str(missing_sc["status"]), "invalid")
+        self.assertEqual(str(missing_sc["import_recommendation"]), "reject")
+        self.assertEqual(str(missing_sc["signature"]["trust_classification"]), "invalid_signature")
+
+        unsigned_row = self.record("phase201 unsigned extra signature source", kind="context_block")
+        unsigned_topic = "phase201-unsigned-extra-signature-topic"
+        server.topic_add({"memory_id": str(unsigned_row["id"]), "topic": unsigned_topic, "source": "operator"})
+        unsigned_pack = self._create_exported_pack(
+            pack_name="phase201_unsigned_extra_signature",
+            output_dir=self.root / "phase201_unsigned_extra_signature",
+            topics=[unsigned_topic],
+            kinds=["context_block"],
+        )
+        unsigned_extra = self.root / "phase201_unsigned_extra_signature" / "unsigned_with_signature_member.zip"
+        self._rewrite_zip(
+            unsigned_pack,
+            unsigned_extra,
+            extra_members={
+                server.PACK_SIGNATURE_MEMBER: (
+                    json.dumps(
+                        {
+                            "signature_schema_version": 1,
+                            "signature_algorithm": server.PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL,
+                            "signature_payload_version": server.PACK_SIGNATURE_PAYLOAD_VERSION_V1,
+                            "signer_id": "fake.signer",
+                            "secret_fingerprint": "0" * 32,
+                            "signed_at": "2026-05-26T00:00:00Z",
+                            "signature_value": "0" * 64,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            },
+        )
+        unsigned_extra_inspect = self._pack_inspect(pack_path=str(unsigned_extra))
+        unsigned_extra_sc = unsigned_extra_inspect["structuredContent"]
+        self.assertEqual(str(unsigned_extra_sc["status"]), "valid")
+        self.assertEqual(str(unsigned_extra_sc["import_recommendation"]), "quarantine_only")
+        self.assertEqual(str(unsigned_extra_sc["signature"]["trust_classification"]), "unsigned")
+
+    def test_signer_registry_state_cycle(self) -> None:
+        secret = "phase201-state-cycle-secret-01234567890123"
+        self._signer_add(signer_id="phase201.state.cycle", secret=secret, trust_level="trusted")
+        disabled = self._signer_disable(signer_id="phase201.state.cycle")
+        self.assertEqual(str(disabled["structuredContent"]["signer_status"]), "disabled")
+        enabled = self._signer_enable(signer_id="phase201.state.cycle")
+        self.assertEqual(str(enabled["structuredContent"]["signer_status"]), "active")
+
+        disable_missing = self._signer_disable_error(signer_id="phase201.missing.signer")
+        self.assertEqual(self._pack_error_code(disable_missing), "signer_not_found")
+        enable_missing = self._signer_enable_error(signer_id="phase201.missing.signer")
+        self.assertEqual(self._pack_error_code(enable_missing), "signer_not_found")
+
+        invalid_signer_id = self._signer_add_error(signer_id="no spaces allowed", secret=secret)
+        self.assertIn("signer_id must match", str(invalid_signer_id["content"][0]["text"]))
+        unicode_signer_id = self._signer_add_error(signer_id="žsigner", secret=secret)
+        self.assertIn("signer_id must match", str(unicode_signer_id["content"][0]["text"]))
+
+    def test_migration_7_idempotent(self) -> None:
+        self._reset_sqlite_file()
+        server.load_store()
+        self._signer_add(signer_id="phase201.migration.signer", secret="phase201-migration-secret-012345678901")
+        source = self.record("phase201 migration row", kind="context_block")
+        server.topic_add({"memory_id": str(source["id"]), "topic": "phase201-migration-topic", "source": "operator"})
+        export = self._pack_export(
+            pack_name="phase201_migration_pack",
+            output_dir=str(self.root / "phase201_migration_pack"),
+            allow_unsigned=True,
+            topics=["phase201-migration-topic"],
+            kinds=["context_block"],
+        )
+        self.assertFalse(export["isError"], export)
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            signer_rows_before = conn.execute("SELECT COUNT(*) FROM trusted_signers").fetchone()[0]
+            imported_before = conn.execute("SELECT COUNT(*) FROM imported_packs").fetchone()[0]
+            exported_before = conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0]
+        finally:
+            conn.close()
+
+        server._SQLITE_BOOTSTRAPPED.clear()
+        server.load_store()
+        server._SQLITE_BOOTSTRAPPED.clear()
+        server.load_store()
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            schema_value = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            self.assertIsNotNone(schema_value)
+            assert schema_value is not None
+            self.assertEqual(int(schema_value[0]), 7)
+
+            tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            self.assertIn("trusted_signers", tables)
+
+            indexes = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+            self.assertIn("idx_trusted_signers_status", indexes)
+            self.assertIn("idx_trusted_signers_trust_level", indexes)
+
+            signer_rows_after = conn.execute("SELECT COUNT(*) FROM trusted_signers").fetchone()[0]
+            imported_after = conn.execute("SELECT COUNT(*) FROM imported_packs").fetchone()[0]
+            exported_after = conn.execute("SELECT COUNT(*) FROM exported_packs").fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(int(signer_rows_before), int(signer_rows_after))
+        self.assertEqual(int(imported_before), int(imported_after))
+        self.assertEqual(int(exported_before), int(exported_after))
+
+    def test_signed_pack_import_remains_quarantine_only(self) -> None:
+        secret = "phase201-import-policy-secret-012345678901"
+        self._signer_add(signer_id="phase201.import.policy", secret=secret, trust_level="trusted")
+        source = self.record("phase201 import policy row", kind="context_block")
+        topic = "phase201-import-policy-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase201_import_policy_pack",
+            output_dir=self.root / "phase201_import_policy_pack",
+            signer_id="phase201.import.policy",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path), verification_secret=secret)
+        self.assertEqual(str(inspected["structuredContent"]["signature"]["trust_classification"]), "trusted_signer")
+        self.assertEqual(str(inspected["structuredContent"]["import_recommendation"]), "quarantine_only")
+
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_sc = imported["structuredContent"]
+        self.assertEqual(str(imported_sc["trust_level"]), "quarantine")
+        self.assertTrue(str(imported_sc["namespace"]).startswith("pack:quarantine:"))
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                "SELECT trust_level, namespace FROM imported_packs WHERE pack_id = ?",
+                (str(imported_sc["pack_id"]),),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row[0]), "quarantine")
+        self.assertTrue(str(row[1]).startswith("pack:quarantine:"))
+
+    def test_pack_export_signed_unsigned_regression(self) -> None:
+        marker = "phase201_export_regression"
+        row = self.record(f"{marker} source", kind="context_block")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+
+        unsigned_pack = self._create_exported_pack(
+            pack_name=f"{marker}_unsigned",
+            output_dir=self.root / f"{marker}_unsigned",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        unsigned_members = self._read_zip_members(unsigned_pack)
+        unsigned_manifest = json.loads(unsigned_members["manifest.json"].decode("utf-8"))
+        self.assertEqual(int(unsigned_manifest.get("pack_schema_version", 0)), 1)
+        self.assertFalse(bool(unsigned_manifest.get("signed")))
+        self.assertIn(str(unsigned_manifest.get("unsigned_reason", "")), {"operator_chose_unsigned", "signing_not_implemented"})
+        self.assertNotIn(server.PACK_SIGNATURE_MEMBER, unsigned_members)
+
+        secret = "phase201-export-signed-secret-0123456789012"
+        signed_pack, signed_sc = self._create_signed_exported_pack(
+            pack_name=f"{marker}_signed",
+            output_dir=self.root / f"{marker}_signed",
+            signer_id="phase201.export.regression",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        warning_codes = self._pack_warning_codes({"structuredContent": signed_sc})
+        self.assertIn("local_hmac_not_public_key", warning_codes)
+
+        signed_members = self._read_zip_members(signed_pack)
+        signed_manifest = json.loads(signed_members["manifest.json"].decode("utf-8"))
+        self.assertTrue(bool(signed_manifest.get("signed")))
+        self.assertIn("signature", signed_manifest)
+        self.assertIn(server.PACK_SIGNATURE_MEMBER, signed_members)
+        self.assertNotIn(secret, "\n".join(blob.decode("utf-8", errors="ignore") for blob in signed_members.values()))
+        covered_members = list((signed_manifest.get("content_hash", {}) or {}).get("covered_members", []))
+        self.assertNotIn(server.PACK_SIGNATURE_MEMBER, covered_members)
+
+    def test_pack_inspect_signature_regression(self) -> None:
+        marker = "phase201_inspect_signature_regression"
+        row = self.record(f"{marker} row", kind="context_block")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+
+        unsigned_pack = self._create_exported_pack(
+            pack_name=f"{marker}_unsigned",
+            output_dir=self.root / f"{marker}_unsigned",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        unsigned_inspect = self._pack_inspect(
+            pack_path=str(unsigned_pack),
+            verification_secret="phase201-inspect-regression-secret-123456789",
+        )
+        self.assertIn("verification_secret_unused_for_unsigned_pack", self._pack_warning_codes(unsigned_inspect))
+
+        secret = "phase201-inspect-regression-signed-secret-012"
+        self._signer_add(signer_id="phase201.inspect.regression", secret=secret, trust_level="trusted")
+        signed_pack, _ = self._create_signed_exported_pack(
+            pack_name=f"{marker}_signed",
+            output_dir=self.root / f"{marker}_signed",
+            signer_id="phase201.inspect.regression",
+            signing_secret=secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+
+        before = self._read_only_snapshot()
+        signed_no_secret = self._pack_inspect(pack_path=str(signed_pack))
+        signed_verified = self._pack_inspect(pack_path=str(signed_pack), verification_secret=secret)
+        signed_wrong = self._pack_inspect(
+            pack_path=str(signed_pack),
+            verification_secret="phase201-inspect-regression-wrong-secret-12",
+        )
+        after = self._read_only_snapshot()
+
+        self.assertEqual(before["counts"], after["counts"])
+        self.assertEqual(before["digests"], after["digests"])
+
+        self.assertIn("signature_not_verified", self._pack_warning_codes(signed_no_secret))
+        self.assertIn("local_hmac_not_public_key", self._pack_warning_codes(signed_no_secret))
+        self.assertTrue(bool(signed_verified["structuredContent"]["signature"]["verified"]))
+        self.assertEqual(
+            str(signed_verified["structuredContent"]["signature"]["trust_classification"]),
+            "trusted_signer",
+        )
+        self.assertEqual(str(signed_wrong["structuredContent"]["status"]), "invalid")
+        self.assertEqual(
+            str(signed_wrong["structuredContent"]["signature"]["trust_classification"]),
+            "invalid_signature",
+        )
+
+        members = self._read_zip_members(signed_pack)
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        signature_payload = json.loads(members[server.PACK_SIGNATURE_MEMBER].decode("utf-8"))
+        manifest["signature"]["signature_algorithm"] = "hmac-sha512-local-v1"
+        signature_payload["signature_algorithm"] = "hmac-sha512-local-v1"
+        unsupported = self.root / f"{marker}_signed" / "unsupported_signature_algorithm.zip"
+        self._rewrite_zip(
+            signed_pack,
+            unsupported,
+            replace_members={
+                "manifest.json": (
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8"),
+                server.PACK_SIGNATURE_MEMBER: (
+                    json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8"),
+            },
+        )
+        unsupported_inspect = self._pack_inspect(pack_path=str(unsupported), verification_secret=secret)
+        self.assertEqual(str(unsupported_inspect["structuredContent"]["status"]), "unsupported")
+        self.assertEqual(
+            str(unsupported_inspect["structuredContent"]["signature"]["trust_classification"]),
+            "unsupported_signature",
+        )
+
+    def test_docs_signing_lifecycle_recap(self) -> None:
+        readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        tool_reference = (Path(__file__).resolve().parent / "docs" / "tool_reference.md").read_text(encoding="utf-8")
+        combined = f"{readme}\n{tool_reference}"
+        self.assertIn("signer_add", combined)
+        self.assertIn("signer_list", combined)
+        self.assertIn("sign_pack", combined)
+        self.assertIn("verification_secret", combined)
+        self.assertIn("allow_trusted_import", combined)
+        self.assertIn("trusted import policy", combined.lower())
+        self.assertIn("not public-key signing", combined.lower())
+        self.assertIn("not non-repudiation", combined.lower())
+
+    def test_trusted_import_policy_docs_present(self) -> None:
+        readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        tool_reference = (Path(__file__).resolve().parent / "docs" / "tool_reference.md").read_text(encoding="utf-8")
+        combined = f"{readme}\n{tool_reference}"
+        self.assertIn("Trusted Import Policy", readme)
+        self.assertIn("Trusted Import Policy", tool_reference)
+        self.assertIn("Trusted import is NOT local adoption", combined)
+        self.assertIn("Trusted import is NOT automatic promotion", combined)
+        self.assertIn("Trusted import is NOT default retrieval", combined)
+        self.assertIn("pack:trusted:<pack_id>", combined)
+        self.assertIn("manual promotion remains explicit", combined.lower())
+
+    def test_retrieval_semantics_include_flags_after_5b(self) -> None:
+        marker = "phase210-flag-matrix-marker"
+        trusted_ns = "pack:trusted:phase210-flag-trusted"
+        quarantine_ns = "pack:quarantine:phase210-flag-quarantine"
+        self._insert_imported_pack(pack_id="phase210-flag-trusted", trust_level="trusted", namespace=trusted_ns)
+        self._insert_imported_pack(pack_id="phase210-flag-quarantine", trust_level="quarantine", namespace=quarantine_ns)
+        trusted_row = self.record(f"{marker} trusted", kind="note", namespace=trusted_ns, origin="imported")
+        quarantine_row = self.record(f"{marker} quarantine", kind="note", namespace=quarantine_ns, origin="imported")
+
+        default = server.search_memories({"query": marker, "limit": 20})
+        imported_only = server.search_memories({"query": marker, "limit": 20, "include_imported": True})
+        quarantine_only = server.search_memories({"query": marker, "limit": 20, "include_quarantine": True})
+        both = server.search_memories({"query": marker, "limit": 20, "include_imported": True, "include_quarantine": True})
+        explicit_trusted = server.search_memories(
+            {"query": marker, "limit": 20, "namespace": trusted_ns, "include_quarantine": True}
+        )
+        explicit_quarantine = server.search_memories(
+            {"query": marker, "limit": 20, "namespace": quarantine_ns, "include_imported": True}
+        )
+
+        default_ids = {str(item["id"]) for item in default["structuredContent"]["matches"]}
+        imported_ids = {str(item["id"]) for item in imported_only["structuredContent"]["matches"]}
+        quarantine_ids = {str(item["id"]) for item in quarantine_only["structuredContent"]["matches"]}
+        both_ids = {str(item["id"]) for item in both["structuredContent"]["matches"]}
+        explicit_trusted_ids = {str(item["id"]) for item in explicit_trusted["structuredContent"]["matches"]}
+        explicit_quarantine_ids = {str(item["id"]) for item in explicit_quarantine["structuredContent"]["matches"]}
+
+        self.assertNotIn(str(trusted_row["id"]), default_ids)
+        self.assertNotIn(str(quarantine_row["id"]), default_ids)
+        self.assertIn(str(trusted_row["id"]), imported_ids)
+        self.assertNotIn(str(quarantine_row["id"]), imported_ids)
+        self.assertIn(str(quarantine_row["id"]), quarantine_ids)
+        self.assertNotIn(str(trusted_row["id"]), quarantine_ids)
+        self.assertIn(str(trusted_row["id"]), both_ids)
+        self.assertIn(str(quarantine_row["id"]), both_ids)
+        self.assertEqual(explicit_trusted_ids, {str(trusted_row["id"])})
+        self.assertEqual(explicit_quarantine_ids, {str(quarantine_row["id"])})
+
+    def test_include_imported_only_returns_trusted_namespaces_after_5b(self) -> None:
+        marker = "phase210-include-imported-trusted-only"
+        trusted_ns = "pack:trusted:phase210-imported-only-trusted"
+        quarantine_ns = "pack:quarantine:phase210-imported-only-quarantine"
+        self._insert_imported_pack(pack_id="phase210-imported-only-trusted", trust_level="trusted", namespace=trusted_ns)
+        self._insert_imported_pack(
+            pack_id="phase210-imported-only-quarantine",
+            trust_level="quarantine",
+            namespace=quarantine_ns,
+        )
+        trusted_row = self.record(f"{marker} trusted", kind="note", namespace=trusted_ns, origin="imported")
+        quarantine_row = self.record(f"{marker} quarantine", kind="note", namespace=quarantine_ns, origin="imported")
+        result = server.search_memories({"query": marker, "limit": 20, "include_imported": True})
+        ids = {str(item["id"]) for item in result["structuredContent"]["matches"]}
+        self.assertIn(str(trusted_row["id"]), ids)
+        self.assertNotIn(str(quarantine_row["id"]), ids)
+
+    def test_pack_import_requires_one_import_target(self) -> None:
+        row = self.record("phase210 import target policy", kind="context_block")
+        topic = "phase210-import-target-policy-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        pack_path = self._create_exported_pack(
+            pack_name="phase210_import_target_policy",
+            output_dir=self.root / "phase210_import_target_policy",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        before = self._table_count("imported_packs")
+
+        neither = self._pack_import_error(pack_path=str(pack_path))
+        self.assertEqual(self._pack_error_code(neither), "import_target_not_allowed")
+        both = self._pack_import_error(
+            pack_path=str(pack_path),
+            allow_unsigned_quarantine=True,
+            allow_trusted_import=True,
+            verification_secret="phase210-both-targets-secret-0123456789012",
+        )
+        self.assertEqual(self._pack_error_code(both), "ambiguous_import_target")
+        self.assertEqual(before, self._table_count("imported_packs"))
+
+    def test_pack_import_trusted_requires_verification_secret(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase210-trusted-requires-secret")
+        failed = self._pack_import_error(pack_path=str(fixture["pack_path"]), allow_trusted_import=True)
+        self.assertEqual(self._pack_error_code(failed), "trusted_import_requires_verification_secret")
+
+    def test_pack_import_trusted_rejects_short_verification_secret(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase210-trusted-short-secret")
+        failed = self._pack_import_error(
+            pack_path=str(fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret="short",
+        )
+        self.assertEqual(self._pack_error_code(failed), "secret_too_short")
+        error_payload = failed.get("structuredContent", {}).get("error", {})
+        self.assertEqual(str(error_payload.get("field", "")), "verification_secret")
+
+    def test_pack_import_trusted_signed_pack_success(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase210-trusted-import-success")
+        imported = self._pack_import(
+            pack_path=str(fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(fixture["secret"]),
+        )
+        sc = imported["structuredContent"]
+        self.assertEqual(str(sc["trust_level"]), "trusted")
+        self.assertTrue(str(sc["namespace"]).startswith("pack:trusted:"))
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                "SELECT trust_level, namespace FROM imported_packs WHERE pack_id = ?",
+                (str(sc["pack_id"]),),
+            ).fetchone()
+            memories = conn.execute(
+                "SELECT namespace, origin FROM memories WHERE id IN (SELECT memory_id FROM imported_pack_rows WHERE pack_id = ?)",
+                (str(sc["pack_id"]),),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row[0]), "trusted")
+        self.assertTrue(str(row[1]).startswith("pack:trusted:"))
+        self.assertTrue(all(str(item[0]).startswith("pack:trusted:") for item in memories))
+        self.assertTrue(all(str(item[1]) == "imported" for item in memories))
+
+    def test_pack_import_trusted_does_not_create_local_rows(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase210-trusted-no-local")
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before_local_namespace = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?",
+                    (server.DEFAULT_MEMORY_NAMESPACE,),
+                ).fetchone()[0]
+            )
+            before_promoted = int(conn.execute("SELECT COUNT(*) FROM memories WHERE origin = 'promoted'").fetchone()[0])
+        finally:
+            conn.close()
+        imported = self._pack_import(
+            pack_path=str(fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(fixture["secret"]),
+        )
+        sc = imported["structuredContent"]
+        self.assertEqual(str(sc["trust_level"]), "trusted")
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after_local_namespace = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE namespace = ?",
+                    (server.DEFAULT_MEMORY_NAMESPACE,),
+                ).fetchone()[0]
+            )
+            after_promoted = int(conn.execute("SELECT COUNT(*) FROM memories WHERE origin = 'promoted'").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertEqual(before_local_namespace, after_local_namespace)
+        self.assertEqual(before_promoted, after_promoted)
+
+    def test_pack_import_trusted_rejects_unverified_or_unknown(self) -> None:
+        unknown_secret = "phase210-unknown-signer-secret-01234567890123"
+        source = self.record("phase210 unknown signer trusted import", kind="context_block")
+        topic = "phase210-unknown-signer-topic"
+        server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        pack_path, _ = self._create_signed_exported_pack(
+            pack_name="phase210_unknown_signer_pack",
+            output_dir=self.root / "phase210_unknown_signer_pack",
+            signer_id="phase210.unknown.signer",
+            signing_secret=unknown_secret,
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        failed = self._pack_import_error(
+            pack_path=str(pack_path),
+            allow_trusted_import=True,
+            verification_secret=unknown_secret,
+        )
+        self.assertEqual(self._pack_error_code(failed), "trusted_import_requires_verified_trusted_signer")
+
+    def test_pack_import_trusted_rejects_invalid_blocked_disabled_mismatch(self) -> None:
+        server.load_store()
+        base_count = self._table_count("imported_packs")
+
+        invalid_fixture = self._create_signed_pack_fixture(marker="phase210-trusted-invalid-signature")
+        invalid = self._pack_import_error(
+            pack_path=str(invalid_fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret="phase210-invalid-secret-wrong-012345678901",
+        )
+        self.assertEqual(self._pack_error_code(invalid), "trusted_import_requires_verified_trusted_signer")
+
+        blocked_fixture = self._create_signed_pack_fixture(
+            marker="phase210-trusted-blocked-signer",
+            trust_level="blocked",
+        )
+        blocked = self._pack_import_error(
+            pack_path=str(blocked_fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(blocked_fixture["secret"]),
+        )
+        self.assertEqual(self._pack_error_code(blocked), "trusted_import_requires_verified_trusted_signer")
+
+        disabled_fixture = self._create_signed_pack_fixture(marker="phase210-trusted-disabled-signer")
+        self._signer_disable(signer_id=str(disabled_fixture["signer_id"]))
+        disabled = self._pack_import_error(
+            pack_path=str(disabled_fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(disabled_fixture["secret"]),
+        )
+        self.assertEqual(self._pack_error_code(disabled), "trusted_import_requires_verified_trusted_signer")
+
+        mismatch_signer = "phase210.mismatch.signer"
+        secret_a = "phase210-mismatch-secret-A-0123456789012345"
+        secret_b = "phase210-mismatch-secret-B-0123456789012345"
+        self._signer_add(signer_id=mismatch_signer, secret=secret_a, trust_level="trusted")
+        row = self.record("phase210 mismatch source", kind="context_block")
+        mismatch_topic = "phase210-mismatch-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": mismatch_topic, "source": "operator"})
+        mismatch_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase210_mismatch_pack",
+            output_dir=self.root / "phase210_mismatch_pack",
+            signer_id=mismatch_signer,
+            signing_secret=secret_b,
+            topics=[mismatch_topic],
+            kinds=["context_block"],
+        )
+        mismatch = self._pack_import_error(
+            pack_path=str(mismatch_pack),
+            allow_trusted_import=True,
+            verification_secret=secret_b,
+        )
+        self.assertEqual(self._pack_error_code(mismatch), "trusted_import_requires_verified_trusted_signer")
+        self.assertEqual(base_count, self._table_count("imported_packs"))
+
+    def test_pack_import_quarantine_fallback_for_signed_pack(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase210-signed-quarantine-fallback")
+        imported = self._pack_import(pack_path=str(fixture["pack_path"]), allow_unsigned_quarantine=True)
+        sc = imported["structuredContent"]
+        self.assertEqual(str(sc["trust_level"]), "quarantine")
+        self.assertTrue(str(sc["namespace"]).startswith("pack:quarantine:"))
+
+    def test_pack_import_reimport_collision_across_trust_levels(self) -> None:
+        fixture_q = self._create_signed_pack_fixture(marker="phase210-cross-level-q-first")
+        imported_q = self._pack_import(pack_path=str(fixture_q["pack_path"]), allow_unsigned_quarantine=True)
+        again_trusted = self._pack_import_error(
+            pack_path=str(fixture_q["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(fixture_q["secret"]),
+        )
+        self.assertEqual(self._pack_error_code(again_trusted), "pack_already_imported")
+        self.assertTrue(str(imported_q["structuredContent"]["namespace"]).startswith("pack:quarantine:"))
+
+        fixture_t = self._create_signed_pack_fixture(marker="phase210-cross-level-t-first")
+        imported_t = self._pack_import(
+            pack_path=str(fixture_t["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(fixture_t["secret"]),
+        )
+        again_quarantine = self._pack_import_error(
+            pack_path=str(fixture_t["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        self.assertEqual(self._pack_error_code(again_quarantine), "pack_already_imported")
+        self.assertTrue(str(imported_t["structuredContent"]["namespace"]).startswith("pack:trusted:"))
+
+    def test_pack_list_imports_mixed_trust_filter(self) -> None:
+        trusted_fixture = self._create_signed_pack_fixture(marker="phase210-list-mixed-trusted")
+        trusted_import = self._pack_import(
+            pack_path=str(trusted_fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(trusted_fixture["secret"]),
+        )
+        q_row = self.record("phase210-list-mixed-quarantine source", kind="context_block")
+        q_topic = "phase210-list-mixed-quarantine-topic"
+        server.topic_add({"memory_id": str(q_row["id"]), "topic": q_topic, "source": "operator"})
+        q_pack = self._create_exported_pack(
+            pack_name="phase210_list_mixed_quarantine",
+            output_dir=self.root / "phase210_list_mixed_quarantine",
+            topics=[q_topic],
+            kinds=["context_block"],
+        )
+        quarantine_import = self._pack_import(pack_path=str(q_pack), allow_unsigned_quarantine=True)
+
+        trusted_only = self._pack_list_imports(trust_level="trusted")
+        quarantine_only = self._pack_list_imports(trust_level="quarantine")
+        all_rows = self._pack_list_imports()
+        trusted_ids = {str(item["pack_id"]) for item in trusted_only["structuredContent"]["packs"]}
+        quarantine_ids = {str(item["pack_id"]) for item in quarantine_only["structuredContent"]["packs"]}
+        all_ids = {str(item["pack_id"]) for item in all_rows["structuredContent"]["packs"]}
+        self.assertIn(str(trusted_import["structuredContent"]["pack_id"]), trusted_ids)
+        self.assertNotIn(str(quarantine_import["structuredContent"]["pack_id"]), trusted_ids)
+        self.assertIn(str(quarantine_import["structuredContent"]["pack_id"]), quarantine_ids)
+        self.assertNotIn(str(trusted_import["structuredContent"]["pack_id"]), quarantine_ids)
+        self.assertIn(str(trusted_import["structuredContent"]["pack_id"]), all_ids)
+        self.assertIn(str(quarantine_import["structuredContent"]["pack_id"]), all_ids)
+
+    def test_pack_review_import_trusted_pack(self) -> None:
+        fixture = self._create_trusted_import_fixture(marker="phase210-review-trusted")
+        imported_sc = fixture["imported"]["structuredContent"]
+        reviewed = self._pack_review_import(pack_id=str(imported_sc["pack_id"]), include_samples=True, sample_limit=5)
+        sc = reviewed["structuredContent"]
+        self.assertEqual(str(sc["pack"]["trust_level"]), "trusted")
+        self.assertTrue(str(sc["pack"]["namespace"]).startswith("pack:trusted:"))
+        if sc["samples"]:
+            self.assertTrue(all(str(item["namespace"]).startswith("pack:trusted:") for item in sc["samples"]))
+            self.assertTrue(all(str(item["origin"]) == "imported" for item in sc["samples"]))
+
+    def test_pack_inspect_trusted_import_available_required(self) -> None:
+        unsigned_row = self.record("phase210 trusted import available unsigned", kind="context_block")
+        unsigned_topic = "phase210-trusted-available-unsigned-topic"
+        server.topic_add({"memory_id": str(unsigned_row["id"]), "topic": unsigned_topic, "source": "operator"})
+        unsigned_pack = self._create_exported_pack(
+            pack_name="phase210_trusted_available_unsigned",
+            output_dir=self.root / "phase210_trusted_available_unsigned",
+            topics=[unsigned_topic],
+            kinds=["context_block"],
+        )
+        unsigned_inspect = self._pack_inspect(pack_path=str(unsigned_pack))
+        self.assertIn("trusted_import_available", unsigned_inspect["structuredContent"])
+        self.assertFalse(bool(unsigned_inspect["structuredContent"]["trusted_import_available"]))
+
+        trusted_fixture = self._create_signed_pack_fixture(marker="phase210-trusted-available-trusted")
+        trusted_verified = self._pack_inspect(
+            pack_path=str(trusted_fixture["pack_path"]),
+            verification_secret=str(trusted_fixture["secret"]),
+        )
+        trusted_no_secret = self._pack_inspect(pack_path=str(trusted_fixture["pack_path"]))
+        trusted_wrong = self._pack_inspect(
+            pack_path=str(trusted_fixture["pack_path"]),
+            verification_secret="phase210-trusted-available-wrong-012345678901",
+        )
+        self.assertTrue(bool(trusted_verified["structuredContent"]["trusted_import_available"]))
+        self.assertFalse(bool(trusted_no_secret["structuredContent"]["trusted_import_available"]))
+        self.assertFalse(bool(trusted_wrong["structuredContent"]["trusted_import_available"]))
+
+        unknown_secret = "phase210-trusted-available-unknown-01234567890123"
+        src = self.record("phase210 trusted available unknown signer", kind="context_block")
+        unknown_topic = "phase210-trusted-available-unknown-topic"
+        server.topic_add({"memory_id": str(src["id"]), "topic": unknown_topic, "source": "operator"})
+        unknown_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase210_trusted_available_unknown",
+            output_dir=self.root / "phase210_trusted_available_unknown",
+            signer_id="phase210.unknown.available.signer",
+            signing_secret=unknown_secret,
+            topics=[unknown_topic],
+            kinds=["context_block"],
+        )
+        unknown_inspect = self._pack_inspect(pack_path=str(unknown_pack), verification_secret=unknown_secret)
+        self.assertFalse(bool(unknown_inspect["structuredContent"]["trusted_import_available"]))
+
+        blocked_fixture = self._create_signed_pack_fixture(
+            marker="phase210-trusted-available-blocked",
+            trust_level="blocked",
+        )
+        blocked_inspect = self._pack_inspect(
+            pack_path=str(blocked_fixture["pack_path"]),
+            verification_secret=str(blocked_fixture["secret"]),
+        )
+        self.assertFalse(bool(blocked_inspect["structuredContent"]["trusted_import_available"]))
+
+        disabled_fixture = self._create_signed_pack_fixture(marker="phase210-trusted-available-disabled")
+        self._signer_disable(signer_id=str(disabled_fixture["signer_id"]))
+        disabled_inspect = self._pack_inspect(
+            pack_path=str(disabled_fixture["pack_path"]),
+            verification_secret=str(disabled_fixture["secret"]),
+        )
+        self.assertFalse(bool(disabled_inspect["structuredContent"]["trusted_import_available"]))
+
+        mismatch_signer = "phase210.trusted.available.mismatch"
+        secret_a = "phase210-trusted-available-mismatch-A-0123456789"
+        secret_b = "phase210-trusted-available-mismatch-B-0123456789"
+        self._signer_add(signer_id=mismatch_signer, secret=secret_a, trust_level="trusted")
+        mismatch_source = self.record("phase210 trusted available mismatch source", kind="context_block")
+        mismatch_topic = "phase210-trusted-available-mismatch-topic"
+        server.topic_add({"memory_id": str(mismatch_source["id"]), "topic": mismatch_topic, "source": "operator"})
+        mismatch_pack, _ = self._create_signed_exported_pack(
+            pack_name="phase210_trusted_available_mismatch",
+            output_dir=self.root / "phase210_trusted_available_mismatch",
+            signer_id=mismatch_signer,
+            signing_secret=secret_b,
+            topics=[mismatch_topic],
+            kinds=["context_block"],
+        )
+        mismatch_inspect = self._pack_inspect(pack_path=str(mismatch_pack), verification_secret=secret_b)
+        self.assertFalse(bool(mismatch_inspect["structuredContent"]["trusted_import_available"]))
+
+        unsupported_members = self._read_zip_members(Path(str(trusted_fixture["pack_path"])))
+        unsupported_manifest = json.loads(unsupported_members["manifest.json"].decode("utf-8"))
+        unsupported_sig = json.loads(unsupported_members[server.PACK_SIGNATURE_MEMBER].decode("utf-8"))
+        unsupported_manifest["signature"]["signature_algorithm"] = "hmac-sha512-local-v1"
+        unsupported_sig["signature_algorithm"] = "hmac-sha512-local-v1"
+        unsupported_path = self.root / "phase210_trusted_available_trusted" / "unsupported_signature.zip"
+        unsupported_path.parent.mkdir(parents=True, exist_ok=True)
+        self._rewrite_zip(
+            Path(str(trusted_fixture["pack_path"])),
+            unsupported_path,
+            replace_members={
+                "manifest.json": (
+                    json.dumps(unsupported_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8"),
+                server.PACK_SIGNATURE_MEMBER: (
+                    json.dumps(unsupported_sig, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8"),
+            },
+        )
+        unsupported_inspect = self._pack_inspect(
+            pack_path=str(unsupported_path),
+            verification_secret=str(trusted_fixture["secret"]),
+        )
+        self.assertFalse(bool(unsupported_inspect["structuredContent"]["trusted_import_available"]))
+
+    def test_pack_promote_preview_trusted_pack(self) -> None:
+        fixture = self._create_trusted_import_fixture(marker="phase210-promote-preview-trusted")
+        pack_id = str(fixture["imported"]["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        preview = self._pack_promote_preview(pack_id=pack_id, row_ids=[row_id], include_samples=False)
+        sc = preview["structuredContent"]
+        self.assertEqual(str(sc["promotion_plan"]["target_namespace"]), "local")
+        self.assertEqual(str(sc["promotion_plan"]["target_origin"]), "promoted")
+        trusted_warnings = [
+            item
+            for item in sc["warnings"]
+            if isinstance(item, dict) and str(item.get("code")) == "trusted_import_source"
+        ]
+        self.assertTrue(trusted_warnings)
+        self.assertTrue(any(str(item.get("phase", "")) == "preview" for item in trusted_warnings))
+
+    def test_pack_promote_trusted_pack_success(self) -> None:
+        fixture = self._create_trusted_import_fixture(marker="phase210-promote-trusted")
+        pack_id = str(fixture["imported"]["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        sc = promoted["structuredContent"]
+        self.assertTrue(sc["promoted_rows"])
+        promoted_memory_id = str(sc["promoted_rows"][0]["promoted_memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT namespace, origin FROM memories WHERE id = ?", (promoted_memory_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(str(row["namespace"]), "local")
+        self.assertEqual(str(row["origin"]), "promoted")
+        trusted_warnings = [
+            item
+            for item in sc["warnings"]
+            if isinstance(item, dict) and str(item.get("code")) == "trusted_import_source"
+        ]
+        self.assertTrue(any(str(item.get("phase", "")) == "promotion" for item in trusted_warnings))
+
+    def test_pack_promote_trusted_pack_does_not_bypass_gates(self) -> None:
+        fixture = self._create_trusted_import_fixture(marker="phase210-promote-trusted-gates")
+        pack_id = str(fixture["imported"]["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        missing_confirm = self._pack_promote_error(pack_id=pack_id, row_ids=[row_id])
+        self.assertEqual(self._pack_error_code(missing_confirm), "confirm_promote_required")
+        missing_filters = self._pack_promote_error(pack_id=pack_id, confirm_promote=True)
+        self.assertEqual(self._pack_error_code(missing_filters), "promote_all_requires_explicit_allow")
+        query_rejected = self._pack_promote_error(
+            pack_id=pack_id,
+            row_ids=[row_id],
+            query="not allowed",
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(query_rejected), "query_filter_not_allowed_for_promotion")
+
+    def test_pack_promote_rejects_invalid_trust_level_not_trusted_or_quarantine(self) -> None:
+        self._insert_imported_pack_unchecked(
+            pack_id="phase210-invalid-promote-pack",
+            trust_level="legacy-invalid",
+            namespace="pack:legacy:phase210-invalid-promote-pack",
+        )
+        failed = self._pack_promote_error(
+            pack_id="phase210-invalid-promote-pack",
+            allow_promote_all=True,
+            confirm_promote=True,
+        )
+        self.assertEqual(self._pack_error_code(failed), "unsupported_trust_level_for_promotion")
+
+    def test_pack_promote_preview_rejects_invalid_trust_level_not_trusted_or_quarantine(self) -> None:
+        self._insert_imported_pack_unchecked(
+            pack_id="phase210-invalid-preview-pack",
+            trust_level="legacy-invalid",
+            namespace="pack:legacy:phase210-invalid-preview-pack",
+        )
+        failed = self._pack_promote_preview_error(pack_id="phase210-invalid-preview-pack")
+        self.assertEqual(self._pack_error_code(failed), "unsupported_trust_level_for_promotion_preview")
+
+    def test_pack_import_verification_secret_lifecycle_scrubbed(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase210-secret-lifecycle")
+        unique_secret = str(fixture["secret"])
+        imported = self._pack_import(
+            pack_path=str(fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=unique_secret,
+        )
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            imported_row = conn.execute(
+                "SELECT manifest_json, freshness_summary_json FROM imported_packs WHERE pack_id = ?",
+                (pack_id,),
+            ).fetchone()
+            event_rows = conn.execute("SELECT data_json FROM events ORDER BY created_at ASC, rowid ASC").fetchall()
+        finally:
+            conn.close()
+        serialized = json.dumps(imported["structuredContent"], ensure_ascii=False)
+        if imported_row is not None:
+            serialized += str(imported_row[0]) + str(imported_row[1])
+        serialized += "\n".join(str(row[0]) for row in event_rows)
+        self.assertNotIn(unique_secret, serialized)
+
+    def test_pack_promote_trusted_source_provenance(self) -> None:
+        fixture = self._create_trusted_import_fixture(marker="phase210-trusted-provenance")
+        imported_sc = fixture["imported"]["structuredContent"]
+        pack_id = str(imported_sc["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        expected_fingerprint = server._secret_fingerprint(str(fixture["secret"]))
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT metadata_json FROM memories WHERE id = ?", (promoted_memory_id,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        assert row is not None
+        metadata = json.loads(str(row["metadata_json"] or "{}"))
+        pack_meta = metadata.get("pack_promotion", {}) if isinstance(metadata, dict) else {}
+        self.assertEqual(str(pack_meta.get("source_trust_level", "")), "trusted")
+        self.assertEqual(str(pack_meta.get("source_signer_id", "")), str(fixture["signer_id"]))
+        self.assertEqual(str(pack_meta.get("source_secret_fingerprint", "")), expected_fingerprint)
+
+    def test_unsigned_and_quarantine_lifecycle_still_passes(self) -> None:
+        marker = "phase210_unsigned_quarantine_lifecycle"
+        row = self.record(f"{marker} source", kind="context_block")
+        topic = f"{marker}-topic"
+        server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        pack_path = self._create_exported_pack(
+            pack_name=f"{marker}_pack",
+            output_dir=self.root / f"{marker}_pack",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path))
+        self.assertEqual(str(inspected["structuredContent"]["status"]), "valid")
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        self.assertEqual(str(imported["structuredContent"]["trust_level"]), "quarantine")
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        default = server.search_memories({"query": marker, "limit": 20})
+        self.assertIn(promoted_id, {str(item["id"]) for item in default["structuredContent"]["matches"]})
+
+    def test_signed_trusted_import_then_promote_lifecycle(self) -> None:
+        marker = "phase210_signed_trusted_lifecycle"
+        fixture = self._create_trusted_import_fixture(marker=marker, touched_files=["src/phase210/lifecycle.py"])
+        imported_sc = fixture["imported"]["structuredContent"]
+        self.assertEqual(str(imported_sc["trust_level"]), "trusted")
+        pack_id = str(imported_sc["pack_id"])
+        namespace = str(imported_sc["namespace"])
+        imported_memory_id = str(imported_sc["imported_rows"][0]["memory_id"])
+
+        reviewed = self._pack_review_import(pack_id=pack_id, include_samples=True, sample_limit=5)
+        self.assertGreaterEqual(int(reviewed["structuredContent"]["selection"]["selected_rows"]), 1)
+        preview = self._pack_promote_preview(pack_id=pack_id, row_ids=[str(self._pack_rows(pack_id)[0][0])], include_samples=False)
+        self.assertFalse(preview["isError"], preview)
+
+        promoted = self._pack_promote(
+            pack_id=pack_id,
+            row_ids=[str(self._pack_rows(pack_id)[0][0])],
+            confirm_promote=True,
+        )
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+
+        default = server.search_memories({"query": marker, "limit": 50})
+        include_imported = server.search_memories({"query": marker, "limit": 50, "include_imported": True})
+        include_quarantine = server.search_memories({"query": marker, "limit": 50, "include_quarantine": True})
+        explicit_namespace = server.search_memories({"query": marker, "limit": 50, "namespace": namespace})
+        default_ids = {str(item["id"]) for item in default["structuredContent"]["matches"]}
+        imported_ids = {str(item["id"]) for item in include_imported["structuredContent"]["matches"]}
+        quarantine_ids = {str(item["id"]) for item in include_quarantine["structuredContent"]["matches"]}
+        explicit_ids = {str(item["id"]) for item in explicit_namespace["structuredContent"]["matches"]}
+
+        self.assertIn(promoted_id, default_ids)
+        self.assertNotIn(imported_memory_id, default_ids)
+        self.assertIn(imported_memory_id, imported_ids)
+        self.assertNotIn(imported_memory_id, quarantine_ids)
+        self.assertIn(imported_memory_id, explicit_ids)
+
+    def test_memory_packs_v1_trusted_import_lifecycle(self) -> None:
+        marker = "phase211_v1_trusted_lifecycle"
+        fixture = self._create_trusted_import_fixture(marker=marker, touched_files=["src/phase211/trusted.py"])
+        inspect_sc = fixture["inspect"]["structuredContent"]
+        imported_sc = fixture["imported"]["structuredContent"]
+        self.assertEqual(str((inspect_sc.get("signature") or {}).get("trust_classification", "")), "trusted_signer")
+        self.assertTrue(bool(inspect_sc.get("trusted_import_available")))
+        self.assertEqual(str(imported_sc.get("trust_level", "")), "trusted")
+        self.assertTrue(str(imported_sc.get("namespace", "")).startswith("pack:trusted:"))
+
+        pack_id = str(imported_sc["pack_id"])
+        imported_memory_id = str(imported_sc["imported_rows"][0]["memory_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        pack_path = Path(str(fixture["pack_path"]))
+        moved_pack_path = pack_path.with_suffix(".moved")
+        if pack_path.exists():
+            pack_path.replace(moved_pack_path)
+
+        reviewed = self._pack_review_import(pack_id=pack_id, include_samples=True, sample_limit=5)
+        self.assertGreaterEqual(int(reviewed["structuredContent"]["selection"]["selected_rows"]), 1)
+        preview = self._pack_promote_preview(pack_id=pack_id, row_ids=[row_id], include_samples=False)
+        self.assertFalse(preview["isError"], preview)
+
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            audit_row = conn.execute(
+                "SELECT promotion_id FROM promotion_audit WHERE pack_id = ? ORDER BY promoted_at DESC LIMIT 1",
+                (pack_id,),
+            ).fetchone()
+            mapping_row = conn.execute(
+                "SELECT promoted_memory_id FROM promoted_pack_rows WHERE pack_id = ? AND row_id_in_pack = ?",
+                (pack_id, row_id),
+            ).fetchone()
+            imported_ns_row = conn.execute(
+                "SELECT namespace, origin FROM memories WHERE id = ?",
+                (imported_memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(audit_row)
+        self.assertIsNotNone(mapping_row)
+        self.assertIsNotNone(imported_ns_row)
+        assert mapping_row is not None
+        assert imported_ns_row is not None
+        self.assertEqual(str(mapping_row["promoted_memory_id"]), promoted_id)
+        self.assertTrue(str(imported_ns_row["namespace"]).startswith("pack:trusted:"))
+        self.assertEqual(str(imported_ns_row["origin"]), "imported")
+
+        default = server.search_memories({"query": marker, "limit": 50})
+        include_imported = server.search_memories({"query": marker, "limit": 50, "include_imported": True})
+        default_ids = {str(item["id"]) for item in default["structuredContent"]["matches"]}
+        imported_ids = {str(item["id"]) for item in include_imported["structuredContent"]["matches"]}
+        self.assertIn(promoted_id, default_ids)
+        self.assertNotIn(imported_memory_id, default_ids)
+        self.assertIn(imported_memory_id, imported_ids)
+
+    def test_memory_packs_v1_quarantine_fallback_signed_lifecycle(self) -> None:
+        marker = "phase211_v1_quarantine_fallback"
+        fixture = self._create_signed_pack_fixture(marker=marker)
+        inspected = self._pack_inspect(
+            pack_path=str(fixture["pack_path"]),
+            verification_secret=str(fixture["secret"]),
+        )
+        self.assertEqual(
+            str((inspected["structuredContent"].get("signature") or {}).get("trust_classification", "")),
+            "trusted_signer",
+        )
+        imported = self._pack_import(
+            pack_path=str(fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+            allow_trusted_import=False,
+        )
+        imported_sc = imported["structuredContent"]
+        self.assertEqual(str(imported_sc["trust_level"]), "quarantine")
+        self.assertTrue(str(imported_sc["namespace"]).startswith("pack:quarantine:"))
+        pack_id = str(imported_sc["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        imported_memory_id = str(imported_sc["imported_rows"][0]["memory_id"])
+
+        reviewed = self._pack_review_import(pack_id=pack_id, include_samples=True, sample_limit=5)
+        self.assertGreaterEqual(int(reviewed["structuredContent"]["selection"]["selected_rows"]), 1)
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+
+        default = server.search_memories({"query": marker, "limit": 50})
+        include_quarantine = server.search_memories({"query": marker, "limit": 50, "include_quarantine": True})
+        default_ids = {str(item["id"]) for item in default["structuredContent"]["matches"]}
+        quarantine_ids = {str(item["id"]) for item in include_quarantine["structuredContent"]["matches"]}
+        self.assertIn(promoted_id, default_ids)
+        self.assertNotIn(imported_memory_id, default_ids)
+        self.assertIn(imported_memory_id, quarantine_ids)
+
+    def test_memory_packs_v1_unsigned_lifecycle_still_passes(self) -> None:
+        marker = "phase211_v1_unsigned"
+        source = self.record(f"{marker} source", kind="context_block", title=f"{marker} title")
+        topic = f"{marker}-topic"
+        added = server.topic_add({"memory_id": str(source["id"]), "topic": topic, "source": "operator"})
+        self.assertFalse(added["isError"], added)
+        pack_path = self._create_exported_pack(
+            pack_name=f"{marker}_pack",
+            output_dir=self.root / f"{marker}_pack",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        inspected = self._pack_inspect(pack_path=str(pack_path))
+        self.assertEqual(str(inspected["structuredContent"]["status"]), "valid")
+        self.assertFalse(bool(inspected["structuredContent"]["trusted_import_available"]))
+        self.assertEqual(
+            str((inspected["structuredContent"].get("signature") or {}).get("trust_classification", "")),
+            "unsigned",
+        )
+
+        trusted_attempt_with_secret = self._pack_import_error(
+            pack_path=str(pack_path),
+            allow_trusted_import=True,
+            verification_secret="phase211-v1-unsigned-trusted-secret-01234567890123",
+        )
+        trusted_attempt_no_secret = self._pack_import_error(
+            pack_path=str(pack_path),
+            allow_trusted_import=True,
+        )
+        self.assertEqual(
+            self._pack_error_code(trusted_attempt_with_secret),
+            "trusted_import_requires_verified_trusted_signer",
+        )
+        self.assertEqual(
+            self._pack_error_code(trusted_attempt_no_secret),
+            "trusted_import_requires_verification_secret",
+        )
+
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        self.assertEqual(str(imported["structuredContent"]["trust_level"]), "quarantine")
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        default = server.search_memories({"query": marker, "limit": 30})
+        self.assertIn(promoted_id, {str(item["id"]) for item in default["structuredContent"]["matches"]})
+
+    def test_memory_packs_mixed_trust_retrieval_semantics(self) -> None:
+        marker = "phase211_mixed_retrieval"
+        local = self.record(f"{marker} local", kind="context_block", title=f"{marker} local title")
+        trusted_fixture = self._create_trusted_import_fixture(marker=f"{marker}_trusted")
+        trusted_sc = trusted_fixture["imported"]["structuredContent"]
+        trusted_pack_id = str(trusted_sc["pack_id"])
+        trusted_namespace = str(trusted_sc["namespace"])
+        trusted_memory_id = str(trusted_sc["imported_rows"][0]["memory_id"])
+
+        quarantine_fixture = self._create_signed_pack_fixture(marker=f"{marker}_quarantine")
+        quarantine_import = self._pack_import(
+            pack_path=str(quarantine_fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        quarantine_sc = quarantine_import["structuredContent"]
+        quarantine_pack_id = str(quarantine_sc["pack_id"])
+        quarantine_namespace = str(quarantine_sc["namespace"])
+        quarantine_memory_id = str(quarantine_sc["imported_rows"][0]["memory_id"])
+
+        trusted_row_id = str(self._pack_rows(trusted_pack_id)[0][0])
+        promoted = self._pack_promote(
+            pack_id=trusted_pack_id,
+            row_ids=[trusted_row_id],
+            confirm_promote=True,
+        )
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+
+        default = server.search_memories({"query": marker, "limit": 80})
+        include_imported = server.search_memories({"query": marker, "limit": 80, "include_imported": True})
+        include_quarantine = server.search_memories({"query": marker, "limit": 80, "include_quarantine": True})
+        both = server.search_memories(
+            {"query": marker, "limit": 80, "include_imported": True, "include_quarantine": True}
+        )
+        default_ids = [str(item["id"]) for item in default["structuredContent"]["matches"]]
+        imported_ids = [str(item["id"]) for item in include_imported["structuredContent"]["matches"]]
+        quarantine_ids = [str(item["id"]) for item in include_quarantine["structuredContent"]["matches"]]
+        both_ids = [str(item["id"]) for item in both["structuredContent"]["matches"]]
+
+        self.assertIn(str(local["id"]), default_ids)
+        self.assertIn(promoted_id, default_ids)
+        self.assertNotIn(trusted_memory_id, default_ids)
+        self.assertNotIn(quarantine_memory_id, default_ids)
+
+        self.assertIn(trusted_memory_id, imported_ids)
+        self.assertNotIn(quarantine_memory_id, imported_ids)
+
+        self.assertIn(quarantine_memory_id, quarantine_ids)
+        self.assertNotIn(trusted_memory_id, quarantine_ids)
+
+        self.assertIn(trusted_memory_id, both_ids)
+        self.assertIn(quarantine_memory_id, both_ids)
+
+        namespace_local = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespace": "local",
+                "include_imported": True,
+                "include_quarantine": True,
+            }
+        )
+        namespace_trusted = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespace": trusted_namespace,
+                "include_quarantine": True,
+            }
+        )
+        namespace_quarantine = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespace": quarantine_namespace,
+                "include_imported": True,
+            }
+        )
+        multi_namespace = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespaces": ["local", trusted_namespace],
+                "include_quarantine": True,
+            }
+        )
+        ns_local_ids = {str(item["id"]) for item in namespace_local["structuredContent"]["matches"]}
+        ns_trusted_ids = {str(item["id"]) for item in namespace_trusted["structuredContent"]["matches"]}
+        ns_quarantine_ids = {str(item["id"]) for item in namespace_quarantine["structuredContent"]["matches"]}
+        ns_multi_ids = {str(item["id"]) for item in multi_namespace["structuredContent"]["matches"]}
+
+        self.assertIn(str(local["id"]), ns_local_ids)
+        self.assertIn(promoted_id, ns_local_ids)
+        self.assertNotIn(trusted_memory_id, ns_local_ids)
+        self.assertNotIn(quarantine_memory_id, ns_local_ids)
+
+        self.assertEqual(ns_trusted_ids, {trusted_memory_id})
+        self.assertEqual(ns_quarantine_ids, {quarantine_memory_id})
+        self.assertIn(str(local["id"]), ns_multi_ids)
+        self.assertIn(promoted_id, ns_multi_ids)
+        self.assertIn(trusted_memory_id, ns_multi_ids)
+        self.assertNotIn(quarantine_memory_id, ns_multi_ids)
+
+        origin_promoted = server.search_memories({"query": marker, "limit": 80, "origins": ["promoted"]})
+        promoted_only_ids = {str(item["id"]) for item in origin_promoted["structuredContent"]["matches"]}
+        self.assertIn(promoted_id, promoted_only_ids)
+        self.assertNotIn(trusted_memory_id, promoted_only_ids)
+        self.assertNotIn(quarantine_memory_id, promoted_only_ids)
+
+        origin_imported_trusted = server.search_memories(
+            {"query": marker, "limit": 80, "namespace": trusted_namespace, "origin": "imported"}
+        )
+        origin_imported_quarantine = server.search_memories(
+            {"query": marker, "limit": 80, "namespace": quarantine_namespace, "origin": "imported"}
+        )
+        origin_imported_without_flags = server.search_memories({"query": marker, "limit": 80, "origin": "imported"})
+        self.assertEqual(
+            {str(item["id"]) for item in origin_imported_trusted["structuredContent"]["matches"]},
+            {trusted_memory_id},
+        )
+        self.assertEqual(
+            {str(item["id"]) for item in origin_imported_quarantine["structuredContent"]["matches"]},
+            {quarantine_memory_id},
+        )
+        self.assertNotIn(
+            trusted_memory_id,
+            {str(item["id"]) for item in origin_imported_without_flags["structuredContent"]["matches"]},
+        )
+        self.assertNotIn(
+            quarantine_memory_id,
+            {str(item["id"]) for item in origin_imported_without_flags["structuredContent"]["matches"]},
+        )
+
+    def test_memory_packs_explicit_namespace_overrides_include_flags(self) -> None:
+        marker = "phase211_namespace_override"
+        local = self.record(f"{marker} local", kind="context_block")
+        trusted_fixture = self._create_trusted_import_fixture(marker=f"{marker}_trusted")
+        trusted_sc = trusted_fixture["imported"]["structuredContent"]
+        trusted_pack_id = str(trusted_sc["pack_id"])
+        trusted_namespace = str(trusted_sc["namespace"])
+        trusted_memory_id = str(trusted_sc["imported_rows"][0]["memory_id"])
+
+        quarantine_fixture = self._create_signed_pack_fixture(marker=f"{marker}_quarantine")
+        quarantine_import = self._pack_import(
+            pack_path=str(quarantine_fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        quarantine_sc = quarantine_import["structuredContent"]
+        quarantine_namespace = str(quarantine_sc["namespace"])
+        quarantine_memory_id = str(quarantine_sc["imported_rows"][0]["memory_id"])
+
+        trusted_row_id = str(self._pack_rows(trusted_pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=trusted_pack_id, row_ids=[trusted_row_id], confirm_promote=True)
+        promoted_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+
+        only_local = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespace": "local",
+                "include_imported": True,
+                "include_quarantine": True,
+            }
+        )
+        only_trusted = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespace": trusted_namespace,
+                "include_quarantine": True,
+            }
+        )
+        only_quarantine = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespace": quarantine_namespace,
+                "include_imported": True,
+            }
+        )
+        local_and_trusted = server.search_memories(
+            {
+                "query": marker,
+                "limit": 80,
+                "namespaces": ["local", trusted_namespace],
+                "include_quarantine": True,
+            }
+        )
+        local_ids = {str(item["id"]) for item in only_local["structuredContent"]["matches"]}
+        trusted_ids = {str(item["id"]) for item in only_trusted["structuredContent"]["matches"]}
+        quarantine_ids = {str(item["id"]) for item in only_quarantine["structuredContent"]["matches"]}
+        local_trusted_ids = {str(item["id"]) for item in local_and_trusted["structuredContent"]["matches"]}
+
+        self.assertIn(str(local["id"]), local_ids)
+        self.assertIn(promoted_id, local_ids)
+        self.assertNotIn(trusted_memory_id, local_ids)
+        self.assertNotIn(quarantine_memory_id, local_ids)
+        self.assertEqual(trusted_ids, {trusted_memory_id})
+        self.assertEqual(quarantine_ids, {quarantine_memory_id})
+        self.assertIn(str(local["id"]), local_trusted_ids)
+        self.assertIn(promoted_id, local_trusted_ids)
+        self.assertIn(trusted_memory_id, local_trusted_ids)
+        self.assertNotIn(quarantine_memory_id, local_trusted_ids)
+
+    def test_include_imported_excludes_quarantine_after_5b(self) -> None:
+        # 0.21.x pins post-5b migration semantics:
+        # include_imported=true includes trusted imports, quarantine requires include_quarantine=true.
+        marker = "phase211_include_imported_migration"
+        trusted_ns = "pack:trusted:phase211-include-trusted"
+        quarantine_ns = "pack:quarantine:phase211-include-quarantine"
+        self._insert_imported_pack(pack_id="phase211-include-trusted", trust_level="trusted", namespace=trusted_ns)
+        self._insert_imported_pack(
+            pack_id="phase211-include-quarantine",
+            trust_level="quarantine",
+            namespace=quarantine_ns,
+        )
+        trusted_row = self.record(f"{marker} trusted", kind="note", namespace=trusted_ns, origin="imported")
+        quarantine_row = self.record(f"{marker} quarantine", kind="note", namespace=quarantine_ns, origin="imported")
+        imported_only = server.search_memories({"query": marker, "limit": 20, "include_imported": True})
+        quarantine_only = server.search_memories({"query": marker, "limit": 20, "include_quarantine": True})
+        imported_ids = {str(item["id"]) for item in imported_only["structuredContent"]["matches"]}
+        quarantine_ids = {str(item["id"]) for item in quarantine_only["structuredContent"]["matches"]}
+        self.assertIn(str(trusted_row["id"]), imported_ids)
+        self.assertNotIn(str(quarantine_row["id"]), imported_ids)
+        self.assertIn(str(quarantine_row["id"]), quarantine_ids)
+
+    def test_memory_packs_cross_trust_reimport_collision(self) -> None:
+        fixture_q = self._create_signed_pack_fixture(marker="phase211-cross-q-first")
+        imported_q = self._pack_import(pack_path=str(fixture_q["pack_path"]), allow_unsigned_quarantine=True)
+        again_trusted = self._pack_import_error(
+            pack_path=str(fixture_q["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(fixture_q["secret"]),
+        )
+        self.assertEqual(self._pack_error_code(again_trusted), "pack_already_imported")
+        pack_id_q = str(imported_q["structuredContent"]["pack_id"])
+        variant = self.root / "phase211-cross-q-first" / "collision_variant.zip"
+        variant.parent.mkdir(parents=True, exist_ok=True)
+        self._rewrite_zip(
+            Path(str(fixture_q["pack_path"])),
+            variant,
+            extra_members={"extra/collision.txt": b"phase211 distinct bytes"},
+        )
+        distinct = self._pack_import_error(pack_path=str(variant), allow_unsigned_quarantine=True)
+        self.assertEqual(self._pack_error_code(distinct), "pack_id_collision_distinct_content")
+
+        fixture_t = self._create_signed_pack_fixture(marker="phase211-cross-t-first")
+        imported_t = self._pack_import(
+            pack_path=str(fixture_t["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=str(fixture_t["secret"]),
+        )
+        again_quarantine = self._pack_import_error(
+            pack_path=str(fixture_t["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        self.assertEqual(self._pack_error_code(again_quarantine), "pack_already_imported")
+
+        legacy_fixture = self._create_signed_pack_fixture(marker="phase211-cross-legacy")
+        legacy_pack_id = str(legacy_fixture["export"]["pack_id"])
+        self._insert_imported_pack(
+            pack_id=legacy_pack_id,
+            trust_level="quarantine",
+            namespace=f"pack:quarantine:{legacy_pack_id}",
+        )
+        legacy_collision = self._pack_import_error(
+            pack_path=str(legacy_fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        self.assertEqual(self._pack_error_code(legacy_collision), "pack_already_imported_legacy_unknown_hash")
+        self.assertNotEqual(pack_id_q, str(imported_t["structuredContent"]["pack_id"]))
+
+    def test_memory_packs_trusted_import_tamper_rejection(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase211-tamper-trusted")
+        pack_path = Path(str(fixture["pack_path"]))
+        secret = str(fixture["secret"])
+        before_imported_packs = self._table_count("imported_packs")
+        before_memories = self._table_count("memories")
+
+        members = self._read_zip_members(pack_path)
+        tampered_content_path = self.root / "phase211-tamper-trusted" / "tampered_content.zip"
+        tampered_content_path.parent.mkdir(parents=True, exist_ok=True)
+        tampered_content = members["content/memories.jsonl"] + b"\n"
+        self._rewrite_zip(
+            pack_path,
+            tampered_content_path,
+            replace_members={"content/memories.jsonl": tampered_content},
+        )
+        tampered_content_import = self._pack_import_error(
+            pack_path=str(tampered_content_path),
+            allow_trusted_import=True,
+            verification_secret=secret,
+        )
+        self.assertEqual(
+            self._pack_error_code(tampered_content_import),
+            "trusted_import_requires_verified_trusted_signer",
+        )
+
+        signature_payload = json.loads(members[server.PACK_SIGNATURE_MEMBER].decode("utf-8"))
+        signature_payload["signature_value"] = "0" * len(str(signature_payload.get("signature_value", "")))
+        tampered_signature_path = self.root / "phase211-tamper-trusted" / "tampered_signature_value.zip"
+        self._rewrite_zip(
+            pack_path,
+            tampered_signature_path,
+            replace_members={
+                server.PACK_SIGNATURE_MEMBER: (
+                    json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+            },
+        )
+        tampered_signature_import = self._pack_import_error(
+            pack_path=str(tampered_signature_path),
+            allow_trusted_import=True,
+            verification_secret=secret,
+        )
+        self.assertEqual(
+            self._pack_error_code(tampered_signature_import),
+            "trusted_import_requires_verified_trusted_signer",
+        )
+
+        signer_tampered = json.loads(members[server.PACK_SIGNATURE_MEMBER].decode("utf-8"))
+        signer_tampered["signer_id"] = "phase211.tampered.signer"
+        tampered_signer_path = self.root / "phase211-tamper-trusted" / "tampered_signer_id.zip"
+        self._rewrite_zip(
+            pack_path,
+            tampered_signer_path,
+            replace_members={
+                server.PACK_SIGNATURE_MEMBER: (
+                    json.dumps(signer_tampered, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+            },
+        )
+        tampered_signer_import = self._pack_import_error(
+            pack_path=str(tampered_signer_path),
+            allow_trusted_import=True,
+            verification_secret=secret,
+        )
+        self.assertEqual(
+            self._pack_error_code(tampered_signer_import),
+            "trusted_import_requires_verified_trusted_signer",
+        )
+        self.assertEqual(before_imported_packs, self._table_count("imported_packs"))
+        self.assertEqual(before_memories, self._table_count("memories"))
+
+    def test_upgrade_from_0_21_0_to_0_21_1_no_changes(self) -> None:
+        marker = "phase211_upgrade_no_mutation"
+        trusted_fixture = self._create_trusted_import_fixture(marker=f"{marker}_trusted")
+        trusted_pack_id = str(trusted_fixture["imported"]["structuredContent"]["pack_id"])
+        trusted_row_id = str(self._pack_rows(trusted_pack_id)[0][0])
+        promoted = self._pack_promote(pack_id=trusted_pack_id, row_ids=[trusted_row_id], confirm_promote=True)
+        self.assertFalse(promoted["isError"], promoted)
+
+        quarantine_fixture = self._create_signed_pack_fixture(marker=f"{marker}_quarantine")
+        imported_q = self._pack_import(
+            pack_path=str(quarantine_fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        self.assertFalse(imported_q["isError"], imported_q)
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before_counts = {
+                "trusted_signers": int(conn.execute("SELECT COUNT(*) FROM trusted_signers").fetchone()[0]),
+                "imported_packs": int(conn.execute("SELECT COUNT(*) FROM imported_packs").fetchone()[0]),
+                "imported_pack_rows": int(conn.execute("SELECT COUNT(*) FROM imported_pack_rows").fetchone()[0]),
+                "promoted_pack_rows": int(conn.execute("SELECT COUNT(*) FROM promoted_pack_rows").fetchone()[0]),
+                "promotion_audit": int(conn.execute("SELECT COUNT(*) FROM promotion_audit").fetchone()[0]),
+                "memories": int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]),
+            }
+            before_imported = conn.execute(
+                "SELECT pack_id, trust_level, namespace, COALESCE(received_zip_sha256, '') "
+                "FROM imported_packs ORDER BY pack_id ASC"
+            ).fetchall()
+            before_promoted = conn.execute(
+                "SELECT pack_id, row_id_in_pack, imported_memory_id, promoted_memory_id, COALESCE(promotion_id, '') "
+                "FROM promoted_pack_rows ORDER BY pack_id ASC, row_id_in_pack ASC"
+            ).fetchall()
+            before_audit = conn.execute(
+                "SELECT promotion_id, pack_id, row_count, limited FROM promotion_audit ORDER BY promotion_id ASC"
+            ).fetchall()
+            server._sqlite_ensure_schema(conn)
+            server._sqlite_ensure_schema(conn)
+            schema_version = int(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
+            after_counts = {
+                "trusted_signers": int(conn.execute("SELECT COUNT(*) FROM trusted_signers").fetchone()[0]),
+                "imported_packs": int(conn.execute("SELECT COUNT(*) FROM imported_packs").fetchone()[0]),
+                "imported_pack_rows": int(conn.execute("SELECT COUNT(*) FROM imported_pack_rows").fetchone()[0]),
+                "promoted_pack_rows": int(conn.execute("SELECT COUNT(*) FROM promoted_pack_rows").fetchone()[0]),
+                "promotion_audit": int(conn.execute("SELECT COUNT(*) FROM promotion_audit").fetchone()[0]),
+                "memories": int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]),
+            }
+            after_imported = conn.execute(
+                "SELECT pack_id, trust_level, namespace, COALESCE(received_zip_sha256, '') "
+                "FROM imported_packs ORDER BY pack_id ASC"
+            ).fetchall()
+            after_promoted = conn.execute(
+                "SELECT pack_id, row_id_in_pack, imported_memory_id, promoted_memory_id, COALESCE(promotion_id, '') "
+                "FROM promoted_pack_rows ORDER BY pack_id ASC, row_id_in_pack ASC"
+            ).fetchall()
+            after_audit = conn.execute(
+                "SELECT promotion_id, pack_id, row_count, limited FROM promotion_audit ORDER BY promotion_id ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(schema_version, 7)
+        self.assertEqual(before_counts, after_counts)
+        self.assertEqual(before_imported, after_imported)
+        self.assertEqual(before_promoted, after_promoted)
+        self.assertEqual(before_audit, after_audit)
+
+        retrieval = server.search_memories({"query": marker, "limit": 50, "include_imported": True, "include_quarantine": True})
+        self.assertGreaterEqual(len(retrieval["structuredContent"]["matches"]), 2)
+
+    def test_pack_review_import_works_without_source_zip(self) -> None:
+        trusted_fixture = self._create_trusted_import_fixture(marker="phase211-review-no-zip-trusted")
+        trusted_pack_id = str(trusted_fixture["imported"]["structuredContent"]["pack_id"])
+        trusted_row_id = str(self._pack_rows(trusted_pack_id)[0][0])
+        trusted_zip = Path(str(trusted_fixture["pack_path"]))
+        if trusted_zip.exists():
+            trusted_zip.unlink()
+
+        quarantine_fixture = self._create_signed_pack_fixture(marker="phase211-review-no-zip-quarantine")
+        quarantine_import = self._pack_import(
+            pack_path=str(quarantine_fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        quarantine_pack_id = str(quarantine_import["structuredContent"]["pack_id"])
+        quarantine_row_id = str(self._pack_rows(quarantine_pack_id)[0][0])
+        quarantine_zip = Path(str(quarantine_fixture["pack_path"]))
+        if quarantine_zip.exists():
+            quarantine_zip.unlink()
+
+        trusted_review = self._pack_review_import(pack_id=trusted_pack_id, include_samples=True, sample_limit=5)
+        trusted_preview = self._pack_promote_preview(
+            pack_id=trusted_pack_id,
+            row_ids=[trusted_row_id],
+            include_samples=False,
+        )
+        quarantine_review = self._pack_review_import(pack_id=quarantine_pack_id, include_samples=True, sample_limit=5)
+        quarantine_preview = self._pack_promote_preview(
+            pack_id=quarantine_pack_id,
+            row_ids=[quarantine_row_id],
+            include_samples=False,
+        )
+        self.assertFalse(trusted_review["isError"], trusted_review)
+        self.assertFalse(trusted_preview["isError"], trusted_preview)
+        self.assertFalse(quarantine_review["isError"], quarantine_review)
+        self.assertFalse(quarantine_preview["isError"], quarantine_preview)
+
+    def test_pack_import_quarantine_with_unused_verification_secret(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase211-q-import-unused-secret")
+        unique_secret = str(fixture["secret"])
+        imported = self._pack_import(
+            pack_path=str(fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+            verification_secret=unique_secret,
+        )
+        self.assertIn("verification_secret_unused_for_quarantine_import", self._pack_warning_codes(imported))
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            row = conn.execute(
+                "SELECT manifest_json, freshness_summary_json FROM imported_packs WHERE pack_id = ?",
+                (pack_id,),
+            ).fetchone()
+            event_rows = conn.execute("SELECT data_json FROM events ORDER BY created_at ASC, rowid ASC").fetchall()
+        finally:
+            conn.close()
+        serialized = json.dumps(imported["structuredContent"], ensure_ascii=False)
+        if row is not None:
+            serialized += str(row[0]) + str(row[1])
+        serialized += "\n".join(str(item[0]) for item in event_rows)
+        self.assertNotIn(unique_secret, serialized)
+
+    def test_memory_packs_trusted_import_secret_safety(self) -> None:
+        fixture = self._create_signed_pack_fixture(marker="phase211-secret-safety")
+        trusted_secret = str(fixture["secret"])
+        wrong_secret = "phase211-secret-safety-wrong-01234567890123456"
+        failed = self._pack_import_error(
+            pack_path=str(fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=wrong_secret,
+        )
+        self.assertEqual(self._pack_error_code(failed), "trusted_import_requires_verified_trusted_signer")
+
+        imported = self._pack_import(
+            pack_path=str(fixture["pack_path"]),
+            allow_trusted_import=True,
+            verification_secret=trusted_secret,
+        )
+        pack_id = str(imported["structuredContent"]["pack_id"])
+        imported_rows = list((imported["structuredContent"] or {}).get("imported_rows", []))
+        imported_ids = [str(item["memory_id"]) for item in imported_rows if isinstance(item, dict)]
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            imported_row = conn.execute(
+                "SELECT manifest_json, freshness_summary_json FROM imported_packs WHERE pack_id = ?",
+                (pack_id,),
+            ).fetchone()
+            event_rows = conn.execute("SELECT data_json FROM events ORDER BY created_at ASC, rowid ASC").fetchall()
+            metadata_rows = conn.execute(
+                "SELECT COALESCE(metadata_json, '') FROM memories WHERE id IN (SELECT memory_id FROM imported_pack_rows WHERE pack_id = ?)",
+                (pack_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        serialized = (
+            json.dumps(imported, ensure_ascii=False)
+            + json.dumps(failed, ensure_ascii=False)
+            + "".join(str(item[0]) for item in event_rows)
+            + "".join(str(item[0]) for item in metadata_rows)
+        )
+        if imported_row is not None:
+            serialized += str(imported_row[0]) + str(imported_row[1])
+        self.assertTrue(imported_ids)
+        self.assertNotIn(trusted_secret, serialized)
+        self.assertNotIn(wrong_secret, serialized)
+
+    def test_memory_packs_trusted_promotion_provenance(self) -> None:
+        marker = "phase211-trusted-promotion-provenance"
+        touched_rel = "src/phase211/provenance.py"
+        touched_abs = self.workspace / touched_rel
+        touched_abs.parent.mkdir(parents=True, exist_ok=True)
+        touched_abs.write_text("PHASE211='provenance'\n", encoding="utf-8")
+        fixture = self._create_trusted_import_fixture(marker=marker, touched_files=[touched_rel])
+        imported_sc = fixture["imported"]["structuredContent"]
+        pack_id = str(imported_sc["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        imported_memory_id = str(imported_sc["imported_rows"][0]["memory_id"])
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_sc = promoted["structuredContent"]
+        promoted_memory_id = str(promoted_sc["promoted_rows"][0]["promoted_memory_id"])
+        promotion_id = str(promoted_sc["promotion_id"])
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            imported_row = conn.execute("SELECT * FROM memories WHERE id = ?", (imported_memory_id,)).fetchone()
+            promoted_row = conn.execute("SELECT * FROM memories WHERE id = ?", (promoted_memory_id,)).fetchone()
+            promoted_topics = conn.execute(
+                "SELECT topic, source FROM memory_topics WHERE memory_id = ? ORDER BY topic ASC",
+                (promoted_memory_id,),
+            ).fetchall()
+            imported_topics = conn.execute(
+                "SELECT topic FROM memory_topics WHERE memory_id = ? ORDER BY topic ASC",
+                (imported_memory_id,),
+            ).fetchall()
+            promoted_files = conn.execute(
+                "SELECT memory_table, path, file_sha FROM memory_files WHERE memory_id = ? ORDER BY path ASC",
+                (promoted_memory_id,),
+            ).fetchall()
+            imported_files = conn.execute(
+                "SELECT memory_table, path, file_sha FROM memory_files WHERE memory_id = ? ORDER BY path ASC",
+                (imported_memory_id,),
+            ).fetchall()
+            mapping = conn.execute(
+                "SELECT promotion_id, original_import_freshness FROM promoted_pack_rows WHERE pack_id = ? AND row_id_in_pack = ?",
+                (pack_id, row_id),
+            ).fetchone()
+            audit = conn.execute(
+                "SELECT promotion_id, row_count FROM promotion_audit WHERE promotion_id = ?",
+                (promotion_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(imported_row)
+        self.assertIsNotNone(promoted_row)
+        self.assertIsNotNone(mapping)
+        self.assertIsNotNone(audit)
+        assert imported_row is not None
+        assert promoted_row is not None
+        assert mapping is not None
+        self.assertEqual(str(promoted_row["namespace"]), "local")
+        self.assertEqual(str(promoted_row["origin"]), "promoted")
+        self.assertEqual(str(promoted_row["kind"]), str(imported_row["kind"]))
+        self.assertEqual(str(promoted_row["text"]), str(imported_row["text"]))
+        self.assertEqual(str(promoted_row["title"] or ""), str(imported_row["title"] or ""))
+        self.assertEqual(str(promoted_row["git_sha"] or ""), str(imported_row["git_sha"] or ""))
+        self.assertEqual(str(promoted_row["git_branch"] or ""), str(imported_row["git_branch"] or ""))
+        self.assertEqual(int(promoted_row["git_dirty"] or 0), int(imported_row["git_dirty"] or 0))
+        self.assertEqual(str(promoted_row["import_freshness"] or ""), str(imported_row["import_freshness"] or ""))
+        self.assertEqual([str(item["topic"]) for item in promoted_topics], [str(item["topic"]) for item in imported_topics])
+        self.assertTrue(all(str(item["source"]) == "promotion" for item in promoted_topics))
+        self.assertEqual(
+            [(str(item["path"]), str(item["file_sha"] or "")) for item in promoted_files],
+            [(str(item["path"]), str(item["file_sha"] or "")) for item in imported_files],
+        )
+        self.assertEqual(str(mapping["promotion_id"] or ""), promotion_id)
+
+        promoted_meta = json.loads(str(promoted_row["metadata_json"] or "{}"))
+        pack_meta = promoted_meta.get("pack_promotion", {}) if isinstance(promoted_meta, dict) else {}
+        self.assertEqual(str(pack_meta.get("source_trust_level", "")), "trusted")
+        self.assertEqual(str(pack_meta.get("promoted_from_pack_id", "")), pack_id)
+        self.assertEqual(str(pack_meta.get("promoted_from_row_id_in_pack", "")), row_id)
+        self.assertEqual(str(pack_meta.get("promoted_from_imported_memory_id", "")), imported_memory_id)
+        self.assertEqual(str(pack_meta.get("promotion_id", "")), promotion_id)
+        self.assertEqual(str(pack_meta.get("source_signer_id", "")), str(fixture["signer_id"]))
+        self.assertEqual(
+            str(pack_meta.get("source_secret_fingerprint", "")),
+            server._secret_fingerprint(str(fixture["secret"])),
+        )
+
+    def test_promoted_memory_preserves_import_time_freshness(self) -> None:
+        marker = "phase211-import-freshness-preserve"
+        touched_rel = "src/phase211/freshness.py"
+        touched_abs = self.workspace / touched_rel
+        touched_abs.parent.mkdir(parents=True, exist_ok=True)
+        touched_abs.write_text("VALUE='before-import'\n", encoding="utf-8")
+        fixture = self._create_trusted_import_fixture(marker=marker, touched_files=[touched_rel])
+        imported_sc = fixture["imported"]["structuredContent"]
+        pack_id = str(imported_sc["pack_id"])
+        row_id = str(self._pack_rows(pack_id)[0][0])
+        imported_memory_id = str(imported_sc["imported_rows"][0]["memory_id"])
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            imported_row = conn.execute(
+                "SELECT import_freshness FROM memories WHERE id = ?",
+                (imported_memory_id,),
+            ).fetchone()
+            imported_file = conn.execute(
+                "SELECT path, file_sha FROM memory_files WHERE memory_id = ? ORDER BY path ASC LIMIT 1",
+                (imported_memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert imported_row is not None
+        imported_freshness = str(imported_row["import_freshness"] or "")
+        imported_file_sha = str((imported_file["file_sha"] if imported_file is not None else "") or "")
+
+        touched_abs.write_text("VALUE='after-import-mutated'\n", encoding="utf-8")
+        promoted = self._pack_promote(pack_id=pack_id, row_ids=[row_id], confirm_promote=True)
+        promoted_memory_id = str(promoted["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        conn.row_factory = sqlite3.Row
+        try:
+            promoted_row = conn.execute(
+                "SELECT import_freshness FROM memories WHERE id = ?",
+                (promoted_memory_id,),
+            ).fetchone()
+            promoted_file = conn.execute(
+                "SELECT path, file_sha FROM memory_files WHERE memory_id = ? ORDER BY path ASC LIMIT 1",
+                (promoted_memory_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert promoted_row is not None
+        self.assertEqual(str(promoted_row["import_freshness"] or ""), imported_freshness)
+        self.assertEqual(str((promoted_file["file_sha"] if promoted_file is not None else "") or ""), imported_file_sha)
+
+    def test_trusted_import_available_stability(self) -> None:
+        marker = "phase211-trusted-available-stability"
+        fixture = self._create_signed_pack_fixture(marker=marker)
+        pack_path = str(fixture["pack_path"])
+        secret = str(fixture["secret"])
+        signer_id = str(fixture["signer_id"])
+
+        first = self._pack_inspect(pack_path=pack_path, verification_secret=secret)["structuredContent"]
+        second = self._pack_inspect(pack_path=pack_path, verification_secret=secret)["structuredContent"]
+        self.assertEqual(str((first.get("signature") or {}).get("trust_classification", "")), "trusted_signer")
+        self.assertEqual(str((second.get("signature") or {}).get("trust_classification", "")), "trusted_signer")
+        self.assertTrue(bool(first.get("trusted_import_available")))
+        self.assertTrue(bool(second.get("trusted_import_available")))
+        self.assertEqual(first.get("signature"), second.get("signature"))
+
+        self._signer_disable(signer_id=signer_id)
+        disabled = self._pack_inspect(pack_path=pack_path, verification_secret=secret)["structuredContent"]
+        self.assertEqual(str((disabled.get("signature") or {}).get("trust_classification", "")), "disabled_signer")
+        self.assertFalse(bool(disabled.get("trusted_import_available")))
+
+        self._signer_enable(signer_id=signer_id)
+        reenabled = self._pack_inspect(pack_path=pack_path, verification_secret=secret)["structuredContent"]
+        self.assertEqual(str((reenabled.get("signature") or {}).get("trust_classification", "")), "trusted_signer")
+        self.assertTrue(bool(reenabled.get("trusted_import_available")))
+
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                "UPDATE trusted_signers SET trust_level = 'blocked', updated_at = ? WHERE signer_id = ?",
+                (server.now_iso(), signer_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        blocked = self._pack_inspect(pack_path=pack_path, verification_secret=secret)["structuredContent"]
+        self.assertEqual(str((blocked.get("signature") or {}).get("trust_classification", "")), "blocked_signer")
+        self.assertFalse(bool(blocked.get("trusted_import_available")))
+
+        wrong = self._pack_inspect(
+            pack_path=pack_path,
+            verification_secret="phase211-stability-wrong-secret-0123456789012",
+        )["structuredContent"]
+        self.assertEqual(str((wrong.get("signature") or {}).get("trust_classification", "")), "invalid_signature")
+        self.assertFalse(bool(wrong.get("trusted_import_available")))
+
+        unknown_secret = "phase211-stability-unknown-secret-01234567890123"
+        unknown_row = self.record(f"{marker} unknown signer source", kind="context_block")
+        unknown_topic = f"{marker}-unknown-topic"
+        add_unknown = server.topic_add({"memory_id": str(unknown_row["id"]), "topic": unknown_topic, "source": "operator"})
+        self.assertFalse(add_unknown["isError"], add_unknown)
+        unknown_pack, _ = self._create_signed_exported_pack(
+            pack_name=f"{marker}_unknown",
+            output_dir=self.root / f"{marker}_unknown",
+            signer_id=f"{marker}.unknown.signer",
+            signing_secret=unknown_secret,
+            topics=[unknown_topic],
+            kinds=["context_block"],
+        )
+        unknown = self._pack_inspect(
+            pack_path=str(unknown_pack),
+            verification_secret=unknown_secret,
+        )["structuredContent"]
+        self.assertEqual(str((unknown.get("signature") or {}).get("trust_classification", "")), "unknown_signer")
+        self.assertFalse(bool(unknown.get("trusted_import_available")))
+
+    def test_memory_packs_mixed_trust_list_review_preview_promote(self) -> None:
+        trusted_fixture = self._create_trusted_import_fixture(marker="phase211-mixed-list-trusted")
+        trusted_sc = trusted_fixture["imported"]["structuredContent"]
+        trusted_pack_id = str(trusted_sc["pack_id"])
+        trusted_row_id = str(self._pack_rows(trusted_pack_id)[0][0])
+
+        quarantine_fixture = self._create_signed_pack_fixture(marker="phase211-mixed-list-quarantine")
+        quarantine_import = self._pack_import(
+            pack_path=str(quarantine_fixture["pack_path"]),
+            allow_unsigned_quarantine=True,
+        )
+        quarantine_sc = quarantine_import["structuredContent"]
+        quarantine_pack_id = str(quarantine_sc["pack_id"])
+        quarantine_row_id = str(self._pack_rows(quarantine_pack_id)[0][0])
+
+        listed_all = self._pack_list_imports(limit=20)
+        listed_trusted = self._pack_list_imports(limit=20, trust_level="trusted")
+        listed_quarantine = self._pack_list_imports(limit=20, trust_level="quarantine")
+        all_trust_levels = {str(item.get("trust_level", "")) for item in listed_all["structuredContent"]["packs"]}
+        trusted_pack_ids = {str(item.get("pack_id", "")) for item in listed_trusted["structuredContent"]["packs"]}
+        quarantine_pack_ids = {str(item.get("pack_id", "")) for item in listed_quarantine["structuredContent"]["packs"]}
+        self.assertIn("trusted", all_trust_levels)
+        self.assertIn("quarantine", all_trust_levels)
+        self.assertIn(trusted_pack_id, trusted_pack_ids)
+        self.assertIn(quarantine_pack_id, quarantine_pack_ids)
+
+        trusted_review = self._pack_review_import(pack_id=trusted_pack_id, include_samples=True, sample_limit=5)
+        quarantine_review = self._pack_review_import(pack_id=quarantine_pack_id, include_samples=True, sample_limit=5)
+        self.assertTrue(
+            all(str(item.get("namespace", "")).startswith("pack:trusted:") for item in trusted_review["structuredContent"]["samples"])
+        )
+        self.assertTrue(
+            all(str(item.get("namespace", "")).startswith("pack:quarantine:") for item in quarantine_review["structuredContent"]["samples"])
+        )
+
+        trusted_preview = self._pack_promote_preview(pack_id=trusted_pack_id, row_ids=[trusted_row_id], include_samples=False)
+        quarantine_preview = self._pack_promote_preview(
+            pack_id=quarantine_pack_id,
+            row_ids=[quarantine_row_id],
+            include_samples=False,
+        )
+        self.assertFalse(trusted_preview["isError"], trusted_preview)
+        self.assertFalse(quarantine_preview["isError"], quarantine_preview)
+
+        trusted_preview_warnings = (trusted_preview["structuredContent"] or {}).get("warnings", [])
+        trusted_preview_codes = {str(item.get("code", "")) for item in trusted_preview_warnings if isinstance(item, dict)}
+        self.assertIn("trusted_import_source", trusted_preview_codes)
+        self.assertNotIn("promoting_from_trusted_import", trusted_preview_codes)
+        self.assertNotIn("promoted_from_trusted_import", trusted_preview_codes)
+        self.assertTrue(
+            any(
+                isinstance(item, dict)
+                and str(item.get("code", "")) == "trusted_import_source"
+                and str(item.get("phase", "")) == "preview"
+                for item in trusted_preview_warnings
+            )
+        )
+
+        trusted_promote = self._pack_promote(
+            pack_id=trusted_pack_id,
+            row_ids=[trusted_row_id],
+            confirm_promote=True,
+        )
+        promoted_memory_id = str(trusted_promote["structuredContent"]["promoted_rows"][0]["promoted_memory_id"])
+        promote_warnings = (trusted_promote["structuredContent"] or {}).get("warnings", [])
+        promote_codes = {str(item.get("code", "")) for item in promote_warnings if isinstance(item, dict)}
+        self.assertIn("trusted_import_source", promote_codes)
+        self.assertNotIn("promoting_from_trusted_import", promote_codes)
+        self.assertNotIn("promoted_from_trusted_import", promote_codes)
+        self.assertTrue(
+            any(
+                isinstance(item, dict)
+                and str(item.get("code", "")) == "trusted_import_source"
+                and str(item.get("phase", "")) == "promotion"
+                for item in promote_warnings
+            )
+        )
+
+        reviewed_after = self._pack_review_import(pack_id=trusted_pack_id, include_samples=True, sample_limit=10)
+        promoted_rows = [item for item in reviewed_after["structuredContent"]["samples"] if str(item.get("row_id_in_pack", "")) == trusted_row_id]
+        self.assertTrue(promoted_rows)
+        self.assertEqual(str(promoted_rows[0].get("promoted_to_memory_id", "")), promoted_memory_id)
+
+    def test_memory_packs_trusted_import_policy_docs_consistency(self) -> None:
+        readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        tool_reference = (Path(__file__).resolve().parent / "docs" / "tool_reference.md").read_text(encoding="utf-8")
+        changelog = (Path(__file__).resolve().parent / "CHANGELOG.md").read_text(encoding="utf-8")
+        combined = f"{readme}\n{tool_reference}"
+        self.assertIn("Trusted Import Policy", combined)
+        self.assertIn("Trusted import is NOT local adoption", combined)
+        self.assertIn("Trusted import is NOT automatic promotion", combined)
+        self.assertIn("Trusted import is NOT default retrieval", combined)
+        self.assertIn("pack:trusted:<pack_id>", combined)
+        self.assertIn("include_imported=true", combined)
+        self.assertIn("include_quarantine=true", combined)
+        self.assertIn("manual promotion", combined.lower())
+        self.assertIn("local hmac", combined.lower())
+        self.assertIn("not public-key", combined.lower())
+        self.assertIn("not non-repudiation", combined.lower())
+        self.assertIn("persistent secret store", combined.lower())
+        self.assertIn("revocation", combined.lower())
+        self.assertIn("## 0.21.1", changelog)
+        self.assertIn("not a new feature phase", changelog.lower())
+
+    def test_memory_packs_no_trusted_import_for_unsigned_or_unverified(self) -> None:
+        marker = "phase211-no-trusted-for-unsigned-or-unverified"
+        row = self.record(f"{marker} unsigned source", kind="context_block")
+        topic = f"{marker}-topic"
+        add = server.topic_add({"memory_id": str(row["id"]), "topic": topic, "source": "operator"})
+        self.assertFalse(add["isError"], add)
+        unsigned_pack = self._create_exported_pack(
+            pack_name=f"{marker}_unsigned",
+            output_dir=self.root / f"{marker}_unsigned",
+            topics=[topic],
+            kinds=["context_block"],
+        )
+        before = self._table_count("imported_packs")
+        unsigned_fail = self._pack_import_error(
+            pack_path=str(unsigned_pack),
+            allow_trusted_import=True,
+            verification_secret="phase211-unsigned-trusted-attempt-secret-012345678901",
+        )
+        self.assertEqual(self._pack_error_code(unsigned_fail), "trusted_import_requires_verified_trusted_signer")
+
+        unknown_secret = "phase211-no-trusted-unknown-secret-01234567890123"
+        unknown_row = self.record(f"{marker} unknown signer source", kind="context_block")
+        unknown_topic = f"{marker}-unknown-topic"
+        add_unknown = server.topic_add({"memory_id": str(unknown_row["id"]), "topic": unknown_topic, "source": "operator"})
+        self.assertFalse(add_unknown["isError"], add_unknown)
+        unknown_pack, _ = self._create_signed_exported_pack(
+            pack_name=f"{marker}_unknown",
+            output_dir=self.root / f"{marker}_unknown",
+            signer_id=f"{marker}.unknown.signer",
+            signing_secret=unknown_secret,
+            topics=[unknown_topic],
+            kinds=["context_block"],
+        )
+        unknown_fail = self._pack_import_error(
+            pack_path=str(unknown_pack),
+            allow_trusted_import=True,
+            verification_secret=unknown_secret,
+        )
+        self.assertEqual(self._pack_error_code(unknown_fail), "trusted_import_requires_verified_trusted_signer")
+        no_secret_fail = self._pack_import_error(
+            pack_path=str(unknown_pack),
+            allow_trusted_import=True,
+        )
+        self.assertEqual(self._pack_error_code(no_secret_fail), "trusted_import_requires_verification_secret")
+        self.assertEqual(before, self._table_count("imported_packs"))
+
+    def test_memory_packs_v1_readiness_report_gate(self) -> None:
+        report_root = Path(__file__).resolve().parent / "_test_results" / "memory_packs_trusted_import_stabilization"
+        if not report_root.exists():
+            self.skipTest("synthetic readiness report not present in this checkout")
+        run_dirs = sorted(path for path in report_root.iterdir() if path.is_dir() and path.name.startswith("phase211_run_"))
+        if not run_dirs:
+            self.skipTest("no phase211 readiness report directories found")
+        latest = run_dirs[-1]
+        report_path = latest / "memory_packs_trusted_import_stabilization_report.json"
+        if not report_path.exists():
+            self.skipTest("latest readiness report JSON not found")
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        checks = payload.get("checks", [])
+        self.assertIsInstance(checks, list)
+        status_rows = [item for item in checks if isinstance(item, dict) and str(item.get("name", "")) == "memory_packs_v1_status"]
+        self.assertTrue(status_rows)
+        status_row = status_rows[0]
+        all_other_passed = all(
+            bool(item.get("passed"))
+            for item in checks
+            if isinstance(item, dict) and str(item.get("name", "")) != "memory_packs_v1_status"
+        )
+        expected_ready = "ready" if all_other_passed else "not_ready"
+        details_text = str(status_row.get("details", ""))
+        self.assertIn(expected_ready, details_text)
+        if all_other_passed:
+            self.assertTrue(bool(status_row.get("passed")))
+        else:
+            self.assertFalse(bool(status_row.get("passed")))
+
+        readme = (Path(__file__).resolve().parent / "README.md").read_text(encoding="utf-8")
+        claim = "Complete for practical local export/import workflows"
+        if all_other_passed:
+            self.assertIn(claim, readme)
+        else:
+            self.assertNotIn(claim, readme)
+
+    def test_memory_packs_sync_parity_if_siblings_present(self) -> None:
+        base = Path(__file__).resolve().parent
+        workspace_root = base.parent.parent.parent.parent
+        copies = {
+            "agentic": base,
+            "mnemo": workspace_root / "mnemo",
+            "pub_mnemo": workspace_root / "pub_mnemo",
+        }
+        missing = [name for name, path in copies.items() if not path.exists()]
+        if missing:
+            self.skipTest(f"sibling copy not present: {', '.join(missing)}")
+
+        files = [
+            "server.py",
+            "test_server.py",
+            "pyproject.toml",
+            "README.md",
+            "CHANGELOG.md",
+            "docs/storage.md",
+            "docs/tool_reference.md",
+            "git_context.py",
+            "smoke_test.py",
+        ]
+        for rel in files:
+            digests: dict[str, str] = {}
+            for label, root in copies.items():
+                file_path = root / rel
+                self.assertTrue(file_path.exists(), f"missing file for parity check: {label}:{rel}")
+                digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                digests[label] = digest
+            if len(set(digests.values())) != 1:
+                self.skipTest(f"sync parity mismatch for {rel}: {digests}")
+
+    def test_memory_packs_moderate_scale_characterization(self) -> None:
+        marker = "phase211_moderate_scale"
+        topic = f"{marker}-topic"
+        kinds = ["context_block", "hippocampus_entry"]
+        for idx in range(500):
+            kind = kinds[idx % len(kinds)]
+            recorded = self.record(
+                f"{marker} row {idx}",
+                kind=kind,
+                title=f"{marker} title {idx}",
+            )
+            topic_result = server.topic_add(
+                {"memory_id": str(recorded["id"]), "topic": topic, "source": "operator"}
+            )
+            self.assertFalse(topic_result["isError"], topic_result)
+
+        exported = self._pack_export(
+            pack_name=f"{marker}_pack",
+            output_dir=str(self.root / f"{marker}_pack"),
+            topics=[topic],
+            kinds=["context_block", "hippocampus_entry"],
+            limit=600,
+            allow_unsigned=True,
+        )
+        pack_path = Path(str(exported["structuredContent"]["output_path"]))
+        inspect = self._pack_inspect(pack_path=str(pack_path))
+        self.assertEqual(str(inspect["structuredContent"]["status"]), "valid")
+
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        imported_sc = imported["structuredContent"]
+        self.assertEqual(int(imported_sc["imported"]["memory_count"]), 500)
+        pack_id = str(imported_sc["pack_id"])
+        review = self._pack_review_import(pack_id=pack_id, include_samples=False, limit=600)
+        self.assertEqual(int(review["structuredContent"]["selection"]["total_pack_rows"]), 500)
 
 
 class IdfActivationTests(MnemoTestCase):

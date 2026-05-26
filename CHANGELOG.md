@@ -1,5 +1,350 @@
 # Changelog
 
+## 0.21.2
+
+### Added
+
+- Python compatibility regression guards for the SQLite FTS token-quoting path:
+  - quote-output behavior checks (`abc`, `a"b`, empty token)
+  - static source guard preventing the backslash-in-f-string pattern that breaks Python `3.10/3.11`
+  - minimum-version declaration regression check (`>=3.10`)
+- CI/workflow hardening for MCP components with Python matrix coverage (`3.10`, `3.11`, `3.12`, `3.13`).
+
+### Changed
+
+- Version bump to `0.21.2` across server/package/docs.
+- Fixed Python `3.10/3.11` import-breaking quote escaping syntax in `server.py` by removing backslash escapes from f-string expression braces in the FTS token quoting path while preserving output behavior.
+- Nexus auto-record-to-Governor non-fatal behavior remains covered by regression test (`test_auto_record_failure_does_not_break_main_action`).
+
+### Compatibility / Scope
+
+- `0.21.2` is a compatibility/hardening patch, not a new Memory Packs feature phase.
+- SQLite schema version remains `7` (no schema changes).
+- No Memory Packs lifecycle feature changes.
+
+## 0.21.1
+
+### Added
+
+- Trusted-import stabilization regression coverage for:
+  - trusted lifecycle (`export -> inspect -> trusted import -> review -> preview -> manual promote`)
+  - signed-pack quarantine fallback lifecycle
+  - unsigned quarantine lifecycle
+  - mixed local/trusted/quarantine/promoted retrieval boundaries
+  - cross-trust reimport/collision behavior
+  - tampered trusted-import rejection before mutation
+  - verification-secret scrubbing across import outputs/logs/DB JSON surfaces
+  - trusted-source promotion provenance and import-freshness preservation
+- Version-aware `0.21.0 -> 0.21.1` no-mutation upgrade regression checks (schema remains `7`).
+- Memory Packs v1 synthetic readiness gate/reporting:
+  - `memory_packs_v1_status` row (`ready` iff all checks pass).
+- Trusted import stabilization synthetic validation runner:
+  - `_test_results/memory_packs_trusted_import_stabilization/run_check.py`
+
+### Changed
+
+- Version bump to `0.21.1` across server/package/docs.
+- `pack_import` quarantine path now emits warning code:
+  - `verification_secret_unused_for_quarantine_import`
+  when a `verification_secret` is supplied but quarantine mode is selected.
+- Trusted-source warning wire format is preserved from `0.21.0`:
+  - warning code `trusted_import_source`
+  - `phase=preview` (`pack_promote_preview`)
+  - `phase=promotion` (`pack_promote`)
+- Include-flag semantic migration note (introduced in `0.21.0`, now explicitly stabilized):
+  - `include_imported=true` resolves trusted imported namespaces
+  - `include_quarantine=true` resolves quarantine namespaces
+  - callers that previously treated `include_imported=true` as “all imported” must now add `include_quarantine=true` for quarantine scope.
+
+### Compatibility / Scope
+
+- `0.21.1` is a stabilization pass, not a new feature phase.
+- SQLite schema version remains `7`.
+- No public-key signing.
+- No persistent secret store.
+- No key revocation or remote key discovery.
+- No trusted auto-promotion.
+- No alias pack import/export.
+
+## 0.21.0
+
+### Added
+
+- Memory Packs Phase 5b trusted import policy and implementation:
+  - `pack_import` trusted mode with:
+    - `allow_trusted_import=true`
+    - `verification_secret`
+  - trusted import target namespace:
+    - `pack:trusted:<pack_id>`
+  - trusted registry row import state:
+    - `imported_packs.trust_level = trusted`
+- `pack_inspect` informational eligibility signal:
+  - `trusted_import_available` (true only for verified trusted signer state)
+- Trusted-source promotion/review warning surfacing:
+  - warning code `trusted_import_source` with:
+    - `phase=preview` in `pack_promote_preview`
+    - `phase=promotion` in `pack_promote`
+- Trusted-source promotion provenance enrichment in promoted-memory metadata:
+  - `source_trust_level`
+  - signer fields when available (`source_signer_id`, `source_secret_fingerprint`)
+
+### Changed
+
+- Version bump to `0.21.0` across server/package/docs.
+- Retrieval include-flag policy audit confirmed and pinned:
+  - default remains local-only
+  - `include_imported=true` resolves trusted imported namespaces
+  - `include_quarantine=true` resolves quarantine namespaces
+  - both flags include both
+  - explicit `namespace`/`namespaces` now override include flags verbatim
+- `pack_import` target-gating now enforces:
+  - exactly one import target (`allow_trusted_import` xor `allow_unsigned_quarantine`)
+  - `ambiguous_import_target` when both are true
+  - `import_target_not_allowed` when neither is true
+  - trusted import requires verified trusted signer classification (`trusted_import_requires_verified_trusted_signer`)
+  - short trusted-import verification secrets return `secret_too_short` with `field=verification_secret`
+- Trusted imports remain imported rows (not local adoption):
+  - `origin=imported`
+  - no auto-promotion
+  - default retrieval exclusion remains in place
+- `pack_promote_preview`/`pack_promote` trust eligibility expanded:
+  - accepted source trust levels: `quarantine`, `trusted`
+  - invalid synthetic trust levels still reject with:
+    - `unsupported_trust_level_for_promotion_preview`
+    - `unsupported_trust_level_for_promotion`
+
+### Compatibility / Scope
+
+- SQLite schema version remains `7`.
+- No public-key signing.
+- No persistent secret store.
+- No key revocation.
+- No remote key discovery.
+- No trusted auto-promotion.
+- No alias pack import/export.
+
+## 0.20.1
+
+### Added
+
+- Signing/trust stabilization regression coverage for:
+  - signed and unsigned lifecycle flows
+  - trust-classification matrix states
+  - tamper-case rejection paths
+  - signer registry state-cycle behavior
+  - schema 7 migration/idempotency
+  - quarantine-only signed-import policy enforcement
+- Additional recursive secret-scrubbing regression checks across outputs/logging paths.
+- Signing stabilization synthetic validation runner:
+  - `_test_results/memory_packs_signing_stabilization/run_check.py`
+
+### Changed
+
+- Version bump to `0.20.1` across server/package/docs.
+- `pack_inspect` now emits the `local_hmac_not_public_key` warning for signed local-HMAC packs.
+- Documentation now marks `0.20.1` as a stabilization pass (no new Memory Packs feature phase).
+
+### Compatibility / Scope
+
+- SQLite schema version remains `7`.
+- No trusted import.
+- No automatic trusted promotion.
+- No public-key signing in stdlib-only mode.
+- No persistent secret store.
+- No key revocation or remote key discovery.
+- No alias pack import/export.
+
+## 0.20.0
+
+### Added
+
+- Memory Packs Phase 5a signing/trust foundation with stdlib-only local HMAC signing mode:
+  - `signature_algorithm = hmac-sha256-local-v1`
+  - `signature_payload_version = memory-pack-signing-v1`
+- New signer registry table and actions:
+  - `trusted_signers`
+  - `signer_add`, `signer_list`, `signer_disable`, `signer_enable`
+- Secret-scrubbing safety for secret-shaped params:
+  - `SECRET_PARAM_NAMES = {"signing_secret", "verification_secret", "secret"}`
+  - recursive `"[REDACTED]"` scrubbing in query/event logging payloads
+- Optional signed export support in `pack_export` with ZIP signature member:
+  - `signature/signature.json`
+- Signature verification/classification in `pack_inspect`:
+  - unsigned, not-verified, trusted/unknown signer
+  - blocked/disabled signer
+  - invalid/mismatch/unsupported signature states
+- Phase 5a synthetic validation runner:
+  - `_test_results/memory_packs_phase5a_signing/run_check.py`
+
+### Changed
+
+- Version bump to `0.20.0` across server/package/docs.
+- SQLite schema version bumped to `7` for `trusted_signers`.
+- `pack_export` unsigned path remains supported with `allow_unsigned=true`; new unsigned reason is `operator_chose_unsigned`.
+- `pack_inspect` now accepts historical unsigned reason `signing_not_implemented` and current `operator_chose_unsigned`.
+- `pack_import` remains quarantine-only and now also accepts valid signed packs when inspection result is still `quarantine_only`.
+- Documentation now includes a full lifecycle recap through signing foundation:
+  - record/topic tagging -> preview -> redaction preview -> export (unsigned or signed local HMAC) -> inspect -> quarantine import -> review -> promotion preview -> manual promotion.
+
+### Compatibility / Scope
+
+- No trusted import yet.
+- No automatic trusted promotion.
+- No public-key identity/signature verification in stdlib mode.
+- No key revocation or remote key discovery.
+- No alias pack import/export.
+- Local HMAC signing is explicitly local/dev trust only and not non-repudiation.
+
+## 0.19.6
+
+### Added
+
+- Stabilization synthetic validation runner:
+  - `_test_results/memory_packs_stabilization/run_check.py`
+- New stabilization regression test group covering:
+  - full lifecycle integration (`record/topic_add -> preview -> redaction preview -> export -> inspect -> import -> review -> promote preview -> promote -> retrieval checks`)
+  - migration/idempotency matrix checks for legacy/current SQLite shapes
+  - action dispatch coverage for all Memory Packs actions
+  - read-only contract checks for read-only Memory Packs actions
+  - artifact safety checks for exported ZIP members/hash/redaction/source-ID leakage guards
+  - retrieval boundary checks (local/promoted/quarantine visibility)
+  - promotion-audit linkage integrity checks
+  - no-source-exporter-ID leakage checks in action outputs
+
+### Changed
+
+- Version bump to `0.19.6` across server/package/docs.
+- Documentation now marks `0.19.6` as a stabilization pass (no new Memory Packs feature phase).
+- Repeated limited-promotion guidance now references `0.19.6` while preserving existing behavior (`skip_already_promoted` and `allow_repromote` remain unimplemented).
+
+### Compatibility / Scope
+
+- No new lifecycle feature phase is introduced in `0.19.6`.
+- No signing/trust implementation, no trusted import, and no alias-pack import/export is added.
+- Redaction remains baseline `baseline-v1` and is intentionally not full DLP.
+
+## 0.19.5
+
+### Added
+
+- Memory Packs Phase 4b manual promotion action:
+  - `pack_promote`
+- Promotion mapping table:
+  - `promoted_pack_rows`
+- Promotion batch audit table:
+  - `promotion_audit`
+- Promotion batch IDs (`promotion_<utc_compact_timestamp>_<8_char_hex>`) shared across one promotion run.
+- `pack_review_import` sample enrichment for already-promoted rows:
+  - `promoted_to_memory_id`
+  - `promotion_id`
+  - `promoted_at`
+
+### Changed
+
+- Promotion is now an explicit mutating operator flow from quarantine to local:
+  - source: `namespace=pack:quarantine:<pack_id>`, `origin=imported`
+  - target: `namespace=local`, `origin=promoted`
+- `pack_promote` now enforces:
+  - `confirm_promote=true`
+  - explicit row filters, or `allow_promote_all=true`
+  - limited-row guard unless `allow_limited_promotion=true`
+  - duplicate-promotion rejection (`pack_rows_already_promoted`)
+- Promoted rows preserve imported row payload/provenance:
+  - kind, text/title, topics, memory_files file SHA links
+  - git provenance (`git_sha`, `git_branch`, `git_dirty`)
+  - import freshness label copied from imported row
+- `memory_topics.source` may now include `promotion`.
+
+### Compatibility / Scope
+
+- Phase 4b promotion is manual and deterministic:
+  - no automatic promotion
+  - no delete/move of quarantine rows
+  - no re-promotion/skip-already-promoted mode
+- No trusted import, signing, signature verification, trust-store policy, or alias-pack promotion/import is added in this phase.
+
+## 0.19.0
+
+### Added
+
+- Memory Packs Phase 4a review actions:
+  - `pack_list_imports`
+  - `pack_review_import`
+  - `pack_promote_preview`
+- Read-only quarantine review of already-imported pack rows directly from SQLite.
+- Promotion preview planning payloads for future local promotion without writing promoted rows.
+
+### Changed
+
+- Imported-pack review now supports deterministic natural ordering for `row_id_in_pack` numeric suffixes (for example `ctx_2` before `ctx_10`).
+- `pack_list_imports` exposes `received_zip_sha256` and basename-normalized `source_label` for operator audit comparison across machines.
+- `pack_review_import`/`pack_promote_preview` share imported-row selection semantics (topics/kinds/freshness/row_ids/memory_ids/touched_paths).
+
+### Compatibility / Scope
+
+- Phase 4a is read-only review/preview:
+  - no mutation of memories/import registries/topics/files
+  - no actual promotion
+  - no trusted import, signing, signature verification, trust-store policy, or alias-pack import
+
+## 0.18.5
+
+### Added
+
+- Memory Packs Phase 3b import action:
+  - `pack_import`
+- Basic validated unsigned-pack import into quarantine namespaces:
+  - `namespace = pack:quarantine:<pack_id>`
+  - `origin = imported`
+  - `trust_level = quarantine`
+- `imported_pack_rows` mapping table to map pack-local row IDs to newly created local `mem_*` IDs.
+- `received_zip_sha256` on `imported_packs` for exact re-import and pack-ID collision diagnostics.
+
+### Changed
+
+- `pack_import` now gates on the shared `pack_inspect` validation path and imports from the same loaded ZIP snapshot bytes.
+- Imported memories preserve pack git provenance:
+  - `git_sha_at_write -> memories.git_sha`
+  - `git_branch_at_write -> memories.git_branch`
+  - `git_dirty_at_write -> memories.git_dirty`
+- Imported topics are written to `memory_topics` with `source=pack_import`.
+- Imported touched files are written to `memory_files` with imported memory IDs and kind-based `memory_table`.
+- Imported rows store diagnostic `import_freshness` labels (`verified|stale|missing|unknown`) using existing git-aware SHA helpers.
+
+### Compatibility / Scope
+
+- Unsigned import is quarantine-only in this phase and requires `allow_unsigned_quarantine=true`.
+- Re-import is rejected by default:
+  - same `pack_id` + same `received_zip_sha256` => `pack_already_imported`
+  - same `pack_id` + different ZIP bytes => `pack_id_collision_distinct_content`
+- No trusted import, signing, signature verification, trust-store policy, promotion, or alias-pack import is implemented.
+
+## 0.18.0
+
+### Added
+
+- Memory Packs Phase 3a inspect action:
+  - `pack_inspect`
+- Read-only local ZIP inspection/validation for exported memory packs.
+- Canonical content-hash verification over fixed covered members (not attacker-controlled manifest subsets).
+- Pack schema/member/JSON/JSONL validation with row/count and redaction-metadata consistency checks.
+- Source memory-ID leak detection (`mem_*`) across required JSON members.
+
+### Changed
+
+- Pack validation now classifies unsigned packs as valid-but-`quarantine_only` recommendations when:
+  - `signed=false`
+  - `unsigned_reason=signing_not_implemented`
+- Unsupported schema/signature-state packs are classified as `status=unsupported` with `import_recommendation=reject`.
+
+### Compatibility / Scope
+
+- Phase 3a is inspection only:
+  - no import
+  - no DB mutation
+  - no signing/trust-store/promotion workflows
+- One invalid row invalidates the whole pack in this phase (no partial-import policy).
+
 ## 0.17.0
 
 ### Added

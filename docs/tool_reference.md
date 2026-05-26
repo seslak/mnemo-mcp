@@ -191,7 +191,7 @@ Read-only behavior:
 
 ### `pack_export`
 
-Writes a local unsigned development pack ZIP using the same selection semantics as `pack_preview`.
+Writes a local pack ZIP using the same selection semantics as `pack_preview`.
 
 ```json
 {"action":"pack_export","params":{"pack_name":"auth_memory_pack","allow_unsigned":true}}
@@ -200,7 +200,13 @@ Writes a local unsigned development pack ZIP using the same selection semantics 
 Key params:
 
 - `pack_name` (required, sanitized for filesystem safety)
-- `allow_unsigned` (required in Phase 2c; must be `true`)
+- unsigned mode:
+  - `allow_unsigned` required when `sign_pack` is not enabled
+- signed mode:
+  - `sign_pack=true`
+  - `signer_id` required
+  - `signing_secret` required
+  - `signature_algorithm` defaults to `hmac-sha256-local-v1`
 - `output_dir` (optional; defaults to `state/mnemo/packs/exports/`)
 - selection filters shared with `pack_preview`:
   - `topics`
@@ -213,13 +219,13 @@ Key params:
   - `limit`
 - `allow_limited_export` (default `false`)
 
-Policy constraints in Phase 2c:
+Policy constraints:
 
-- signing is not implemented yet; export fails unless `allow_unsigned=true`
 - exportable kinds are strict:
   - `context_block`
   - `hippocampus_entry`
 - preview-only kinds (`interaction_log`, `agent_feedback`) are rejected for export
+- `hmac-sha256-local-v1` is local/dev signing only; it is not public-key identity and not non-repudiation
 
 Redaction behavior:
 
@@ -242,9 +248,517 @@ Pack format notes:
   - `content/file_fingerprints.json`
   - `provenance/origin.json`
   - `provenance/redactions.json`
+- signed packs also include:
+  - `signature/signature.json`
 - rows in `content/memories.jsonl` use pack-local row IDs (`ctx_###`, `hip_###`), not source DB `mem_*` IDs
 - `manifest.json` includes SHA-256 `content_hash` over covered content/provenance members
 - successful export writes one `exported_packs` audit row
+- unsigned reason values accepted by inspector:
+  - `operator_chose_unsigned` (current)
+  - `signing_not_implemented` (historical compatibility)
+
+### `pack_inspect`
+
+Read-only inspection and validation for exported memory-pack ZIP files.
+
+```json
+{"action":"pack_inspect","params":{"pack_path":"D:/packs/my_pack.zip","include_samples":false,"sample_limit":5}}
+```
+
+Key params:
+
+- `pack_path` (required local filesystem path)
+- `include_samples` (default `false`)
+- `sample_limit` (default `5`, capped to `20`)
+- `verification_secret` (optional; required only when verifying local-HMAC signature with `hmac-sha256-local-v1`)
+
+Validation scope:
+
+- ZIP safety checks:
+  - member-count/size limits
+  - encrypted-member rejection
+  - duplicate member/path traversal/unsafe path rejection
+- required members:
+  - `manifest.json`
+  - `content/memories.jsonl`
+  - `content/topics.json`
+  - `content/file_fingerprints.json`
+  - `provenance/origin.json`
+  - `provenance/redactions.json`
+- schema support (`pack_schema_version=1` in Phase 3a)
+- content hash verification against canonical covered members (not attacker-controlled subsets)
+- redaction metadata consistency checks
+- source DB memory ID leak detection (`mem_*`) in required JSON payloads
+- signature checks when present:
+  - signed packs require `signature/signature.json`
+  - `manifest.signature.signature_member` must equal `signature/signature.json`
+  - `signature/signature.json` and `manifest.signature` metadata must match
+  - local-HMAC verification runs when `verification_secret` is supplied
+
+Status/recommendation behavior:
+
+- `status`: `valid`, `invalid`, `unsupported`
+- `import_recommendation`: `quarantine_only` or `reject`
+- unsigned valid packs are marked `quarantine_only`
+- valid signed packs are still `quarantine_only` in 0.20.1 (trusted import is not implemented)
+- malformed/tampered/unsupported packs are marked `reject`
+- invalid/unsupported packs return no samples
+- trust/signature classification is returned under `structuredContent.signature.trust_classification`:
+  - `unsigned`
+  - `signature_not_verified`
+  - `trusted_signer`
+  - `unknown_signer`
+  - `disabled_signer`
+  - `blocked_signer`
+  - `invalid_signature`
+  - `secret_fingerprint_mismatch`
+  - `unsupported_signature`
+
+Read-only behavior:
+
+- no database mutation
+- no ZIP extraction
+- no import/promotion mutation from inspect
+- no signature-key persistence from inspect
+
+### `pack_import`
+
+Validated pack import with explicit target policy (Phase 5b trusted import update).
+
+```json
+{"action":"pack_import","params":{"pack_path":"D:/packs/my_pack.zip","allow_unsigned_quarantine":true}}
+```
+
+```json
+{"action":"pack_import","params":{"pack_path":"D:/packs/my_pack.zip","allow_trusted_import":true,"verification_secret":"..."}}
+```
+
+Key params:
+
+- `pack_path` (required local ZIP path)
+- exactly one target gate must be true:
+  - `allow_unsigned_quarantine=true`, or
+  - `allow_trusted_import=true`
+- `verification_secret` is required for `allow_trusted_import=true`
+
+Import gate:
+
+- import reuses the shared `pack_inspect` validation engine
+- trusted mode requires a verified trusted signer classification:
+  - `status = valid`
+  - `signature.present = true`
+  - `signature.verified = true`
+  - `signature.trust_classification = trusted_signer`
+  - `trusted_import_available = true`
+- quarantine mode remains available and safe for unsigned/unverified/unknown/operator-cautious flows
+
+Import policy:
+
+- trusted import target:
+  - `namespace = pack:trusted:<pack_id>`
+  - `imported_packs.trust_level = trusted`
+  - `origin = imported`
+- quarantine import target:
+  - `namespace = pack:quarantine:<pack_id>`
+  - `imported_packs.trust_level = quarantine`
+  - `origin = imported`
+- trusted import is not local adoption and does not auto-promote
+- kinds are restricted to:
+  - `context_block`
+  - `hippocampus_entry`
+
+Imported data behavior:
+
+- imported memories get new local `mem_*` IDs
+- source DB IDs are not imported
+- source git provenance is preserved:
+  - `git_sha_at_write -> memories.git_sha`
+  - `git_branch_at_write -> memories.git_branch`
+  - `git_dirty_at_write -> memories.git_dirty`
+- topics are imported with `memory_topics.source = pack_import`
+- touched files are imported to `memory_files` with:
+  - `memory_table = memory kind`
+  - `memory_id = new local mem_*`
+  - `file_sha = source/export SHA from pack`
+
+Audit and collision behavior:
+
+- successful imports insert one `imported_packs` row with `received_zip_sha256`
+- `imported_pack_rows` maps `(pack_id, row_id_in_pack)` to local `memory_id`
+- re-import handling:
+  - same `pack_id` + same `received_zip_sha256` => `pack_already_imported`
+  - same `pack_id` + different ZIP bytes => `pack_id_collision_distinct_content`
+  - legacy missing hash => `pack_already_imported_legacy_unknown_hash`
+
+Freshness metadata:
+
+- imported memories store diagnostic `import_freshness` labels:
+  - `verified`, `stale`, `missing`, `unknown`
+- labels use existing git-aware SHA helpers when local repo state is available
+
+Scope limits:
+
+- no public-key signing mode in stdlib deployments
+- no persistent secret store
+- no key revocation/remote key discovery
+- no automatic trusted promotion
+- no alias-pack import
+
+### `signer_add`
+
+Registers signer metadata in local SQLite trust registry.
+
+```json
+{"action":"signer_add","params":{"signer_id":"alice.dev","secret":"<32+ chars>","trust_level":"trusted"}}
+```
+
+Key params:
+
+- `signer_id` required; ASCII regex: `^[A-Za-z0-9._:-]{3,128}$`
+- `secret` required for `hmac-sha256-local-v1` and minimum 32 chars
+- `trust_level`: `trusted` or `blocked` (default `trusted`)
+- `signature_algorithm`: currently `hmac-sha256-local-v1` only
+
+Safety:
+
+- raw secret is never stored
+- registry stores `secret_fingerprint = sha256(secret_utf8).hexdigest()[:32]`
+- action output never returns raw secret
+
+### `signer_list`
+
+Lists local signer registry rows.
+
+```json
+{"action":"signer_list","params":{"status":"active","trust_level":"trusted","limit":100}}
+```
+
+Key params:
+
+- `status` optional: `active|disabled`
+- `trust_level` optional: `trusted|blocked`
+- `limit` defaults to `100`, capped at `500`
+
+### `signer_disable`
+
+Disables a signer without deleting it.
+
+```json
+{"action":"signer_disable","params":{"signer_id":"alice.dev"}}
+```
+
+### `signer_enable`
+
+Re-enables a disabled signer.
+
+```json
+{"action":"signer_enable","params":{"signer_id":"alice.dev"}}
+```
+
+### `pack_list_imports`
+
+Read-only list view of imported pack registry rows (Phase 4a).
+
+```json
+{"action":"pack_list_imports","params":{"trust_level":"quarantine","limit":50}}
+```
+
+Key params:
+
+- `trust_level` (optional `quarantine|trusted`)
+- `pack_id` (optional exact match)
+- `namespace` (optional exact match)
+- `include_counts` (default `true`)
+- `include_topics` (default `true`)
+- `include_freshness` (default `true`)
+- `limit` (default `50`, capped to `200`)
+
+Output highlights:
+
+- `total` is the unlimited matching pack count
+- `packs` is the limited returned slice (`limited=true` when truncated)
+- each pack entry includes:
+  - `pack_id`, `pack_name`, `namespace`, `trust_level`, `imported_at`
+  - `source_label` as basename-only display
+  - `received_zip_sha256` (intentionally visible for cross-machine comparison)
+  - `memory_count`, `topic_count`, `memory_file_count`
+  - parsed `freshness` summary when available
+  - bounded `top_topics` (max 10, ordered by count desc then topic asc)
+
+### `pack_review_import`
+
+Read-only review of one imported pack's mapped quarantine rows from SQLite (Phase 4a).
+
+```json
+{"action":"pack_review_import","params":{"pack_id":"pack_...","topics":["auth"],"limit":100,"sample_limit":10}}
+```
+
+Key params:
+
+- `pack_id` (required)
+- optional row filters:
+  - `topics`
+  - `kinds`
+  - `import_freshness` (`verified|stale|missing|unknown`)
+  - `row_ids` (pack-local row IDs)
+  - `memory_ids` (local imported `mem_*` IDs)
+  - `touched_paths`
+- optional `query`:
+  - case-insensitive substring matching against imported `text`/`title` only
+  - no FTS, no ranking
+- `include_samples` (default `true`)
+- `sample_limit` (default `10`, capped to `50`)
+- `limit` (default `100`, capped to `1000`)
+
+Behavior notes:
+
+- review scope is restricted to rows mapped by `imported_pack_rows` for the given `pack_id`
+- filters combine with AND semantics
+- list values inside one filter use OR semantics
+- memory IDs that exist but are outside the selected pack are filtered with warning code `memory_ids_outside_pack_filtered`
+- samples expose promotion mapping fields when present:
+  - `promoted_to_memory_id`
+  - `promotion_id`
+  - `promoted_at`
+
+### `pack_promote_preview`
+
+Read-only preview of a future promotion plan (Phase 4a). No promotion mutation occurs.
+
+```json
+{"action":"pack_promote_preview","params":{"pack_id":"pack_...","kinds":["context_block"],"limit":100}}
+```
+
+Key params:
+
+- `pack_id` (required)
+- accepts the same row filters as `pack_review_import` except `query`
+- `include_samples` (default `true`)
+- `sample_limit` (default `10`, capped to `50`)
+- `limit` (default `100`, capped to `1000`)
+
+Behavior notes:
+
+- quarantine and trusted imported packs are eligible in this phase (`trust_level in {'quarantine','trusted'}`)
+- target preview is fixed:
+  - `target_namespace = local`
+  - `target_origin = promoted`
+- output contains candidate rows with preserved pack/import/git provenance
+- no new memory rows are created; candidates mark `would_generate_memory_id=true`
+- with no explicit row filters, warning code `preview_all_pack_rows` is returned
+- limited previews emit `promotion_preview_limited`; candidate output is additionally bounded and may emit `candidate_rows_truncated`
+- trusted-source previews emit warning code `trusted_import_source` with `phase="preview"`
+
+Scope limits:
+
+- no actual promotion in 0.19.0
+- no trusted import, signing, signature verification, trust-store policy, or alias-pack import
+
+### `pack_promote`
+
+Manual promotion from imported quarantine rows into local promoted rows (Phase 4b).
+
+```json
+{"action":"pack_promote","params":{"pack_id":"pack_...","row_ids":["ctx_001"],"confirm_promote":true}}
+```
+
+Key params:
+
+- `pack_id` (required)
+- accepts row filters aligned with `pack_promote_preview`:
+  - `topics`
+  - `kinds`
+  - `import_freshness`
+  - `row_ids`
+  - `memory_ids`
+  - `touched_paths`
+- `limit` (default `100`, capped to `1000`)
+- `allow_limited_promotion` (default `false`)
+- `allow_promote_all` (default `false`)
+- `confirm_promote` (required true gate)
+
+Hard guards:
+
+- `confirm_promote=true` is mandatory
+- if no row filters are supplied, `allow_promote_all=true` is mandatory
+- if selected rows exceed `limit`, promotion fails unless `allow_limited_promotion=true`
+- `query` filter is rejected for mutation (`query_filter_not_allowed_for_promotion`)
+- only imported packs with `trust_level` in `{'quarantine','trusted'}` are eligible
+- duplicate promotion of selected rows is rejected (`pack_rows_already_promoted`)
+
+Mutation scope:
+
+- creates new local `mem_*` rows with:
+  - `namespace=local`
+  - `origin=promoted`
+- writes promotion mappings/audit:
+  - `promoted_pack_rows`
+  - `promotion_audit`
+- copies topics with `memory_topics.source=promotion`
+- copies memory-files links with preserved imported `file_sha`
+
+Non-mutation guarantees:
+
+- imported quarantine rows remain unchanged
+- no pack ZIP reads/writes
+- trusted-source promotions emit warning code `trusted_import_source` with `phase="promotion"`
+- no trusted-import bypass into local namespace, signing, trust-store, or alias-pack promotion in this phase
+- repeated limited promotions should use narrower filters or explicit `row_ids`; `skip_already_promoted`/`allow_repromote` are not implemented in 0.20.1
+
+### Memory Packs Stabilization (0.19.6)
+
+`0.19.6` is a stabilization release, not a new Memory Packs feature phase.
+
+Stabilization focus:
+
+- lifecycle regression coverage across:
+  - `pack_preview`
+  - `pack_redaction_preview`
+  - `pack_export`
+  - `pack_inspect`
+  - `pack_import`
+  - `pack_list_imports`
+  - `pack_review_import`
+  - `pack_promote_preview`
+  - `pack_promote`
+- migration/idempotency safety checks
+- read-only contract regression checks
+- artifact safety checks (hash/redaction/source-ID leak guards)
+- retrieval boundary checks (local/promoted/quarantine visibility)
+
+Scope remains unchanged:
+
+- no signing/trust policy implementation
+- no trusted import
+- no alias-pack import/export
+
+### Memory Packs Signing/Trust Foundation (0.20.0)
+
+`0.20.0` introduces the first signing/trust layer while keeping quarantine as the import target.
+
+Key additions:
+
+- signer registry actions:
+  - `signer_add`
+  - `signer_list`
+  - `signer_disable`
+  - `signer_enable`
+- signed export option:
+  - `pack_export` with `sign_pack=true`
+  - local-HMAC signature member `signature/signature.json`
+- signature verification/classification in `pack_inspect`:
+  - unsigned/not-verified/trusted/unknown/blocked/disabled/invalid/mismatch/unsupported states
+
+Important scope:
+
+- stdlib-only mode uses local HMAC (`hmac-sha256-local-v1`)
+- this is not public-key signing and not non-repudiation
+- trusted import remains future work; valid signed packs still return `quarantine_only`
+
+### Trusted Import Policy
+
+Trusted import is NOT local adoption.
+
+- trusted imported rows are stored under `pack:trusted:<pack_id>`
+- imported rows remain `origin=imported`
+- trusted import does not write direct `namespace=local` rows
+
+Trusted import is NOT automatic promotion.
+
+- manual promotion is still explicit via `pack_promote`
+- `pack_promote` gates remain in force (`confirm_promote`, selection filters, limit guards)
+- manual promotion remains explicit
+
+Trusted import is NOT default retrieval.
+
+- default retrieval continues to scope to `namespace=local`
+- trusted imports require `include_imported=true` or explicit namespace
+- quarantine imports require `include_quarantine=true` or explicit namespace
+
+Trusted import requires verified trust.
+
+- `pack_inspect` classification must be `trusted_signer`
+- signature must verify with `verification_secret`
+- signer must be active/trusted and fingerprint-matched
+- operator must pass `allow_trusted_import=true`
+
+Quarantine remains the safe fallback.
+
+- unsigned/unverified/unknown/invalid/blocked/disabled/mismatch/unsupported signature states cannot trusted-import
+- valid unsigned or cautious imports continue to use `allow_unsigned_quarantine=true`
+
+### Memory Packs lifecycle recap
+
+Current workflow through `0.21.1`:
+
+1. `record` + `topic_add`
+2. `pack_preview`
+3. `pack_redaction_preview`
+4. `pack_export` (unsigned or signed local-HMAC mode)
+5. `pack_inspect` (structure/hash + signature classification/verification + `trusted_import_available`)
+6. `pack_import`:
+   - trusted mode: `allow_trusted_import=true` + `verification_secret`
+   - quarantine mode: `allow_unsigned_quarantine=true`
+7. `pack_list_imports` + `pack_review_import`
+8. `pack_promote_preview`
+9. `pack_promote` (manual local promotion)
+
+Retrieval include-flag semantics (`0.21.1`):
+
+- default: local namespace only
+- `include_imported=true`: adds trusted imported namespaces
+- `include_quarantine=true`: adds quarantine imported namespaces
+- both flags together: include both trusted and quarantine imported namespaces
+- explicit `namespace`/`namespaces`: overrides include flags
+
+Scope/limits retained:
+
+- local HMAC remains the signing mode in stdlib-only deployments
+- no public-key identity and no non-repudiation in local-HMAC mode
+- no persistent secret store
+- no key revocation or remote key discovery
+- no automatic trusted promotion
+- no alias pack import/export
+
+### Memory Packs 0.21.1 stabilization
+
+`0.21.1` is a stabilization pass, not a new feature phase.
+
+Stabilization coverage includes:
+
+- trusted/quarantine retrieval-boundary and include-flag regressions
+- trusted lifecycle, quarantine fallback lifecycle, and unsigned lifecycle regressions
+- cross-trust reimport/collision regressions
+- trusted-import tamper rejection regressions
+- verification-secret scrubbing regressions
+- trusted-source promotion provenance/freshness regressions
+
+If you migrate from pre-5b assumptions:
+
+- `include_imported=true` now means trusted imported namespaces
+- `include_quarantine=true` means quarantine imported namespaces
+- use both for combined imported scope
+
+### Memory Packs v1 status
+
+Complete for practical local export/import workflows when synthetic readiness reports `memory_packs_v1_status=ready`.
+
+Current v1 lifecycle:
+
+- export
+- inspect
+- import (trusted or quarantine)
+- review
+- promotion preview
+- manual promotion
+
+Future optional extensions:
+
+- public-key signing
+- persistent secret store
+- revocation/discovery workflows
+- alias-pack flows
+- skip-already-promoted ergonomics
 
 ### `search`
 
