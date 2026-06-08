@@ -132,7 +132,10 @@ Read-only preview for future memory-pack selection.
 Key params:
 
 - `topics`: topic filter via `memory_topics` joins
+- `group_id`: computed group selector resolved by the same runtime logic as `memory_group_preview`
+- `scope`: `core`, `core_plus_related`, or `full_tree` when `group_id` is used
 - `kinds`: defaults to `["context_block","hippocampus_entry"]`
+- `memory_ids`: exact selector; unknown IDs are ignored with warning and do not broaden selection
 - `namespace` or `namespaces` (mutually exclusive)
 - `include_imported`: adds trusted imported namespaces
 - `include_quarantine`: adds quarantine namespaces
@@ -142,6 +145,12 @@ Key params:
 - `limit`: defaults to `100`
 - `sample_per_kind`: defaults to `3`
 - `include_samples`: defaults to `true`
+
+Selector rules:
+
+- `group_id` cannot be combined with `topics`
+- `group_id` cannot be combined with `memory_ids`
+- mixed selector requests fail with `ambiguous_selector`
 
 Read-only behavior:
 
@@ -160,7 +169,10 @@ Read-only baseline redaction dry-run over the same selection engine used by `pac
 Selection params match `pack_preview`, including:
 
 - `topics`
+- `group_id`
+- `scope`
 - `kinds`
+- `memory_ids`
 - `namespace` / `namespaces`
 - `include_imported` / `include_quarantine`
 - `origin` / `origins`
@@ -191,7 +203,7 @@ Read-only behavior:
 
 ### `pack_export`
 
-Writes a local pack ZIP using the same selection semantics as `pack_preview`.
+Writes a local pack artifact using the same selection semantics as `pack_preview`.
 
 ```json
 {"action":"pack_export","params":{"pack_name":"auth_memory_pack","allow_unsigned":true}}
@@ -210,7 +222,10 @@ Key params:
 - `output_dir` (optional; defaults to `state/mnemo/packs/exports/`)
 - selection filters shared with `pack_preview`:
   - `topics`
+  - `group_id`
+  - `scope`
   - `kinds`
+  - `memory_ids`
   - `namespace` / `namespaces`
   - `include_imported` / `include_quarantine`
   - `origin` / `origins`
@@ -225,7 +240,17 @@ Policy constraints:
   - `context_block`
   - `hippocampus_entry`
 - preview-only kinds (`interaction_log`, `agent_feedback`) are rejected for export
+- limited group/topic/memory-id selections require explicit confirmation:
+  - `allow_limited_export=true`
+  - otherwise export fails with `limited_export_requires_confirmation`
 - `hmac-sha256-local-v1` is local/dev signing only; it is not public-key identity and not non-repudiation
+
+Artifact/suffix behavior:
+
+- exported files now end with `.mem`
+- `.mem` remains a ZIP container internally
+- legacy `.zip` packs remain accepted by `pack_inspect` and `pack_import` for compatibility
+- `content/file_fingerprints.json` stores touched-file paths and hashes only, not file contents
 
 Redaction behavior:
 
@@ -238,6 +263,71 @@ Redaction behavior:
   - `user_path`
   - `ipv4`
 - baseline-v1 is intentionally incomplete and not a full DLP system
+
+Prompt UX notes:
+
+- `/mnemo.memory-pack-export` is the normal user-facing export command
+- no-input export should browse and export in one flow
+- final selectors must still be exact topic, exact `group_id`, or explicit advanced `memory_ids`
+- normal export UX should prefer passing `group_id` + `scope` directly into `pack_preview`, `pack_redaction_preview`, and `pack_export`
+
+### `pack_landing_list`
+
+Read-only listing of inbound pack artifacts for the import prompt UX.
+
+```json
+{"action":"pack_landing_list","params":{"limit":20,"include_legacy_zip":false}}
+```
+
+Behavior notes:
+
+- default landing folder: `state/mnemo/packs/inbox/`
+- override with `MNEMO_PACK_LANDING_DIR`
+- returns `.mem` packs with:
+  - `filename`
+  - `path`
+  - `size_bytes`
+  - `modified_at`
+- ignores non-`.mem` files by default
+- optional `include_legacy_zip=true` includes legacy `.zip` packs
+- no import, move, or delete is performed
+
+### `memory_group_discover`
+
+Read-only deterministic discovery of computed memory groups from existing Mnemo rows.
+
+```json
+{"action":"memory_group_discover","params":{"query":"memory packs","include_imported":true,"limit_groups":20}}
+```
+
+Behavior notes:
+
+- uses current Mnemo visibility rules (`local` by default, `include_imported`, `include_quarantine`, explicit namespace overrides)
+- computes topic/domain/path/link/alias groups from existing SQLite data only
+- alias groups use active alias concepts already present in SQLite alias runtime tables
+- pending alias proposals do not create groups
+- disabled alias terms/concepts do not create groups
+- excludes mechanical topics such as `export:*`, `synthetic:run:*`, and `synthetic:cohort:*`
+- returns bounded samples plus recommended scopes (`core`, `core_plus_related`, `full_tree`)
+
+### `memory_group_preview`
+
+Read-only resolution of one computed group into exact Mnemo `memory_ids`.
+
+```json
+{"action":"memory_group_preview","params":{"group_id":"topic:mnemo-memory-packs","scope":"core_plus_related","limit":500}}
+```
+
+Behavior notes:
+
+- `group_id` is required
+- alias-backed groups use `group_id="alias:<concept_id>"`
+- scopes:
+  - `core`
+  - `core_plus_related`
+  - `full_tree`
+- returns exact `memory_ids`, bounded membership reasons, and pack-readiness output
+- `pack_readiness.recommended_pack_selector.memory_ids` can be passed directly to `pack_preview`, `pack_redaction_preview`, or `pack_export`
 
 Pack format notes:
 
@@ -259,10 +349,10 @@ Pack format notes:
 
 ### `pack_inspect`
 
-Read-only inspection and validation for exported memory-pack ZIP files.
+Read-only inspection and validation for exported memory-pack files.
 
 ```json
-{"action":"pack_inspect","params":{"pack_path":"D:/packs/my_pack.zip","include_samples":false,"sample_limit":5}}
+{"action":"pack_inspect","params":{"pack_path":"D:/packs/my_pack.mem","include_samples":false,"sample_limit":5}}
 ```
 
 Key params:
@@ -303,6 +393,8 @@ Status/recommendation behavior:
 - valid signed packs are still `quarantine_only` in 0.20.1 (trusted import is not implemented)
 - malformed/tampered/unsupported packs are marked `reject`
 - invalid/unsupported packs return no samples
+- `.mem` is the preferred public suffix
+- legacy `.zip` suffixes are still accepted with compatibility warning `legacy_zip_suffix`
 - trust/signature classification is returned under `structuredContent.signature.trust_classification`:
   - `unsigned`
   - `signature_not_verified`
@@ -326,11 +418,11 @@ Read-only behavior:
 Validated pack import with explicit target policy (Phase 5b trusted import update).
 
 ```json
-{"action":"pack_import","params":{"pack_path":"D:/packs/my_pack.zip","allow_unsigned_quarantine":true}}
+{"action":"pack_import","params":{"pack_path":"D:/packs/my_pack.mem","allow_unsigned_quarantine":true}}
 ```
 
 ```json
-{"action":"pack_import","params":{"pack_path":"D:/packs/my_pack.zip","allow_trusted_import":true,"verification_secret":"..."}}
+{"action":"pack_import","params":{"pack_path":"D:/packs/my_pack.mem","allow_trusted_import":true,"verification_secret":"..."}}
 ```
 
 Key params:
@@ -366,6 +458,12 @@ Import policy:
 - kinds are restricted to:
   - `context_block`
   - `hippocampus_entry`
+
+Prompt UX notes:
+
+- `/mnemo.memory-pack-import` is the normal user-facing import command
+- no-input import should browse `pack_landing_list`, inspect one chosen pack, ask for quarantine vs trusted import, then review
+- review should use `include_grouped_summary=true`
 
 Imported data behavior:
 
@@ -520,6 +618,7 @@ Behavior notes:
   - `promoted_to_memory_id`
   - `promotion_id`
   - `promoted_at`
+- optional `include_grouped_summary=true` adds bounded topic/domain/path grouping and suggested promotion groups from already-imported SQLite rows
 
 ### `pack_promote_preview`
 

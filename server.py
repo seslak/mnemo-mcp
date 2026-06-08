@@ -9,6 +9,8 @@ Environment variables:
 - MNEMO_FILE: compatibility/import/export path for memory.json.
 - MNEMO_SQLITE_FILE: sqlite db path. Defaults to <workspace>/state/mnemo/mnemo.sqlite.
 - MNEMO_MAX_MEMORIES: total memory cap including retired entries. Defaults to 5000.
+- MNEMO_PACK_LANDING_DIR: default landing folder for inbound .mem packs.
+  Defaults to <workspace>/state/mnemo/packs/inbox.
 - MNEMO_LOG_QUERIES: set to 0 to disable query event logging. Defaults to 1.
 - MNEMO_WORKSPACE_ROOT: root for lookup_symbol. Defaults to the parent of
   the current working directory.
@@ -63,7 +65,7 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.21.2"
+SERVER_VERSION = "0.21.7"
 SQLITE_SCHEMA_VERSION = "7"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 DEFAULT_MEMORY_NAMESPACE = "local"
@@ -165,6 +167,8 @@ PACK_IMPORT_OUTPUT_TRUNCATED_WARNING_CODE = "imported_rows_truncated"
 PACK_SIGNATURE_MEMBER = "signature/signature.json"
 PACK_UNSIGNED_REASON_SIGNING_NOT_IMPLEMENTED = "signing_not_implemented"
 PACK_UNSIGNED_REASON_OPERATOR = "operator_chose_unsigned"
+PACK_FILE_EXTENSION = ".mem"
+PACK_LEGACY_FILE_EXTENSION = ".zip"
 PACK_SIGNATURE_ALGORITHM_HMAC_LOCAL = "hmac-sha256-local-v1"
 PACK_SIGNATURE_PAYLOAD_VERSION_V1 = "memory-pack-signing-v1"
 PACK_SIGNATURE_SCHEMA_VERSION = 1
@@ -177,6 +181,12 @@ PACK_REVIEW_LIMIT_DEFAULT = 100
 PACK_REVIEW_LIMIT_MAX = 1000
 PACK_REVIEW_SAMPLE_LIMIT_DEFAULT = 10
 PACK_REVIEW_SAMPLE_LIMIT_MAX = 50
+MEMORY_GROUP_DISCOVER_LIMIT_DEFAULT = 20
+MEMORY_GROUP_DISCOVER_LIMIT_MAX = 100
+MEMORY_GROUP_SAMPLE_PER_GROUP_DEFAULT = 3
+MEMORY_GROUP_PREVIEW_LIMIT_DEFAULT = 500
+MEMORY_GROUP_PREVIEW_LIMIT_MAX = 1000
+MEMORY_GROUP_MECHANICAL_TOPIC_PREFIXES = ("export:", "synthetic:run:", "synthetic:cohort:")
 PACK_PROMOTE_PREVIEW_CANDIDATE_OUTPUT_MAX = 100
 PACK_PROMOTE_OUTPUT_MAX_ROWS = 100
 PACK_SAMPLES_SCAN_ORDER = tuple(PACK_REDACTION_TEXT_FIELDS)
@@ -4264,6 +4274,12 @@ def recent_events(args: dict[str, Any]) -> dict[str, Any]:
             if domain:
                 rows = [row for row in rows if normalize_optional_string(row.get("domain")) == domain]
             rows = rows[:limit]
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
@@ -4287,6 +4303,12 @@ def memory_events(args: dict[str, Any]) -> dict[str, Any]:
         else:
             rows = [row for row in _legacy_event_rows(include_archive=False) if str(row.get("memory_id") or "") == memory_id]
             rows = rows[:limit]
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
@@ -5133,6 +5155,13 @@ def export_root() -> Path:
     root = state_dir() / "exports"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def pack_landing_dir() -> Path:
+    configured = os.environ.get("MNEMO_PACK_LANDING_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (state_dir() / "packs" / "inbox").resolve()
 
 
 def _default_export_path(format_value: str) -> Path:
@@ -8488,6 +8517,27 @@ def _pack_parse_common_filters(args: dict[str, Any]) -> dict[str, Any]:
             kinds.append(value)
         if not kinds:
             raise ValueError("kinds must contain at least one value")
+    memory_ids = normalize_optional_string_list(args.get("memory_ids"), "memory_ids") or []
+    seen_memory_ids: set[str] = set()
+    deduped_memory_ids: list[str] = []
+    for memory_id in memory_ids:
+        value = str(memory_id).strip()
+        if not value or value in seen_memory_ids:
+            continue
+        seen_memory_ids.add(value)
+        deduped_memory_ids.append(value)
+    group_id = normalize_optional_string(args.get("group_id"))
+    scope = normalize_choice(
+        args.get("scope"),
+        "scope",
+        ("core", "core_plus_related", "full_tree"),
+        default="core_plus_related",
+        strict=True,
+    ) or "core_plus_related"
+    if group_id is not None and topics:
+        raise PackSelectorError("ambiguous_selector", "group_id cannot be combined with topics")
+    if group_id is not None and deduped_memory_ids:
+        raise PackSelectorError("ambiguous_selector", "group_id cannot be combined with memory_ids")
     raw_touched_paths = normalize_optional_string_list(args.get("touched_paths"), "touched_paths") or []
     touched_paths = normalize_touched_paths(args.get("touched_paths")) or []
     created_after = normalize_iso_utc_timestamp(args.get("created_after"), "created_after")
@@ -8498,6 +8548,9 @@ def _pack_parse_common_filters(args: dict[str, Any]) -> dict[str, Any]:
     return {
         "topics": topics,
         "kinds": kinds,
+        "memory_ids": deduped_memory_ids,
+        "group_id": group_id,
+        "scope": scope,
         "raw_touched_paths": raw_touched_paths,
         "touched_paths": touched_paths,
         "created_after": created_after,
@@ -8515,11 +8568,49 @@ def _pack_selection_context(
     resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
     topics: list[str] = list(parsed_filters["topics"])
     kinds: list[str] = list(parsed_filters["kinds"])
+    memory_ids_input: list[str] = list(parsed_filters.get("memory_ids", []))
+    group_id = normalize_optional_string(parsed_filters.get("group_id"))
+    scope = normalize_optional_string(parsed_filters.get("scope")) or "core_plus_related"
     raw_touched_paths: list[str] = list(parsed_filters["raw_touched_paths"])
     touched_paths: list[str] = list(parsed_filters["touched_paths"])
     created_after = normalize_optional_string(parsed_filters.get("created_after"))
     created_before = normalize_optional_string(parsed_filters.get("created_before"))
     limit = int(parsed_filters["limit"])
+
+    if group_id is not None:
+        catalog = _memory_group_build_catalog(conn, args, [])
+        group_selection = _memory_group_resolve_selection(catalog, group_id, scope)
+        row_map = dict(group_selection["row_map"])
+        ordered_ids = [
+            memory_id
+            for memory_id in group_selection["ordered_ids"]
+            if memory_id in row_map and str(row_map[memory_id].get("kind", "")) in kinds
+        ]
+        selected_ids = list(ordered_ids[:limit])
+        return {
+            "topics": [],
+            "kinds": kinds,
+            "memory_ids": [],
+            "resolved_memory_ids": selected_ids,
+            "group_id": group_id,
+            "scope": scope,
+            "raw_touched_paths": [],
+            "touched_paths": [],
+            "created_after": None,
+            "created_before": None,
+            "limit": limit,
+            "resolved_namespaces": list(group_selection["resolved_namespaces"]),
+            "resolved_origins": group_selection["resolved_origins"],
+            "where_sql": "m.id IN ({})".format(",".join("?" for _ in selected_ids)) if selected_ids else "1 = 0",
+            "sql_params": selected_ids,
+            "created_column": None,
+            "order_sql": "m.id ASC",
+            "total_rows": len(ordered_ids),
+            "row_ids": selected_ids,
+            "selected_rows": [dict(row_map[memory_id]) for memory_id in selected_ids],
+            "limited": bool(len(ordered_ids) > limit),
+            "selector_mode": "group_id",
+        }
 
     column_rows = conn.execute("PRAGMA table_info(memories)").fetchall()
     memory_columns = {
@@ -8556,6 +8647,28 @@ def _pack_selection_context(
         kind_placeholders = ",".join("?" for _ in kinds)
         clauses.append(f"m.kind IN ({kind_placeholders})")
         sql_params.extend(kinds)
+
+    known_memory_ids: list[str] = []
+    if memory_ids_input:
+        rows = conn.execute(
+            f"SELECT id FROM memories WHERE id IN ({','.join('?' for _ in memory_ids_input)}) ORDER BY id ASC",
+            tuple(memory_ids_input),
+        ).fetchall()
+        known_memory_ids = [str(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
+        unknown_memory_ids = [memory_id for memory_id in memory_ids_input if memory_id not in set(known_memory_ids)]
+        if unknown_memory_ids:
+            warnings.append(
+                {
+                    "code": "unknown_memory_ids_ignored",
+                    "message": f"{len(unknown_memory_ids)} memory_ids were not found and were ignored.",
+                }
+            )
+        if known_memory_ids:
+            memory_id_placeholders = ",".join("?" for _ in known_memory_ids)
+            clauses.append(f"m.id IN ({memory_id_placeholders})")
+            sql_params.extend(known_memory_ids)
+        else:
+            clauses.append("1 = 0")
 
     if topics:
         topic_placeholders = ",".join("?" for _ in topics)
@@ -8634,6 +8747,10 @@ def _pack_selection_context(
     return {
         "topics": topics,
         "kinds": kinds,
+        "memory_ids": memory_ids_input,
+        "resolved_memory_ids": known_memory_ids,
+        "group_id": group_id,
+        "scope": scope,
         "raw_touched_paths": raw_touched_paths,
         "touched_paths": touched_paths,
         "created_after": created_after,
@@ -8648,6 +8765,8 @@ def _pack_selection_context(
         "total_rows": total_rows,
         "row_ids": row_ids,
         "selected_rows": selected_rows,
+        "limited": bool(total_rows > limit),
+        "selector_mode": "memory_ids" if memory_ids_input else "topics" if topics else "filters",
     }
 
 
@@ -8812,11 +8931,97 @@ def _pack_output_dir(raw_output_dir: Any) -> Path:
 
 
 def _pack_output_path(output_dir: Path, sanitized_pack_name: str, pack_id: str) -> Path:
-    filename = f"{sanitized_pack_name}_{pack_id}.zip"
+    filename = f"{sanitized_pack_name}_{pack_id}{PACK_FILE_EXTENSION}"
     final_path = (output_dir / filename).resolve()
     if final_path.parent != output_dir.resolve():
         raise ValueError("unsafe export output path")
     return final_path
+
+
+def _pack_landing_matches(path: Path, *, include_legacy_zip: bool) -> bool:
+    suffix = path.suffix.lower()
+    if suffix == PACK_FILE_EXTENSION:
+        return True
+    if include_legacy_zip and suffix == PACK_LEGACY_FILE_EXTENSION:
+        return True
+    return False
+
+
+def pack_landing_list(args: dict[str, Any]) -> dict[str, Any]:
+    include_legacy_zip = parse_bool(args.get("include_legacy_zip"), default=False)
+    limit = _safe_int(args.get("limit"), 20, minimum=1, maximum=200)
+    landing_dir = pack_landing_dir()
+    warnings: list[dict[str, str]] = []
+    packs: list[dict[str, Any]] = []
+
+    if not landing_dir.exists():
+        warnings.append(
+            {
+                "code": "landing_dir_missing",
+                "message": f"landing folder does not exist yet: {landing_dir}",
+            }
+        )
+    elif not landing_dir.is_dir():
+        return tool_error_code("landing_dir_not_directory", f"landing folder is not a directory: {landing_dir}")
+    else:
+        try:
+            candidates = [path for path in landing_dir.iterdir() if path.is_file() and _pack_landing_matches(path, include_legacy_zip=include_legacy_zip)]
+        except Exception as exc:
+            return tool_error_code("landing_dir_read_failed", f"{type(exc).__name__}: {exc}")
+        candidates.sort(key=lambda path: (-int(path.stat().st_mtime_ns), path.name.lower(), path.name))
+        limited = len(candidates) > limit
+        for path in candidates[:limit]:
+            stat = path.stat()
+            packs.append(
+                {
+                    "filename": path.name,
+                    "path": str(path.resolve()),
+                    "size_bytes": int(stat.st_size),
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "suffix": path.suffix.lower(),
+                    "legacy_zip": path.suffix.lower() == PACK_LEGACY_FILE_EXTENSION,
+                }
+            )
+        structured = {
+            "action": "pack_landing_list",
+            "status": "ok",
+            "landing_dir": str(landing_dir),
+            "landing_dir_exists": True,
+            "include_legacy_zip": include_legacy_zip,
+            "total": len(candidates),
+            "limited": limited,
+            "limit": limit,
+            "packs": packs,
+            "warnings": warnings,
+        }
+        lines = [
+            f"Landing packs: {len(candidates)} (limited={str(limited).lower()}, limit={limit})",
+            f"Landing dir: {landing_dir}",
+        ]
+        return text_result("\n".join(lines), structured)
+
+    structured = {
+        "action": "pack_landing_list",
+        "status": "ok",
+        "landing_dir": str(landing_dir),
+        "landing_dir_exists": False,
+        "include_legacy_zip": include_legacy_zip,
+        "total": 0,
+        "limited": False,
+        "limit": limit,
+        "packs": [],
+        "warnings": warnings,
+    }
+    lines = [
+        "Landing packs: 0 (limited=false, limit={0})".format(limit),
+        f"Landing dir: {landing_dir}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def _pack_suffix_flags(pack_path: Path) -> tuple[bool, bool]:
+    ext = pack_path.suffix.lower()
+    return ext == PACK_LEGACY_FILE_EXTENSION, ext not in {PACK_FILE_EXTENSION, PACK_LEGACY_FILE_EXTENSION}
 
 
 def _signer_row_payload(row: sqlite3.Row | tuple[Any, ...] | dict[str, Any]) -> dict[str, Any]:
@@ -9197,6 +9402,13 @@ class PackSnapshotError(ValueError):
         self.message = str(message)
 
 
+class PackSelectorError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.message = str(message)
+
+
 def _load_pack_snapshot(pack_path: Path) -> dict[str, Any]:
     # Snapshot invariant:
     # Validation and import must operate on the exact same bytes. The caller
@@ -9351,6 +9563,23 @@ def _pack_inspect_warning(payload: dict[str, Any], code: str, message: str) -> N
     if key in existing:
         return
     warnings.append({"code": str(code), "message": str(message)})
+
+
+def _pack_inspect_add_suffix_warning(
+    payload: dict[str, Any], *, legacy_zip_suffix_warning: bool, nonstandard_suffix_warning: bool
+) -> None:
+    if legacy_zip_suffix_warning:
+        _pack_inspect_warning(
+            payload,
+            "legacy_zip_suffix",
+            "Pack path ends with .zip; this legacy suffix remains supported for compatibility, but .mem is preferred.",
+        )
+    elif nonstandard_suffix_warning:
+        _pack_inspect_warning(
+            payload,
+            "nonstandard_pack_suffix",
+            "Pack path does not end with .mem or .zip but will be inspected because it opened as a valid ZIP.",
+        )
 
 
 def _pack_inspect_error(payload: dict[str, Any], code: str, message: str) -> None:
@@ -9568,15 +9797,15 @@ def _inspect_pack_snapshot(
     include_samples: bool,
     sample_limit: int,
     verification_secret: str | None = None,
-    non_zip_suffix_warning: bool = False,
+    legacy_zip_suffix_warning: bool = False,
+    nonstandard_suffix_warning: bool = False,
 ) -> dict[str, Any]:
     payload = _pack_inspect_default()
-    if non_zip_suffix_warning:
-        _pack_inspect_warning(
-            payload,
-            "non_zip_suffix",
-            "Pack path does not end with .zip but will be inspected because it opened as a valid ZIP.",
-        )
+    _pack_inspect_add_suffix_warning(
+        payload,
+        legacy_zip_suffix_warning=legacy_zip_suffix_warning,
+        nonstandard_suffix_warning=nonstandard_suffix_warning,
+    )
 
     raw_member_bytes = snapshot.get("required_member_bytes", {})
     if not isinstance(raw_member_bytes, dict):
@@ -10240,6 +10469,8 @@ def pack_preview(args: dict[str, Any]) -> dict[str, Any]:
         parsed = _pack_parse_common_filters(args)
         sample_per_kind = _safe_int(args.get("sample_per_kind"), 3, minimum=0, maximum=20)
         include_samples = parse_bool(args.get("include_samples"), default=True)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -10382,6 +10613,8 @@ def pack_preview(args: dict[str, Any]) -> dict[str, Any]:
                         break
                 samples = {kind_name: samples[kind_name] for kind_name in sorted(samples)}
 
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
@@ -10391,6 +10624,9 @@ def pack_preview(args: dict[str, Any]) -> dict[str, Any]:
         "filters": {
             "topics": list(selection["topics"]),
             "kinds": list(selection["kinds"]),
+            "memory_ids": list(selection["resolved_memory_ids"]),
+            "group_id": selection["group_id"],
+            "scope": selection["scope"],
             "namespaces": list(selection["resolved_namespaces"]),
             "origins": list(selection["resolved_origins"]) if selection["resolved_origins"] is not None else [],
             "created_after": selection["created_after"],
@@ -10399,7 +10635,7 @@ def pack_preview(args: dict[str, Any]) -> dict[str, Any]:
         },
         "selection": {
             "total_rows": int(selection["total_rows"]),
-            "limited": bool(int(selection["total_rows"]) > int(selection["limit"])),
+            "limited": bool(selection["limited"]),
             "limit": int(selection["limit"]),
             "row_ids": list(selection["row_ids"]),
         },
@@ -10445,6 +10681,8 @@ def pack_redaction_preview(args: dict[str, Any]) -> dict[str, Any]:
         parsed = _pack_parse_common_filters(args)
         include_redacted_samples = parse_bool(args.get("include_redacted_samples"), default=True)
         max_redacted_samples = _safe_int(args.get("max_redacted_samples"), 10, minimum=0, maximum=500)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -10463,6 +10701,8 @@ def pack_redaction_preview(args: dict[str, Any]) -> dict[str, Any]:
         with _sqlite_session() as conn:
             _sqlite_ensure_schema(conn)
             selection = _pack_selection_context(conn, args, parsed, warnings)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
@@ -10536,6 +10776,9 @@ def pack_redaction_preview(args: dict[str, Any]) -> dict[str, Any]:
         "filters": {
             "topics": list(selection["topics"]),
             "kinds": list(selection["kinds"]),
+            "memory_ids": list(selection["resolved_memory_ids"]),
+            "group_id": selection["group_id"],
+            "scope": selection["scope"],
             "namespaces": list(selection["resolved_namespaces"]),
             "origins": list(selection["resolved_origins"]) if selection["resolved_origins"] is not None else [],
             "created_after": selection["created_after"],
@@ -10624,6 +10867,1048 @@ def _pack_files_by_memory_id(conn: sqlite3.Connection, row_ids: list[str]) -> di
     return file_map
 
 
+def _memory_group_is_mechanical_topic(topic: str) -> bool:
+    topic_value = str(topic).strip().lower()
+    return any(topic_value.startswith(prefix) for prefix in MEMORY_GROUP_MECHANICAL_TOPIC_PREFIXES)
+
+
+def _memory_group_slug_label(value: str) -> str:
+    text = str(value).replace("_", " ").replace("-", " ").replace("/", " ").strip()
+    if not text:
+        return "Unlabeled Group"
+    return " ".join(part.capitalize() for part in text.split())
+
+
+def _memory_group_path_parent(path_value: str) -> str | None:
+    normalized = str(path_value).replace("\\", "/").strip("/")
+    if not normalized or "/" not in normalized:
+        return None
+    parent = normalized.rsplit("/", 1)[0].strip("/")
+    return parent or None
+
+
+def _memory_group_linked_ids_from_raw(raw_value: Any) -> list[str]:
+    text = normalize_optional_string(raw_value)
+    if text is None:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return []
+    return normalize_linked_ids(parsed)
+
+
+def _memory_group_base_rows(
+    conn: sqlite3.Connection,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
+    seed_topics = normalize_optional_string_list(args.get("topics"), "topics") or []
+    domains = normalize_optional_string_list(args.get("domains"), "domains") or []
+
+    clauses = [
+        "m.deleted = 0",
+        "(m.superseded_by IS NULL OR m.superseded_by = '')",
+    ]
+    sql_params: list[Any] = []
+
+    namespace_placeholders = ",".join("?" for _ in resolved_namespaces)
+    clauses.append(f"m.namespace IN ({namespace_placeholders})")
+    sql_params.extend(resolved_namespaces)
+
+    if resolved_origins:
+        origin_placeholders = ",".join("?" for _ in resolved_origins)
+        clauses.append(f"m.origin IN ({origin_placeholders})")
+        sql_params.extend(resolved_origins)
+
+    if seed_topics:
+        topic_placeholders = ",".join("?" for _ in seed_topics)
+        clauses.append(
+            "EXISTS ("
+            "SELECT 1 FROM memory_topics mt "
+            "WHERE mt.memory_id = m.id "
+            f"AND mt.topic IN ({topic_placeholders})"
+            ")"
+        )
+        sql_params.extend(seed_topics)
+
+    if domains:
+        domain_placeholders = ",".join("?" for _ in domains)
+        clauses.append(f"m.domain IN ({domain_placeholders})")
+        sql_params.extend(domains)
+
+    where_sql = " AND ".join(clauses)
+    rows = conn.execute(
+        "SELECT m.id, m.kind, m.text, m.title, m.preview, m.domain, m.namespace, m.origin, "
+        "m.import_freshness, m.git_sha, m.git_branch, m.git_dirty, m.created_at, m.updated_at, "
+        "m.linked_ids_json, m.normalized_hash, m.shingle_hashes_json "
+        f"FROM memories m WHERE {where_sql} "
+        "ORDER BY COALESCE(m.updated_at, m.created_at, '') DESC, m.id ASC",
+        tuple(sql_params),
+    ).fetchall()
+    memory_ids = [str(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
+    topics_by_memory_id = _pack_topics_by_memory_id(conn, memory_ids)
+    files_by_memory_id = _pack_files_by_memory_id(conn, memory_ids)
+
+    payload_rows: list[dict[str, Any]] = []
+    row_map: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        memory_id = str(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+        payload = {
+            "id": memory_id,
+            "kind": str(row["kind"] if isinstance(row, sqlite3.Row) else row[1]),
+            "text": str(row["text"] if isinstance(row, sqlite3.Row) else row[2]),
+            "title": normalize_optional_string(row["title"] if isinstance(row, sqlite3.Row) else row[3]),
+            "preview": normalize_optional_string(row["preview"] if isinstance(row, sqlite3.Row) else row[4]),
+            "domain": normalize_optional_string(row["domain"] if isinstance(row, sqlite3.Row) else row[5]),
+            "namespace": str(row["namespace"] if isinstance(row, sqlite3.Row) else row[6]),
+            "origin": str(row["origin"] if isinstance(row, sqlite3.Row) else row[7]),
+            "import_freshness": normalize_optional_string(
+                row["import_freshness"] if isinstance(row, sqlite3.Row) else row[8]
+            ),
+            "git_sha": normalize_optional_string(row["git_sha"] if isinstance(row, sqlite3.Row) else row[9]),
+            "git_branch": normalize_optional_string(row["git_branch"] if isinstance(row, sqlite3.Row) else row[10]),
+            "git_dirty": normalize_git_dirty(row["git_dirty"] if isinstance(row, sqlite3.Row) else row[11]),
+            "created_at": normalize_optional_string(row["created_at"] if isinstance(row, sqlite3.Row) else row[12]),
+            "updated_at": normalize_optional_string(row["updated_at"] if isinstance(row, sqlite3.Row) else row[13]),
+            "linked_ids": _memory_group_linked_ids_from_raw(
+                row["linked_ids_json"] if isinstance(row, sqlite3.Row) else row[14]
+            ),
+            "normalized_hash": normalize_optional_string(
+                row["normalized_hash"] if isinstance(row, sqlite3.Row) else row[15]
+            ),
+            "shingle_hashes": _load_json_string_list(
+                row["shingle_hashes_json"] if isinstance(row, sqlite3.Row) else row[16]
+            ),
+            "topics": list(topics_by_memory_id.get(memory_id, [])),
+            "touched_files": list(files_by_memory_id.get(memory_id, [])),
+        }
+        payload_rows.append(payload)
+        row_map[memory_id] = payload
+
+    return {
+        "rows": payload_rows,
+        "row_map": row_map,
+        "resolved_namespaces": resolved_namespaces,
+        "resolved_origins": resolved_origins,
+        "seed_topics": seed_topics,
+        "domains": domains,
+    }
+
+
+def _memory_group_collect_related_ids(
+    core_ids: set[str],
+    row_map: dict[str, dict[str, Any]],
+    topic_index: dict[str, set[str]],
+    domain_index: dict[str, set[str]],
+    path_index: dict[str, set[str]],
+    normalized_hash_index: dict[str, set[str]],
+    shingle_index: dict[str, set[str]],
+    link_index: dict[str, set[str]],
+) -> tuple[list[str], dict[str, list[str]]]:
+    reason_map: dict[str, list[str]] = {}
+    score_map: dict[str, int] = {}
+
+    def add_reason(memory_id: str, reason: str, weight: int) -> None:
+        if memory_id in core_ids:
+            return
+        reasons = reason_map.setdefault(memory_id, [])
+        if reason not in reasons:
+            reasons.append(reason)
+        score_map[memory_id] = int(score_map.get(memory_id, 0) + weight)
+
+    for memory_id in core_ids:
+        row = row_map.get(memory_id)
+        if row is None:
+            continue
+        for topic_name in row.get("topics", []):
+            for candidate_id in topic_index.get(str(topic_name), set()):
+                add_reason(candidate_id, f"shared topic:{topic_name}", 3)
+        domain_value = normalize_optional_string(row.get("domain"))
+        if domain_value:
+            for candidate_id in domain_index.get(domain_value, set()):
+                add_reason(candidate_id, f"shared domain:{domain_value}", 2)
+        for file_info in row.get("touched_files", []):
+            path_value = normalize_optional_string(file_info.get("path"))
+            if path_value:
+                for candidate_id in path_index.get(path_value, set()):
+                    add_reason(candidate_id, f"shared file:{path_value}", 2)
+        for linked_id in row.get("linked_ids", []):
+            if linked_id in row_map:
+                add_reason(linked_id, f"explicit link:{memory_id}", 4)
+        normalized_hash = normalize_optional_string(row.get("normalized_hash"))
+        if normalized_hash:
+            for candidate_id in normalized_hash_index.get(normalized_hash, set()):
+                add_reason(candidate_id, "same normalized hash", 4)
+        for shingle in row.get("shingle_hashes", []):
+            for candidate_id in shingle_index.get(str(shingle), set()):
+                add_reason(candidate_id, "shared shingles", 1)
+        for candidate_id in link_index.get(memory_id, set()):
+            add_reason(candidate_id, f"explicit link:{memory_id}", 4)
+
+    related_ids = [
+        memory_id
+        for memory_id, score in sorted(
+            score_map.items(),
+            key=lambda item: (-int(item[1]), str(item[0])),
+        )
+        if score >= 2
+    ]
+    related_reason_map = {memory_id: sorted(reason_map.get(memory_id, [])) for memory_id in related_ids}
+    return related_ids, related_reason_map
+
+
+def _memory_group_summary_text(rows: list[dict[str, Any]]) -> str:
+    titles = [str(row.get("title") or "").strip() for row in rows if str(row.get("title") or "").strip()]
+    if titles:
+        snippet = "; ".join(titles[:2])
+        return snippet[:200]
+    topics: list[str] = []
+    for row in rows:
+        for topic_name in row.get("topics", []):
+            topic_value = str(topic_name)
+            if topic_value and topic_value not in topics:
+                topics.append(topic_value)
+                if len(topics) >= 4:
+                    break
+        if len(topics) >= 4:
+            break
+    if topics:
+        return f"Topics: {', '.join(topics[:4])}"
+    domains = [str(row.get('domain') or '').strip() for row in rows if str(row.get('domain') or '').strip()]
+    if domains:
+        return f"Domain: {domains[0]}"
+    return "Computed memory group from Mnemo runtime metadata."
+
+
+def _memory_group_is_synthetic_group(group: dict[str, Any]) -> bool:
+    group_type = str(group.get("group_type", "") or "")
+    group_id = str(group.get("group_id", "") or "")
+    label = str(group.get("label", "") or "")
+    joined = f"{group_id}\n{label}".lower()
+    if group_type == "path" and "state/mnemo/synthetic_files/" in joined:
+        return True
+    return (
+        "synthetic_files" in joined
+        or "synthetic ux-lab" in joined
+        or "synthetic:" in joined
+        or "ux-lab" in joined
+    )
+
+
+def _memory_group_catalog_bucket(group: dict[str, Any]) -> tuple[int, str]:
+    group_type = str(group.get("group_type", "") or "")
+    synthetic = _memory_group_is_synthetic_group(group)
+    if not synthetic and group_type == "topic":
+        return (0, group_type)
+    if not synthetic and group_type == "domain":
+        return (1, group_type)
+    if not synthetic and group_type == "alias":
+        return (2, group_type)
+    if not synthetic and group_type == "path":
+        return (3, group_type)
+    return (4, group_type)
+
+
+def _memory_group_catalog_description(group: dict[str, Any]) -> str:
+    group_type = str(group.get("group_type", "") or "group")
+    core_count = int(group.get("core_memory_count", 0) or 0)
+    core_exportable = int(group.get("core_exportable_count", 0) or 0)
+    scope_recommendation = "core"
+    recommended_scopes = group.get("recommended_scopes", [])
+    if isinstance(recommended_scopes, list) and recommended_scopes:
+        first = normalize_optional_string(recommended_scopes[0])
+        if first:
+            scope_recommendation = first
+    description = (
+        f"{group_type} - core {core_count} memories - {core_exportable} exportable - scope: {scope_recommendation}"
+    )
+    if _memory_group_is_synthetic_group(group):
+        description += " - synthetic UX-lab evidence"
+    return description
+
+
+def _memory_group_catalog_option(group: dict[str, Any]) -> dict[str, Any]:
+    group_id = str(group.get("group_id", "") or "")
+    label = str(group.get("label", "") or group_id)
+    if _memory_group_is_synthetic_group(group) and "synthetic" not in label.lower():
+        label = f"{label} [synthetic]"
+    scope_recommendation = "core"
+    recommended_scopes = group.get("recommended_scopes", [])
+    if isinstance(recommended_scopes, list) and recommended_scopes:
+        first = normalize_optional_string(recommended_scopes[0])
+        if first:
+            scope_recommendation = first
+    return {
+        "label": label,
+        "value": group_id,
+        "description": _memory_group_catalog_description(group),
+        "group_id": group_id,
+        "group_type": str(group.get("group_type", "") or ""),
+        "scope_recommendation": scope_recommendation,
+        "core_memory_count": int(group.get("core_memory_count", 0) or 0),
+        "core_exportable_count": int(group.get("core_exportable_count", 0) or 0),
+        "memory_count": int(group.get("memory_count", 0) or 0),
+        "exportable_memory_count": int(group.get("exportable_memory_count", 0) or 0),
+        "synthetic": _memory_group_is_synthetic_group(group),
+    }
+
+
+def _memory_group_confidence(
+    *,
+    core_rows: list[dict[str, Any]],
+    related_count: int,
+    query: str | None,
+    label: str,
+    reasons: list[str],
+) -> float:
+    base = 0.20 + min(len(core_rows), 8) * 0.08
+    if related_count > 0:
+        base += min(related_count, 6) * 0.03
+    evidence_bonus = 0.0
+    if any(row.get("topics") for row in core_rows):
+        evidence_bonus += 0.10
+    if any(normalize_optional_string(row.get("domain")) for row in core_rows):
+        evidence_bonus += 0.07
+    if any(row.get("touched_files") for row in core_rows):
+        evidence_bonus += 0.07
+    query_bonus = 0.0
+    query_text = normalize_optional_string(query)
+    if query_text:
+        haystack = " ".join([label] + reasons + [str(row.get("title") or "") for row in core_rows[:5]]).lower()
+        if query_text.lower() in haystack:
+            query_bonus = 0.18
+    return round(min(0.99, base + evidence_bonus + query_bonus), 3)
+
+
+def _memory_group_alias_term_is_safe(normalized_term: str, weight: float) -> bool:
+    term_value = str(normalized_term).strip()
+    if not term_value:
+        return False
+    token_count = len([token for token in term_value.split(" ") if token])
+    if token_count >= 2:
+        return True
+    if len(term_value) >= 4:
+        return True
+    return float(weight) >= 1.5
+
+
+def _memory_group_alias_source_rows(
+    conn: sqlite3.Connection,
+    language: str = DEFAULT_ALIAS_LANGUAGE,
+) -> list[dict[str, Any]]:
+    wanted_language = _normalize_alias_language(language)
+    sql = (
+        "SELECT "
+        "c.concept_id AS concept_id, "
+        "c.canonical AS canonical, "
+        "c.domain AS concept_domain, "
+        "c.language AS concept_language, "
+        "c.weight AS concept_weight, "
+        "t.alias_id AS alias_id, "
+        "t.term AS term, "
+        "t.normalized_term AS normalized_term, "
+        "t.domain AS term_domain, "
+        "t.language AS term_language, "
+        "t.weight AS term_weight "
+        "FROM alias_terms t "
+        "JOIN alias_concepts c ON c.concept_id = t.concept_id "
+        "WHERE c.status = 'active' AND t.status = 'active' "
+        "AND COALESCE(NULLIF(c.language, ''), ?) = ? "
+        "AND COALESCE(NULLIF(t.language, ''), ?) = ? "
+        "ORDER BY c.canonical, t.term"
+    )
+    rows = conn.execute(
+        sql,
+        (DEFAULT_ALIAS_LANGUAGE, wanted_language, DEFAULT_ALIAS_LANGUAGE, wanted_language),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "concept_id": str(row["concept_id"]),
+                "canonical": str(row["canonical"] or ""),
+                "concept_domain": normalize_optional_string(row["concept_domain"]),
+                "concept_language": _normalize_alias_language(row["concept_language"]),
+                "concept_weight": float(row["concept_weight"] or 1.0),
+                "alias_id": str(row["alias_id"] or ""),
+                "term": str(row["term"] or ""),
+                "normalized_term": _normalize_alias_term(row["normalized_term"] or row["term"]),
+                "term_domain": normalize_optional_string(row["term_domain"]),
+                "term_language": _normalize_alias_language(row["term_language"]),
+                "term_weight": float(row["term_weight"] or 1.0),
+            }
+        )
+    return out
+
+
+def _memory_group_alias_concepts(alias_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    concept_map: dict[str, dict[str, Any]] = {}
+    for row in alias_rows:
+        concept_id = str(row.get("concept_id") or "").strip()
+        if not concept_id:
+            continue
+        canonical = normalize_optional_string(row.get("canonical")) or concept_id
+        concept = concept_map.setdefault(
+            concept_id,
+            {
+                "concept_id": concept_id,
+                "canonical": canonical,
+                "label": canonical,
+                "domain": normalize_optional_string(row.get("concept_domain")) or normalize_optional_string(row.get("term_domain")),
+                "language": _normalize_alias_language(row.get("concept_language") or row.get("term_language")),
+                "weight": max(float(row.get("concept_weight") or 1.0), float(row.get("term_weight") or 1.0)),
+                "terms": [],
+            },
+        )
+        term_value = normalize_optional_string(row.get("term"))
+        normalized_term = _normalize_alias_term(row.get("normalized_term") or term_value)
+        term_weight = float(row.get("term_weight") or 1.0)
+        if term_value and normalized_term:
+            concept["terms"].append(
+                {
+                    "term": term_value,
+                    "normalized_term": normalized_term,
+                    "weight": term_weight,
+                }
+            )
+    concepts = list(concept_map.values())
+    concepts.sort(key=lambda item: (str(item.get("label", "")).lower(), str(item.get("concept_id", ""))))
+    return concepts
+
+
+def _memory_group_alias_memory_reasons(
+    memory_row: dict[str, Any],
+    concept: dict[str, Any],
+) -> list[str]:
+    normalized_text = _normalize_alias_term(
+        " ".join(
+            [
+                str(memory_row.get("title") or ""),
+                str(memory_row.get("text") or ""),
+                str(memory_row.get("preview") or ""),
+            ]
+        )
+    )
+    if not normalized_text:
+        return []
+    reasons: list[str] = []
+    canonical = normalize_optional_string(concept.get("canonical")) or str(concept.get("concept_id", ""))
+    canonical_norm = _normalize_alias_term(canonical)
+    concept_domain = normalize_optional_string(concept.get("domain"))
+    memory_domain = normalize_optional_string(memory_row.get("domain"))
+    if canonical_norm and _memory_group_alias_term_is_safe(canonical_norm, float(concept.get("weight") or 1.0)):
+        if _normalized_term_in_text(normalized_text, canonical_norm):
+            reasons.append(f"matched canonical term {canonical}")
+    alias_hits: list[str] = []
+    for term_info in concept.get("terms", []):
+        if not isinstance(term_info, dict):
+            continue
+        normalized_term = _normalize_alias_term(term_info.get("normalized_term") or term_info.get("term"))
+        term_weight = float(term_info.get("weight") or concept.get("weight") or 1.0)
+        if not _memory_group_alias_term_is_safe(normalized_term, term_weight):
+            continue
+        if _normalized_term_in_text(normalized_text, normalized_term):
+            term_value = normalize_optional_string(term_info.get("term")) or normalized_term
+            if canonical_norm and normalized_term == canonical_norm:
+                continue
+            if term_value not in alias_hits:
+                alias_hits.append(term_value)
+    for term_value in alias_hits:
+        reasons.append(f"matched alias term {term_value}")
+    if concept_domain and memory_domain and concept_domain == memory_domain:
+        reasons.append(f"same alias domain {concept_domain}")
+    return reasons
+
+
+def _memory_group_build_catalog(
+    conn: sqlite3.Connection,
+    args: dict[str, Any],
+    warnings: list[dict[str, str]],
+) -> dict[str, Any]:
+    scope = _memory_group_base_rows(conn, args)
+    rows = list(scope["rows"])
+    row_map = dict(scope["row_map"])
+    min_group_size = _safe_int(
+        args.get("min_group_size"),
+        2,
+        minimum=2,
+        maximum=1000,
+    )
+    query_text = normalize_optional_string(args.get("query"))
+    include_related = parse_bool(args.get("include_related"), default=True)
+
+    topic_index: dict[str, set[str]] = {}
+    domain_index: dict[str, set[str]] = {}
+    path_index: dict[str, set[str]] = {}
+    normalized_hash_index: dict[str, set[str]] = {}
+    shingle_index: dict[str, set[str]] = {}
+    link_index: dict[str, set[str]] = {str(row.get("id")): set() for row in rows}
+
+    for row in rows:
+        memory_id = str(row.get("id", ""))
+        for topic_name in row.get("topics", []):
+            topic_value = str(topic_name)
+            if topic_value:
+                topic_index.setdefault(topic_value, set()).add(memory_id)
+        domain_value = normalize_optional_string(row.get("domain"))
+        if domain_value:
+            domain_index.setdefault(domain_value, set()).add(memory_id)
+        for file_info in row.get("touched_files", []):
+            path_value = normalize_optional_string(file_info.get("path"))
+            if not path_value:
+                continue
+            path_index.setdefault(path_value, set()).add(memory_id)
+            parent = _memory_group_path_parent(path_value)
+            if parent:
+                path_index.setdefault(parent, set()).add(memory_id)
+        normalized_hash = normalize_optional_string(row.get("normalized_hash"))
+        if normalized_hash:
+            normalized_hash_index.setdefault(normalized_hash, set()).add(memory_id)
+        for shingle in row.get("shingle_hashes", []):
+            shingle_index.setdefault(str(shingle), set()).add(memory_id)
+        for linked_id in row.get("linked_ids", []):
+            if linked_id in row_map:
+                link_index.setdefault(memory_id, set()).add(linked_id)
+                link_index.setdefault(linked_id, set()).add(memory_id)
+
+    discovered: list[dict[str, Any]] = []
+
+    def register_group(
+        *,
+        group_id: str,
+        group_type: str,
+        label: str,
+        core_ids: set[str],
+        reasons: list[str],
+        core_reason_map: dict[str, list[str]] | None = None,
+        confidence_bonus: float = 0.0,
+    ) -> None:
+        reason_lookup = core_reason_map or {}
+        if len(core_ids) < min_group_size:
+            return
+        sorted_core_ids = sorted(core_ids)
+        core_rows = [row_map[memory_id] for memory_id in sorted_core_ids if memory_id in row_map]
+        related_ids: list[str] = []
+        related_reason_map: dict[str, list[str]] = {}
+        if include_related:
+            related_ids, related_reason_map = _memory_group_collect_related_ids(
+                set(sorted_core_ids),
+                row_map,
+                topic_index,
+                domain_index,
+                path_index,
+                normalized_hash_index,
+                shingle_index,
+                link_index,
+            )
+        full_tree_ids = set(sorted_core_ids) | set(related_ids)
+        for memory_id in list(sorted(full_tree_ids)):
+            for linked_id in sorted(link_index.get(memory_id, set())):
+                if linked_id in row_map:
+                    full_tree_ids.add(linked_id)
+        total_rows = [row_map[memory_id] for memory_id in sorted(full_tree_ids) if memory_id in row_map]
+        exportable_count = sum(1 for row in total_rows if str(row.get("kind", "")) in PACK_EXPORT_ALLOWED_KINDS)
+        core_exportable_count = sum(1 for row in core_rows if str(row.get("kind", "")) in PACK_EXPORT_ALLOWED_KINDS)
+        core_topics = sorted({str(topic) for row in core_rows for topic in row.get("topics", [])})[:10]
+        related_topics = sorted(
+            {
+                str(topic)
+                for memory_id in related_ids
+                for topic in row_map.get(memory_id, {}).get("topics", [])
+                if str(topic)
+            }
+        )[:10]
+        domains = sorted(
+            {str(row.get("domain")) for row in total_rows if normalize_optional_string(row.get("domain")) is not None}
+        )[:10]
+        kinds: dict[str, int] = {}
+        namespaces: dict[str, int] = {}
+        origins: dict[str, int] = {}
+        touched_paths: dict[str, int] = {}
+        for row in total_rows:
+            kind_name = str(row.get("kind", ""))
+            kinds[kind_name] = int(kinds.get(kind_name, 0) + 1)
+            namespace_value = str(row.get("namespace", DEFAULT_MEMORY_NAMESPACE))
+            namespaces[namespace_value] = int(namespaces.get(namespace_value, 0) + 1)
+            origin_value = str(row.get("origin", DEFAULT_MEMORY_ORIGIN))
+            origins[origin_value] = int(origins.get(origin_value, 0) + 1)
+            for file_info in row.get("touched_files", []):
+                path_value = normalize_optional_string(file_info.get("path"))
+                if path_value:
+                    touched_paths[path_value] = int(touched_paths.get(path_value, 0) + 1)
+        sample_rows = core_rows[: max(1, MEMORY_GROUP_SAMPLE_PER_GROUP_DEFAULT)]
+        recommended_scopes = ["core"]
+        if related_ids:
+            recommended_scopes.append("core_plus_related")
+        if len(full_tree_ids) > len(core_ids):
+            recommended_scopes.append("full_tree")
+        if "full_tree" not in recommended_scopes:
+            recommended_scopes.append("full_tree")
+        confidence_value = _memory_group_confidence(
+            core_rows=core_rows,
+            related_count=len(related_ids),
+            query=query_text,
+            label=label,
+            reasons=reasons,
+        )
+        confidence_value = min(0.99, max(0.0, float(confidence_value) + float(confidence_bonus)))
+        discovered.append(
+            {
+                "group_id": group_id,
+                "group_type": group_type,
+                "label": label,
+                "summary": _memory_group_summary_text(core_rows),
+                "confidence": confidence_value,
+                "memory_count": len(full_tree_ids),
+                "exportable_memory_count": int(exportable_count),
+                "core_memory_count": len(core_ids),
+                "core_exportable_count": int(core_exportable_count),
+                "related_memory_count": len(related_ids),
+                "core_topics": core_topics,
+                "related_topics": related_topics,
+                "domains": domains,
+                "kinds": kinds,
+                "namespaces": namespaces,
+                "origins": origins,
+                "touched_paths": [
+                    path_value
+                    for path_value, _count in sorted(touched_paths.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+                ],
+                "sample_memory_ids": [str(row.get("id", "")) for row in sample_rows],
+                "sample_titles": [str(row.get("title") or collapsed_preview_text(row.get("text"), 80)) for row in sample_rows],
+                "recommended_scopes": recommended_scopes,
+                "reasons": reasons,
+                "_core_ids": sorted_core_ids,
+                "_related_ids": related_ids,
+                "_full_tree_ids": sorted(full_tree_ids),
+                "_membership_reasons": {
+                    memory_id: list(
+                        reason_lookup.get(memory_id, [f"core membership via {group_type}:{label}"])
+                    )
+                    for memory_id in sorted_core_ids
+                    if memory_id in row_map
+                }
+                | related_reason_map,
+            }
+        )
+
+    for topic_name, ids in sorted(topic_index.items()):
+        if _memory_group_is_mechanical_topic(topic_name):
+            continue
+        register_group(
+            group_id=f"topic:{topic_name}",
+            group_type="topic",
+            label=_memory_group_slug_label(topic_name),
+            core_ids=set(ids),
+            reasons=[f"shared topic:{topic_name}"],
+        )
+
+    for domain_value, ids in sorted(domain_index.items()):
+        register_group(
+            group_id=f"domain:{domain_value}",
+            group_type="domain",
+            label=_memory_group_slug_label(domain_value),
+            core_ids=set(ids),
+            reasons=[f"shared domain:{domain_value}"],
+        )
+
+    for path_value, ids in sorted(path_index.items()):
+        group_kind = "path" if "/" in path_value and "." in path_value.rsplit("/", 1)[-1] else "path"
+        register_group(
+            group_id=(f"path:{path_value}" if "." in path_value.rsplit("/", 1)[-1] else f"dir:{path_value}"),
+            group_type=group_kind,
+            label=_memory_group_slug_label(path_value),
+            core_ids=set(ids),
+            reasons=[f"shared path:{path_value}"],
+        )
+
+    alias_rows = _memory_group_alias_source_rows(conn)
+    for concept in _memory_group_alias_concepts(alias_rows):
+        concept_id = normalize_optional_string(concept.get("concept_id"))
+        concept_label = normalize_optional_string(concept.get("canonical")) or normalize_optional_string(concept.get("label"))
+        if not concept_id or not concept_label:
+            continue
+        concept_domain = normalize_optional_string(concept.get("domain"))
+        concept_reasons = [f"alias concept:{concept_label}"]
+        if concept_domain:
+            concept_reasons.append(f"alias domain:{concept_domain}")
+        core_ids: set[str] = set()
+        core_reason_map: dict[str, list[str]] = {}
+        confidence_bonus = 0.0
+        for row in rows:
+            memory_id = str(row.get("id", ""))
+            if not memory_id:
+                continue
+            memory_domain = normalize_optional_string(row.get("domain"))
+            if concept_domain and memory_domain not in {concept_domain, None}:
+                continue
+            alias_reasons = _memory_group_alias_memory_reasons(row, concept)
+            if not alias_reasons:
+                continue
+            core_ids.add(memory_id)
+            membership_reasons = [f"matched alias concept {concept_label}"] + alias_reasons
+            core_reason_map[memory_id] = membership_reasons
+            if any(reason.startswith("matched canonical term ") for reason in alias_reasons):
+                confidence_bonus += 0.02
+            if sum(1 for reason in alias_reasons if reason.startswith("matched alias term ")) >= 2:
+                confidence_bonus += 0.01
+            if concept_domain and memory_domain and concept_domain == memory_domain:
+                confidence_bonus += 0.01
+        register_group(
+            group_id=f"alias:{concept_id}",
+            group_type="alias",
+            label=concept_label,
+            core_ids=core_ids,
+            reasons=concept_reasons,
+            core_reason_map=core_reason_map,
+            confidence_bonus=min(0.05, confidence_bonus),
+        )
+
+    seen_component_roots: set[str] = set()
+    for memory_id in sorted(link_index):
+        if memory_id in seen_component_roots:
+            continue
+        component: set[str] = set()
+        stack = [memory_id]
+        while stack:
+            current = stack.pop()
+            if current in component:
+                continue
+            component.add(current)
+            for neighbor in sorted(link_index.get(current, set())):
+                if neighbor not in component:
+                    stack.append(neighbor)
+        seen_component_roots.update(component)
+        if len(component) < min_group_size:
+            continue
+        root_id = sorted(component)[0]
+        root_row = row_map.get(root_id, {})
+        label = str(root_row.get("title") or root_row.get("id") or "Linked Group")
+        register_group(
+            group_id=f"link:{root_id}",
+            group_type="link",
+            label=label,
+            core_ids=component,
+            reasons=["explicit linked_ids_json relationships"],
+        )
+
+    discovered.sort(
+        key=lambda item: (
+            -float(item.get("confidence", 0.0)),
+            -int(item.get("exportable_memory_count", 0)),
+            -int(item.get("memory_count", 0)),
+            str(item.get("group_id", "")),
+        )
+    )
+    return {
+        "groups": discovered,
+        "rows": rows,
+        "row_map": row_map,
+        "resolved_namespaces": scope["resolved_namespaces"],
+        "resolved_origins": scope["resolved_origins"],
+    }
+
+
+def _memory_group_resolve_selection(
+    catalog: dict[str, Any],
+    group_id: str,
+    scope: str,
+) -> dict[str, Any]:
+    chosen = next((group for group in catalog["groups"] if str(group.get("group_id", "")) == group_id), None)
+    if chosen is None:
+        raise PackSelectorError("memory_group_not_found", f"group {group_id} was not found")
+
+    raw_ids = (
+        list(chosen.get("_core_ids", []))
+        if scope == "core"
+        else list(chosen.get("_core_ids", [])) + list(chosen.get("_related_ids", []))
+        if scope == "core_plus_related"
+        else list(chosen.get("_full_tree_ids", []))
+    )
+    seen_ids: set[str] = set()
+    ordered_ids: list[str] = []
+    for memory_id in raw_ids:
+        value = str(memory_id)
+        if value and value not in seen_ids:
+            seen_ids.add(value)
+            ordered_ids.append(value)
+    row_map = dict(catalog["row_map"])
+    return {
+        "group": chosen,
+        "ordered_ids": ordered_ids,
+        "row_map": row_map,
+        "resolved_namespaces": list(catalog.get("resolved_namespaces") or []),
+        "resolved_origins": catalog.get("resolved_origins"),
+    }
+
+
+def memory_group_discover(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("memory_group_discover requires sqlite backend")
+
+    try:
+        limit_groups = _safe_int(
+            args.get("limit_groups"),
+            MEMORY_GROUP_DISCOVER_LIMIT_DEFAULT,
+            minimum=1,
+            maximum=MEMORY_GROUP_DISCOVER_LIMIT_MAX,
+        )
+        sample_per_group = _safe_int(
+            args.get("sample_per_group"),
+            MEMORY_GROUP_SAMPLE_PER_GROUP_DEFAULT,
+            minimum=0,
+            maximum=10,
+        )
+        include_samples = parse_bool(args.get("include_samples"), default=True)
+        output_mode = normalize_optional_string(args.get("output_mode")) or "raw"
+        catalog_for = normalize_optional_string(args.get("catalog_for"))
+        include_raw_groups = parse_bool(args.get("include_raw_groups"), default=True)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    warnings: list[dict[str, str]] = []
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            catalog = _memory_group_build_catalog(conn, args, warnings)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    if output_mode == "catalog":
+        options_source = list(catalog["groups"])
+        options_source.sort(
+            key=lambda item: (
+                _memory_group_catalog_bucket(item)[0],
+                -int(item.get("core_exportable_count", 0) or 0),
+                -int(item.get("core_memory_count", 0) or 0),
+                str(item.get("label", "") or str(item.get("group_id", ""))).lower(),
+            )
+        )
+        options = [_memory_group_catalog_option(group) for group in options_source[:limit_groups]]
+        structured: dict[str, Any] = {
+            "action": "memory_group_discover",
+            "status": "ok",
+            "output_mode": "catalog",
+            "catalog": {
+                "total_groups": len(options_source),
+                "shown_groups": len(options),
+                "visible_rows_scanned": len(catalog["rows"]),
+                "options": options,
+            },
+            "warnings": warnings,
+        }
+        if include_raw_groups:
+            groups = []
+            for raw_group in options_source[:limit_groups]:
+                group = {
+                    key: value
+                    for key, value in raw_group.items()
+                    if not str(key).startswith("_")
+                }
+                if not include_samples:
+                    group["sample_memory_ids"] = []
+                    group["sample_titles"] = []
+                else:
+                    group["sample_memory_ids"] = list(group.get("sample_memory_ids", []))[:sample_per_group]
+                    group["sample_titles"] = list(group.get("sample_titles", []))[:sample_per_group]
+                groups.append(group)
+            structured["groups"] = groups
+        if catalog_for == "export" and not options:
+            warnings.append(
+                {
+                    "code": "no_export_groups",
+                    "message": "No exportable groups were found in the current visible scope.",
+                }
+            )
+        lines = [
+            f"Discovered memory group catalog: {len(options)} shown / {len(options_source)} total",
+            f"Visible rows scanned: {len(catalog['rows'])}",
+        ]
+        return text_result("\n".join(lines), structured)
+
+    groups = []
+    for raw_group in list(catalog["groups"])[:limit_groups]:
+        group = {
+            key: value
+            for key, value in raw_group.items()
+            if not str(key).startswith("_")
+        }
+        if not include_samples:
+            group["sample_memory_ids"] = []
+            group["sample_titles"] = []
+        else:
+            group["sample_memory_ids"] = list(group.get("sample_memory_ids", []))[:sample_per_group]
+            group["sample_titles"] = list(group.get("sample_titles", []))[:sample_per_group]
+        groups.append(group)
+
+    structured = {
+        "action": "memory_group_discover",
+        "status": "ok",
+        "output_mode": "raw",
+        "groups": groups,
+        "warnings": warnings,
+    }
+    lines = [
+        f"Discovered memory groups: {len(groups)}",
+        f"Visible rows scanned: {len(catalog['rows'])}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
+def memory_group_preview(args: dict[str, Any]) -> dict[str, Any]:
+    if store_backend() != "sqlite":
+        return tool_error("memory_group_preview requires sqlite backend")
+
+    group_id = normalize_optional_string(args.get("group_id"))
+    if group_id is None:
+        return tool_error_code("memory_group_not_found", "group_id is required")
+
+    try:
+        scope = normalize_choice(
+            args.get("scope"),
+            "scope",
+            ("core", "core_plus_related", "full_tree"),
+            default="core_plus_related",
+            strict=True,
+        ) or "core_plus_related"
+        limit = _safe_int(
+            args.get("limit"),
+            MEMORY_GROUP_PREVIEW_LIMIT_DEFAULT,
+            minimum=1,
+            maximum=MEMORY_GROUP_PREVIEW_LIMIT_MAX,
+        )
+        include_samples = parse_bool(args.get("include_samples"), default=True)
+        sample_per_kind = _safe_int(args.get("sample_per_kind"), 3, minimum=0, maximum=10)
+        include_pack_readiness = parse_bool(args.get("include_pack_readiness"), default=True)
+        include_redaction_summary = parse_bool(args.get("include_redaction_summary"), default=False)
+        include_memory_ids = parse_bool(args.get("include_memory_ids"), default=True)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    warnings: list[dict[str, str]] = []
+    try:
+        with _sqlite_session() as conn:
+            _sqlite_ensure_schema(conn)
+            catalog = _memory_group_build_catalog(conn, args, warnings)
+            resolved = _memory_group_resolve_selection(catalog, group_id, scope)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
+    except ValueError as exc:
+        return tool_error(str(exc))
+    except Exception as exc:
+        return tool_error(f"{type(exc).__name__}: {exc}")
+
+    chosen = dict(resolved["group"])
+    ordered_ids = list(resolved["ordered_ids"])
+    row_map = dict(resolved["row_map"])
+    limited = bool(len(ordered_ids) > limit)
+    selected_ids = list(ordered_ids[:limit])
+    selected_rows = [row_map[memory_id] for memory_id in selected_ids if memory_id in row_map]
+
+    by_kind: dict[str, int] = {}
+    by_namespace: dict[str, int] = {}
+    by_origin: dict[str, int] = {}
+    by_topic: dict[str, int] = {}
+    exportable_ids: list[str] = []
+    non_exportable = 0
+    for row in selected_rows:
+        kind_name = str(row.get("kind", ""))
+        by_kind[kind_name] = int(by_kind.get(kind_name, 0) + 1)
+        namespace_value = str(row.get("namespace", DEFAULT_MEMORY_NAMESPACE))
+        by_namespace[namespace_value] = int(by_namespace.get(namespace_value, 0) + 1)
+        origin_value = str(row.get("origin", DEFAULT_MEMORY_ORIGIN))
+        by_origin[origin_value] = int(by_origin.get(origin_value, 0) + 1)
+        for topic_name in row.get("topics", []):
+            by_topic[str(topic_name)] = int(by_topic.get(str(topic_name), 0) + 1)
+        if kind_name in PACK_EXPORT_ALLOWED_KINDS:
+            exportable_ids.append(str(row.get("id", "")))
+        else:
+            non_exportable += 1
+
+    samples: dict[str, list[dict[str, Any]]] = {}
+    if include_samples and sample_per_kind > 0:
+        quotas: dict[str, int] = {}
+        for row in selected_rows:
+            kind_name = str(row.get("kind", ""))
+            if quotas.get(kind_name) is None:
+                quotas[kind_name] = sample_per_kind
+            if quotas.get(kind_name, 0) <= 0:
+                continue
+            samples.setdefault(kind_name, []).append(
+                {
+                    "id": str(row.get("id", "")),
+                    "title": normalize_optional_string(row.get("title")),
+                    "preview": collapsed_preview_text(row.get("text"), 160),
+                    "namespace": str(row.get("namespace", DEFAULT_MEMORY_NAMESPACE)),
+                    "origin": str(row.get("origin", DEFAULT_MEMORY_ORIGIN)),
+                }
+            )
+            quotas[kind_name] = int(quotas.get(kind_name, 0) - 1)
+
+    membership_reasons = {
+        memory_id: list(chosen.get("_membership_reasons", {}).get(memory_id, []))
+        for memory_id in selected_ids
+    }
+
+    structured: dict[str, Any] = {
+        "action": "memory_group_preview",
+        "status": "ok",
+        "group": {key: value for key, value in chosen.items() if not str(key).startswith("_")},
+        "scope": scope,
+        "selection": {
+            "total_rows": len(ordered_ids),
+            "limited": limited,
+            "limit": limit,
+            "memory_ids": selected_ids if include_memory_ids else [],
+        },
+        "counts": {
+            "by_kind": by_kind,
+            "by_topic": dict(sorted(by_topic.items(), key=lambda item: (-int(item[1]), item[0]))[:20]),
+            "by_namespace": by_namespace,
+            "by_origin": by_origin,
+            "exportable": len(exportable_ids),
+            "non_exportable": int(non_exportable),
+        },
+        "pack_readiness": {
+            "can_export_default": bool(exportable_ids and non_exportable == 0),
+            "exportable_kinds": list(PACK_EXPORT_ALLOWED_KINDS),
+            "excluded_kinds": {kind: count for kind, count in by_kind.items() if kind not in PACK_EXPORT_ALLOWED_KINDS},
+            "recommended_pack_selector": {
+                "memory_ids": exportable_ids,
+                "kinds": list(PACK_EXPORT_ALLOWED_KINDS),
+            },
+        }
+        if include_pack_readiness
+        else {},
+        "samples": {kind: samples[kind] for kind in sorted(samples)},
+        "membership_reasons": membership_reasons,
+        "warnings": warnings,
+    }
+    if include_redaction_summary:
+        total_matches = 0
+        by_category: dict[str, int] = {}
+        for row in selected_rows:
+            redaction = _pack_row_redaction(row)
+            total_matches += int(redaction["total_matches"])
+            for category_name, count in dict(redaction["by_category"]).items():
+                by_category[str(category_name)] = int(by_category.get(str(category_name), 0) + int(count))
+        structured["redaction_summary"] = {
+            "ruleset_version": BASELINE_REDACTION_RULESET_VERSION,
+            "total_matches": int(total_matches),
+            "by_category": by_category,
+        }
+
+    lines = [
+        f"Memory group preview: {group_id}",
+        f"Rows selected: {len(ordered_ids)} (limited={str(limited).lower()}, limit={limit})",
+        f"Exportable rows: {len(exportable_ids)}",
+    ]
+    return text_result("\n".join(lines), structured)
+
+
 def pack_export(args: dict[str, Any]) -> dict[str, Any]:
     if store_backend() != "sqlite":
         return tool_error("pack_export requires sqlite backend")
@@ -10651,6 +11936,8 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"unsupported signature_algorithm: {signature_algorithm}")
             signing_secret = _validate_secret_length(args.get("signing_secret"), field_name="signing_secret")
             secret_fingerprint = _secret_fingerprint(signing_secret)
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except ValueError as exc:
         message = str(exc)
         if "signing_secret" in message and "at least" in message:
@@ -10669,8 +11956,9 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
             if total_rows <= 0:
                 raise ValueError("selection returned zero rows; nothing to export")
             if limited and not allow_limited_export:
-                raise ValueError(
-                    "selection is limited; increase limit or pass allow_limited_export=true to export only the limited selected row set"
+                raise PackSelectorError(
+                    "limited_export_requires_confirmation",
+                    "selection is limited; increase limit or pass allow_limited_export=true to export only the limited selected row set",
                 )
             selected_rows = list(selection["selected_rows"])
             for row in selected_rows:
@@ -10691,6 +11979,8 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
                     signer_registry_fingerprint = normalize_optional_string(
                         signer_row["secret_fingerprint"] if isinstance(signer_row, sqlite3.Row) else signer_row[0]
                     )
+    except PackSelectorError as exc:
+        return tool_error_code(exc.code, exc.message)
     except Exception as exc:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
@@ -10838,6 +12128,9 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
     filters_payload = {
         "topics": list(selection["topics"]),
         "kinds": list(selection["kinds"]),
+        "memory_ids": [],
+        "group_id": selection["group_id"],
+        "scope": selection["scope"],
         "namespaces": list(selection["resolved_namespaces"]),
         "origins": list(selection["resolved_origins"]) if selection["resolved_origins"] is not None else [],
         "created_after": selection["created_after"],
@@ -10939,7 +12232,7 @@ def pack_export(args: dict[str, Any]) -> dict[str, Any]:
     member_bytes["manifest.json"] = _pack_json_bytes(manifest)
 
     temp_zip_path = Path(
-        tempfile.NamedTemporaryFile(dir=str(output_dir), delete=False, suffix=".zip.tmp").name
+        tempfile.NamedTemporaryFile(dir=str(output_dir), delete=False, suffix=f"{PACK_FILE_EXTENSION}.tmp").name
     )
     replaced = False
     try:
@@ -13173,7 +14466,7 @@ def _select_imported_pack_rows(
 
     selected_rows_raw = conn.execute(
         "SELECT ipr.row_id_in_pack, ipr.memory_id, m.kind, m.namespace, m.origin, m.import_freshness, "
-        "m.text, m.title, m.preview, m.git_sha, m.git_branch, m.git_dirty, m.created_at, m.updated_at, "
+        "m.text, m.title, m.preview, m.domain, m.git_sha, m.git_branch, m.git_dirty, m.created_at, m.updated_at, "
         "ppr.promoted_memory_id, ppr.promotion_id, ppr.promoted_at "
         f"{from_sql} WHERE {where_sql}",
         tuple(sql_params),
@@ -13192,19 +14485,20 @@ def _select_imported_pack_rows(
             "text": str(row["text"] if isinstance(row, sqlite3.Row) else row[6]),
             "title": normalize_optional_string(row["title"] if isinstance(row, sqlite3.Row) else row[7]),
             "preview": normalize_optional_string(row["preview"] if isinstance(row, sqlite3.Row) else row[8]),
-            "git_sha": normalize_optional_string(row["git_sha"] if isinstance(row, sqlite3.Row) else row[9]),
-            "git_branch": normalize_optional_string(row["git_branch"] if isinstance(row, sqlite3.Row) else row[10]),
-            "git_dirty": normalize_git_dirty(row["git_dirty"] if isinstance(row, sqlite3.Row) else row[11]),
-            "created_at": normalize_optional_string(row["created_at"] if isinstance(row, sqlite3.Row) else row[12]),
-            "updated_at": normalize_optional_string(row["updated_at"] if isinstance(row, sqlite3.Row) else row[13]),
+            "domain": normalize_optional_string(row["domain"] if isinstance(row, sqlite3.Row) else row[9]),
+            "git_sha": normalize_optional_string(row["git_sha"] if isinstance(row, sqlite3.Row) else row[10]),
+            "git_branch": normalize_optional_string(row["git_branch"] if isinstance(row, sqlite3.Row) else row[11]),
+            "git_dirty": normalize_git_dirty(row["git_dirty"] if isinstance(row, sqlite3.Row) else row[12]),
+            "created_at": normalize_optional_string(row["created_at"] if isinstance(row, sqlite3.Row) else row[13]),
+            "updated_at": normalize_optional_string(row["updated_at"] if isinstance(row, sqlite3.Row) else row[14]),
             "promoted_to_memory_id": normalize_optional_string(
-                row["promoted_memory_id"] if isinstance(row, sqlite3.Row) else row[14]
+                row["promoted_memory_id"] if isinstance(row, sqlite3.Row) else row[15]
             ),
             "promotion_id": normalize_optional_string(
-                row["promotion_id"] if isinstance(row, sqlite3.Row) else row[15]
+                row["promotion_id"] if isinstance(row, sqlite3.Row) else row[16]
             ),
             "promoted_at": normalize_optional_string(
-                row["promoted_at"] if isinstance(row, sqlite3.Row) else row[16]
+                row["promoted_at"] if isinstance(row, sqlite3.Row) else row[17]
             ),
         }
         for row in selected_rows_raw
@@ -13301,6 +14595,102 @@ def _select_imported_pack_rows(
         "by_topic": by_topic,
         "referenced_files": referenced_files,
         "top_referenced_files": top_referenced_files,
+    }
+
+
+def _pack_review_import_grouped_summary(
+    conn: sqlite3.Connection,
+    selected_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    limited_rows = list(selected_rows)
+    freshness_counts: dict[str, int] = {name: 0 for name in PACK_IMPORT_FRESHNESS_VALUES}
+    topic_groups: dict[str, dict[str, Any]] = {}
+    domain_groups: dict[str, dict[str, Any]] = {}
+    path_groups: dict[str, dict[str, Any]] = {}
+
+    def add_group(bucket: dict[str, dict[str, Any]], key: str, *, label: str, row: dict[str, Any]) -> None:
+        item = bucket.setdefault(
+            key,
+            {
+                "group_id": key,
+                "label": label,
+                "row_count": 0,
+                "row_ids": [],
+                "memory_ids": [],
+                "sample_titles": [],
+            },
+        )
+        item["row_count"] = int(item["row_count"] + 1)
+        row_id = str(row.get("row_id_in_pack", ""))
+        memory_id = str(row.get("memory_id", ""))
+        if row_id and row_id not in item["row_ids"]:
+            item["row_ids"].append(row_id)
+        if memory_id and memory_id not in item["memory_ids"]:
+            item["memory_ids"].append(memory_id)
+        title = normalize_optional_string(row.get("title")) or _pack_review_sample_preview(row)
+        if title and title not in item["sample_titles"] and len(item["sample_titles"]) < 3:
+            item["sample_titles"].append(title)
+
+    for row in limited_rows:
+        freshness_label = str(row.get("import_freshness", "unknown") or "unknown")
+        if freshness_label not in freshness_counts:
+            freshness_label = "unknown"
+        freshness_counts[freshness_label] = int(freshness_counts.get(freshness_label, 0) + 1)
+        for topic_name in row.get("topics", []):
+            topic_value = str(topic_name)
+            add_group(
+                topic_groups,
+                f"import_topic:{topic_value}",
+                label=_memory_group_slug_label(topic_value),
+                row=row,
+            )
+        domain_value = normalize_optional_string(row.get("domain"))
+        if domain_value:
+            add_group(
+                domain_groups,
+                f"import_domain:{domain_value}",
+                label=_memory_group_slug_label(domain_value),
+                row=row,
+            )
+        for file_info in row.get("touched_files", []):
+            path_value = normalize_optional_string(
+                file_info.get("path") if isinstance(file_info, dict) else file_info
+            )
+            if path_value:
+                add_group(
+                    path_groups,
+                    f"import_path:{path_value}",
+                    label=path_value,
+                    row=row,
+                )
+
+    def finalize(bucket: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        groups = list(bucket.values())
+        groups.sort(key=lambda item: (-int(item.get("row_count", 0)), str(item.get("group_id", ""))))
+        final: list[dict[str, Any]] = []
+        for item in groups[:20]:
+            final.append(
+                {
+                    "group_id": str(item.get("group_id", "")),
+                    "label": str(item.get("label", "")),
+                    "row_count": int(item.get("row_count", 0)),
+                    "row_ids": list(item.get("row_ids", []))[:3],
+                    "memory_ids": list(item.get("memory_ids", []))[:3],
+                    "sample_titles": list(item.get("sample_titles", []))[:3],
+                }
+            )
+        return final
+
+    top_topic_groups = finalize(topic_groups)
+    top_domain_groups = finalize(domain_groups)
+    top_path_groups = finalize(path_groups)
+    suggested_promotion_groups = top_topic_groups[:5] if top_topic_groups else top_path_groups[:5]
+    return {
+        "top_topic_groups": top_topic_groups,
+        "top_domain_groups": top_domain_groups,
+        "top_path_groups": top_path_groups,
+        "freshness_counts": freshness_counts,
+        "suggested_promotion_groups": suggested_promotion_groups,
     }
 
 
@@ -13495,6 +14885,7 @@ def pack_review_import(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error_code("pack_not_found", "pack_id is required")
 
     include_samples = parse_bool(args.get("include_samples"), default=True)
+    include_grouped_summary = parse_bool(args.get("include_grouped_summary"), default=False)
     sample_limit = _safe_int(
         args.get("sample_limit"),
         PACK_REVIEW_SAMPLE_LIMIT_DEFAULT,
@@ -13522,6 +14913,18 @@ def pack_review_import(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error(f"{type(exc).__name__}: {exc}")
 
     selected_rows = list(selection["selected_rows"])
+    grouped_summary: dict[str, Any] = {}
+    if include_grouped_summary:
+        try:
+            with _sqlite_session() as conn:
+                _sqlite_ensure_schema(conn)
+                grouped_summary = _pack_review_import_grouped_summary(conn, selected_rows)
+        except Exception as exc:
+            _pack_import_add_warning(
+                warnings,
+                "grouped_summary_unavailable",
+                f"grouped summary unavailable: {type(exc).__name__}: {exc}",
+            )
     samples: list[dict[str, Any]] = []
     if include_samples and sample_limit > 0:
         for row in selected_rows[:sample_limit]:
@@ -13572,6 +14975,7 @@ def pack_review_import(args: dict[str, Any]) -> dict[str, Any]:
         "files": {
             "top_referenced_files": list(selection["top_referenced_files"]),
         },
+        "grouped_summary": grouped_summary if include_grouped_summary else {},
         "samples": samples if include_samples else [],
         "warnings": warnings,
     }
@@ -14138,17 +15542,16 @@ def pack_inspect(args: dict[str, Any]) -> dict[str, Any]:
         finalized = _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
         return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
 
-    non_zip_suffix_warning = bool(pack_path.suffix.lower() != ".zip")
+    legacy_zip_suffix_warning, nonstandard_suffix_warning = _pack_suffix_flags(pack_path)
     try:
         snapshot = _load_pack_snapshot(pack_path)
     except PackSnapshotError as exc:
         payload = _pack_inspect_default()
-        if non_zip_suffix_warning:
-            _pack_inspect_warning(
-                payload,
-                "non_zip_suffix",
-                "Pack path does not end with .zip but will be inspected because it opened as a valid ZIP.",
-            )
+        _pack_inspect_add_suffix_warning(
+            payload,
+            legacy_zip_suffix_warning=legacy_zip_suffix_warning,
+            nonstandard_suffix_warning=nonstandard_suffix_warning,
+        )
         _pack_inspect_error(payload, exc.code, exc.message)
         finalized = _pack_inspect_finalize(payload, include_samples=include_samples, sample_limit=sample_limit)
         return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
@@ -14158,7 +15561,8 @@ def pack_inspect(args: dict[str, Any]) -> dict[str, Any]:
         include_samples=include_samples,
         sample_limit=sample_limit,
         verification_secret=verification_secret,
-        non_zip_suffix_warning=non_zip_suffix_warning,
+        legacy_zip_suffix_warning=legacy_zip_suffix_warning,
+        nonstandard_suffix_warning=nonstandard_suffix_warning,
     )
     return text_result(_pack_inspect_text(finalized, pack_path.name), finalized)
 
@@ -14206,13 +15610,15 @@ def pack_import(args: dict[str, Any]) -> dict[str, Any]:
         snapshot = _load_pack_snapshot(pack_path)
     except PackSnapshotError as exc:
         return tool_error_code(exc.code, exc.message)
+    legacy_zip_suffix_warning, nonstandard_suffix_warning = _pack_suffix_flags(pack_path)
 
     inspection = _inspect_pack_snapshot(
         snapshot,
         include_samples=False,
         sample_limit=0,
         verification_secret=verification_secret if allow_trusted_import else None,
-        non_zip_suffix_warning=bool(pack_path.suffix.lower() != ".zip"),
+        legacy_zip_suffix_warning=legacy_zip_suffix_warning,
+        nonstandard_suffix_warning=nonstandard_suffix_warning,
     )
     # verification_secret is sensitive and not needed after classification.
     verification_secret = None
@@ -14542,6 +15948,9 @@ GATEWAY_ACTIONS: dict[str, Any] = {
     "doctor": mnemo_doctor,
     "search": search_memories,
     "salience_check": memory_salience_check,
+    "memory_group_discover": memory_group_discover,
+    "memory_group_preview": memory_group_preview,
+    "pack_landing_list": pack_landing_list,
     "pack_list_imports": pack_list_imports,
     "pack_review_import": pack_review_import,
     "pack_promote_preview": pack_promote_preview,
@@ -14627,7 +16036,7 @@ TOOLS = [
         "title": "Mnemo Memory Gateway",
         "description": (
             "Mnemo project-memory gateway; not Copilot native memory. "
-            "Actions: doctor, record, alias_hint, topic_add, topic_remove, topic_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, search, recall, get, link, export, "
+            "Actions: doctor, record, alias_hint, topic_add, topic_remove, topic_list, memory_group_discover, memory_group_preview, pack_landing_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, search, recall, get, link, export, "
             "recent_events, search_events, get_event, memory_events, "
             "maintenance(compact_logs, consolidate, consolidate_full, import_json, backfill_signatures, propose_aliases, list_alias_proposals, approve_alias, reject_alias_proposal, list_aliases, disable_alias, disable_alias_concept), "
             "inspect, lookup_symbol, salience_check, update, delete, recent."
@@ -14638,7 +16047,7 @@ TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": sorted(GATEWAY_ACTIONS),
-                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept; topic_add/topic_remove/topic_list/pack_list_imports/pack_review_import/pack_promote_preview/pack_promote/pack_preview/pack_redaction_preview/pack_export/pack_inspect/pack_import/signer_add/signer_list/signer_disable/signer_enable are first-class actions.",
+                    "description": "Required action name. Use maintenance for compact_logs/consolidate/import_json/propose_aliases/list_alias_proposals/approve_alias/reject_alias_proposal/list_aliases/disable_alias/disable_alias_concept; topic_add/topic_remove/topic_list/memory_group_discover/memory_group_preview/pack_landing_list/pack_list_imports/pack_review_import/pack_promote_preview/pack_promote/pack_preview/pack_redaction_preview/pack_export/pack_inspect/pack_import/signer_add/signer_list/signer_disable/signer_enable are first-class actions.",
                 },
                 "params": {
                     "type": "object",
@@ -14826,7 +16235,7 @@ def handle_request(message: dict[str, Any]) -> None:
                 },
                 "instructions": (
                     "Use the single mnemo gateway tool with action plus optional params. "
-                    "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, recall, get, link, export, "
+                    "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, memory_group_discover, memory_group_preview, pack_landing_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, recall, get, link, export, "
                     "recent_events, search_events, get_event, memory_events, compact_context, "
                     "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
                     "Do not look for individual mnemo_* tools; "

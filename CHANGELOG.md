@@ -1,5 +1,135 @@
 # Changelog
 
+## 0.21.7
+
+### Changed
+
+- `pack_preview`, `pack_redaction_preview`, and `pack_export` now accept direct `group_id` plus `scope` selectors.
+- Group selectors are resolved by the same runtime group resolver used by `memory_group_preview`; prompts no longer need to transfer raw selected `memory_ids` for normal group-based export.
+- Mixed selector requests (`group_id` with `topics` or `memory_ids`) now fail with `ambiguous_selector`.
+- Limited exports now return stable error code `limited_export_requires_confirmation` unless `allow_limited_export=true`.
+
+### Prompt / Workflow
+
+- Packaged scripted Memory Pack prompt workflows for:
+  - `/mnemo.memory-pack-export`
+  - `/mnemo.memory-pack-import`
+  - `/mnemo.memory-pack-promote`
+- Import/promotion prompts document the staged lifecycle: import rows are stored in `imported_pack_rows`, and promotion materializes regular local rows in `memories`.
+- Promotion prompt uses the explicit `allow_promote_all=true` safety gate after approval when promoting the full previewed pack.
+
+- `mnemo.memory-pack-export` now drives normal group-based export with direct `group_id`/`scope` pack calls.
+- Export prompt no longer relies on raw `memory_ids` placeholders for standard group export flow.
+
+### Compatibility / Scope
+
+- `0.21.7` is a focused pack-selector runtime fix.
+- SQLite schema version remains `7` (no schema changes).
+- No new Mnemo or Nexus action names were added.
+- Memory Pack ZIP member schema, trust/import behavior, and promotion semantics are unchanged.
+
+## 0.21.6
+
+### Added
+
+- Added read-only `pack_landing_list` for landing-folder import UX:
+  - default landing folder: `state/mnemo/packs/inbox/`
+  - optional override via `MNEMO_PACK_LANDING_DIR`
+  - returns `.mem` packs with filename, path, size, and modified time
+  - optional legacy `.zip` inclusion remains available for compatibility
+
+### Prompt / Workflow Simplification
+
+- Reworked `/mnemo.memory-pack-export` into the primary user-facing browse-and-export command:
+  - no-input mode lists exportable topics/groups and continues directly into preview/redaction/approval/export
+  - direct input can resolve exact topic, exact `group_id`, group label, or explicit `memory_ids`
+- Reworked `/mnemo.memory-pack-import` into the primary user-facing browse-and-import command:
+  - no-input mode lists available `.mem` packs from the landing folder
+  - explicit input inspects and imports the selected pack
+- Reduced `/mnemo.memory-list-select` to a compatibility stub that points users to `/mnemo.memory-pack-export`
+- Removed the normal list/export handoff ceremony from prompt UX
+
+### Compatibility / Scope
+
+- `0.21.6` is a focused UX/runtime support patch.
+- SQLite schema version remains `7` (no schema changes).
+- Memory Pack ZIP member schema is unchanged.
+- Trust/import/promotion semantics are unchanged.
+
+## 0.21.5
+
+### Changed
+
+- Memory Pack export now writes `.mem` artifacts while keeping ZIP as the internal container format.
+- `pack_inspect` and `pack_import` now treat `.mem` as the preferred public suffix.
+- Legacy `.zip` packs remain supported for inspect/import compatibility and emit a compatibility warning.
+- Exact `memory_ids` export provenance no longer leaks source `mem_*` IDs into pack content metadata.
+
+### Prompt / Workflow Hardening
+
+- Tightened `mnemo.memory-list-select` so it must never execute export and instead hands off to the dedicated export prompt.
+- Rewrote `mnemo.memory-pack-export` around deterministic handoff modes:
+  - exact `memory_ids`
+  - approved export topic
+- Export prompt now requires:
+  - one `pack_preview`
+  - one `pack_redaction_preview`
+  - explicit approval
+  - one complete `pack_export` call
+- Prompt/docs now clarify that `content/file_fingerprints.json` contains touched-file paths and hashes, not file contents.
+- Prompt UX now treats `state/mnemo/synthetic_files/...` path groups as synthetic UX-lab evidence, not production components.
+
+### Compatibility / Scope
+
+- `0.21.5` is a focused export-workflow/runtime hardening patch.
+- SQLite schema version remains `7` (no schema changes).
+- Trust/import/promotion semantics remain unchanged.
+
+## 0.21.4
+
+### Added
+
+- Alias-backed memory-group discovery/preview support on top of the existing alias runtime:
+  - `memory_group_discover` can emit `group_type="alias"`
+  - `memory_group_preview` accepts `group_id="alias:<concept_id>"`
+
+### Changed
+
+- Version bump to `0.21.4` across Mnemo server/package/docs.
+- Memory-group discovery now reuses active alias concepts already stored in SQLite runtime tables.
+- Pending alias proposals and disabled alias terms/concepts are excluded from computed alias groups.
+
+### Compatibility / Scope
+
+- `0.21.4` is a focused runtime patch for alias-backed memory grouping.
+- SQLite schema version remains `7` (no schema changes).
+- Memory Packs ZIP format, signing/trust semantics, import behavior, and promotion behavior remain unchanged.
+
+## 0.21.3
+
+### Added
+
+- Read-only memory-group discovery and preview actions:
+  - `memory_group_discover`
+  - `memory_group_preview`
+- Exact `memory_ids` selector support for:
+  - `pack_preview`
+  - `pack_redaction_preview`
+  - `pack_export`
+- Bounded grouped-summary enrichment for `pack_review_import`.
+
+### Changed
+
+- Version bump to `0.21.3` across Mnemo server/package/docs.
+- Memory-group discovery builds deterministic computed views from existing topics, domains, files/paths, and explicit links without adding schema.
+- Pack selector logic now supports exact `memory_ids` without broadening on unknown IDs; unknown IDs are ignored with warning and zero-match selection remains empty.
+
+### Compatibility / Scope
+
+- `0.21.3` is a focused runtime patch for group-first selection and exact pack targeting.
+- SQLite schema version remains `7` (no schema changes).
+- Memory Packs ZIP format, signing/trust semantics, and import/export storage remain unchanged.
+
 ## 0.21.2
 
 ### Added

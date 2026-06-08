@@ -47,7 +47,10 @@ def main() -> int:
         root = Path(tmp)
         memory_file = root / "mnemo" / "memory.json"
         workspace = root / "repo"
+        landing_dir = root / "mnemo" / "packs" / "inbox"
         workspace.mkdir()
+        landing_dir.mkdir(parents=True, exist_ok=True)
+        (landing_dir / "incoming.mem").write_bytes(b"stub-pack")
         (workspace / "auth.py").write_text(
             "def authenticate(user):\n    return bool(user)\n",
             encoding="utf-8",
@@ -126,7 +129,8 @@ def main() -> int:
             first_event_id = recent_events["result"]["structuredContent"]["events"][0]["event_id"]
             event_detail = call_mnemo(proc, 18, "get_event", {"event_id": first_event_id})
             memory_events = call_mnemo(proc, 19, "memory_events", {"memory_id": memory_id, "limit": 20})
-            shutdown = rpc(proc, {"jsonrpc": "2.0", "id": 20, "method": "shutdown"})
+            pack_landing = call_mnemo(proc, 20, "pack_landing_list", {"limit": 10})
+            shutdown = rpc(proc, {"jsonrpc": "2.0", "id": 21, "method": "shutdown"})
         finally:
             try:
                 proc.wait(timeout=5)
@@ -175,6 +179,8 @@ def main() -> int:
     assert event_detail["result"]["structuredContent"]["event"]["event_id"] == first_event_id
     assert memory_events["result"]["isError"] is False
     assert memory_events["result"]["structuredContent"]["events"]
+    assert pack_landing["result"]["isError"] is False
+    assert pack_landing["result"]["structuredContent"]["packs"][0]["filename"] == "incoming.mem"
     assert shutdown["result"] == {}
     print("OK: mnemo MCP server smoke test passed")
     return 0

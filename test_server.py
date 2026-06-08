@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
+import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +29,7 @@ ENV_KEYS = [
     "MNEMO_FILE",
     "MNEMO_STORE",
     "MNEMO_SQLITE_FILE",
+    "MNEMO_PACK_LANDING_DIR",
     "MNEMO_MAX_MEMORIES",
     "MNEMO_LOG_QUERIES",
     "MNEMO_WORKSPACE_ROOT",
@@ -538,6 +542,7 @@ class ToolSurfaceTests(MnemoTestCase):
         self.assertIn("pack_export", payload["available_actions"])
         self.assertIn("pack_inspect", payload["available_actions"])
         self.assertIn("pack_import", payload["available_actions"])
+        self.assertIn("pack_landing_list", payload["available_actions"])
         self.assertIn("pack_list_imports", payload["available_actions"])
         self.assertIn("pack_review_import", payload["available_actions"])
         self.assertIn("pack_promote_preview", payload["available_actions"])
@@ -584,6 +589,12 @@ class ToolSurfaceTests(MnemoTestCase):
         tool = server.TOOLS[0]
         enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
         self.assertIn("pack_import", enum_values)
+
+    def test_gateway_includes_pack_landing_list_action(self) -> None:
+        self.assertIn("pack_landing_list", server.GATEWAY_ACTIONS)
+        tool = server.TOOLS[0]
+        enum_values = tool["inputSchema"]["properties"]["action"]["enum"]
+        self.assertIn("pack_landing_list", enum_values)
 
     def test_gateway_includes_pack_list_imports_action(self) -> None:
         self.assertIn("pack_list_imports", server.GATEWAY_ACTIONS)
@@ -2792,6 +2803,16 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertFalse(result["isError"], result)
         return result
 
+    def _memory_group_discover(self, **params: Any) -> dict[str, Any]:
+        result = server.memory_group_discover(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
+    def _memory_group_preview(self, **params: Any) -> dict[str, Any]:
+        result = server.memory_group_preview(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
     def _pack_preview_ids(self, result: dict[str, Any]) -> list[str]:
         selection = result["structuredContent"]["selection"]
         return [str(memory_id) for memory_id in selection["row_ids"]]
@@ -2999,6 +3020,11 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertTrue(result["isError"], result)
         return result
 
+    def _pack_landing_list(self, **params: Any) -> dict[str, Any]:
+        result = server.pack_landing_list(dict(params))
+        self.assertFalse(result["isError"], result)
+        return result
+
     def _signer_add(self, **params: Any) -> dict[str, Any]:
         result = server.signer_add(dict(params))
         self.assertFalse(result["isError"], result)
@@ -3033,6 +3059,48 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         result = server.signer_enable(dict(params))
         self.assertTrue(result["isError"], result)
         return result
+
+    def test_pack_landing_list_returns_mem_files_and_ignores_non_mem_by_default(self) -> None:
+        landing_dir = self.root / "landing"
+        landing_dir.mkdir(parents=True, exist_ok=True)
+        newest = landing_dir / "recent.mem"
+        older = landing_dir / "older.mem"
+        ignored = landing_dir / "notes.txt"
+        legacy = landing_dir / "legacy.zip"
+        older.write_bytes(b"older")
+        newest.write_bytes(b"newer")
+        ignored.write_text("ignore", encoding="utf-8")
+        legacy.write_bytes(b"legacy")
+        os.environ["MNEMO_PACK_LANDING_DIR"] = str(landing_dir)
+        now = time.time()
+        os.utime(older, (now - 10, now - 10))
+        os.utime(newest, (now, now))
+        os.utime(legacy, (now - 5, now - 5))
+
+        result = self._pack_landing_list(limit=10)
+        payload = result["structuredContent"]
+        self.assertEqual(payload["action"], "pack_landing_list")
+        self.assertEqual(payload["landing_dir"], str(landing_dir.resolve()))
+        self.assertTrue(payload["landing_dir_exists"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual([item["filename"] for item in payload["packs"]], ["recent.mem", "older.mem"])
+        self.assertEqual([item["suffix"] for item in payload["packs"]], [".mem", ".mem"])
+
+    def test_pack_landing_list_optional_legacy_zip_inclusion_works(self) -> None:
+        landing_dir = self.root / "landing"
+        landing_dir.mkdir(parents=True, exist_ok=True)
+        (landing_dir / "trusted.mem").write_bytes(b"mem")
+        (landing_dir / "legacy.zip").write_bytes(b"zip")
+        os.environ["MNEMO_PACK_LANDING_DIR"] = str(landing_dir)
+
+        result = self._pack_landing_list(include_legacy_zip=True, limit=10)
+        payload = result["structuredContent"]
+        filenames = [item["filename"] for item in payload["packs"]]
+        self.assertEqual(payload["total"], 2)
+        self.assertIn("trusted.mem", filenames)
+        self.assertIn("legacy.zip", filenames)
+        legacy_row = next(item for item in payload["packs"] if item["filename"] == "legacy.zip")
+        self.assertTrue(legacy_row["legacy_zip"])
 
     def _pack_list_imports(self, **params: Any) -> dict[str, Any]:
         result = server.pack_list_imports(dict(params))
@@ -3579,6 +3647,43 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertNotIn(hippocampus["id"], ids)
         self.assertEqual(set(result["structuredContent"]["counts"]["by_kind"].keys()), {"context_block"})
 
+    def test_pack_preview_memory_ids_exact_selector(self) -> None:
+        first = self.record("phase213 exact preview first", kind="context_block")
+        second = self.record("phase213 exact preview second", kind="hippocampus_entry")
+        ignored = self.record("phase213 exact preview ignored", kind="context_block")
+        result = self._pack_preview(memory_ids=[str(second["id"]), str(first["id"]), str(second["id"])], limit=50)
+        ids = set(self._pack_preview_ids(result))
+        self.assertEqual(ids, {str(first["id"]), str(second["id"])})
+        self.assertNotIn(str(ignored["id"]), ids)
+
+    def test_pack_preview_group_selector_matches_memory_group_preview(self) -> None:
+        core = self.record("group selector preview core", kind="context_block")
+        peer = self.record("group selector preview peer", kind="hippocampus_entry")
+        related = self.record("group selector preview related", kind="context_block")
+        for memory_id in (str(core["id"]), str(peer["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase216-group-preview", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        linked = server.memory_link({"source_id": str(core["id"]), "target_id": str(related["id"]), "relation": "related"})
+        self.assertFalse(linked["isError"], linked)
+        group = self._memory_group_preview(group_id="topic:phase216-group-preview", scope="core_plus_related", limit=50)
+        expected_ids = group["structuredContent"]["selection"]["memory_ids"]
+
+        result = self._pack_preview(group_id="topic:phase216-group-preview", scope="core_plus_related", limit=50)
+        structured = result["structuredContent"]
+        self.assertEqual(structured["filters"]["group_id"], "topic:phase216-group-preview")
+        self.assertEqual(structured["filters"]["scope"], "core_plus_related")
+        self.assertEqual(structured["selection"]["row_ids"], expected_ids)
+
+    def test_pack_preview_group_selector_rejects_mixed_selectors(self) -> None:
+        result = server.pack_preview({"group_id": "topic:phase216-mixed", "topics": ["phase216-mixed"]})
+        self.assertTrue(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["error"]["code"], "ambiguous_selector")
+
+    def test_pack_preview_group_selector_unknown_group(self) -> None:
+        result = server.pack_preview({"group_id": "topic:missing-phase216-group"})
+        self.assertTrue(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["error"]["code"], "memory_group_not_found")
+
     def test_pack_preview_include_imported(self) -> None:
         self._insert_imported_pack(pack_id="phase2a-inc-trusted", trust_level="trusted", namespace="pack:phase2a-inc-trusted")
         self._insert_imported_pack(
@@ -3801,6 +3906,420 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         after_ids = [row["id"] for row in after["structuredContent"]["matches"]]
         self.assertEqual(before_ids, after_ids)
 
+    def test_memory_group_discover_topic_groups(self) -> None:
+        first = self.record("group topic alpha body", kind="context_block", title="Alpha memory")
+        second = self.record("group topic beta body", kind="hippocampus_entry", title="Beta memory")
+        added_a = server.topic_add({"memory_id": str(first["id"]), "topic": "mnemo-memory-packs", "source": "operator"})
+        added_b = server.topic_add({"memory_id": str(second["id"]), "topic": "mnemo-memory-packs", "source": "operator"})
+        self.assertFalse(added_a["isError"], added_a)
+        self.assertFalse(added_b["isError"], added_b)
+
+        result = self._memory_group_discover(limit_groups=10)
+        groups = result["structuredContent"]["groups"]
+        group = next(item for item in groups if item["group_id"] == "topic:mnemo-memory-packs")
+        self.assertEqual(group["group_type"], "topic")
+        self.assertGreaterEqual(group["core_memory_count"], 2)
+        self.assertIn(str(first["id"]), group["sample_memory_ids"])
+
+    def test_memory_group_discover_excludes_mechanical_topics_by_default(self) -> None:
+        row = self.record("mechanical topic row", kind="context_block")
+        added = server.topic_add({"memory_id": str(row["id"]), "topic": "synthetic:run:demo", "source": "operator"})
+        self.assertFalse(added["isError"], added)
+
+        result = self._memory_group_discover(limit_groups=20)
+        group_ids = {str(item["group_id"]) for item in result["structuredContent"]["groups"]}
+        self.assertNotIn("topic:synthetic:run:demo", group_ids)
+
+    def test_memory_group_discover_catalog_mode_returns_compact_options(self) -> None:
+        alpha = self.record("banking risk domain alpha", kind="context_block", title="Banking Risk Alpha", domain="banking_risk")
+        beta = self.record("banking risk domain beta", kind="hippocampus_entry", title="Banking Risk Beta", domain="banking_risk")
+        result = self._memory_group_discover(
+            output_mode="catalog",
+            catalog_for="export",
+            limit_groups=10,
+            include_raw_groups=False,
+        )
+        payload = result["structuredContent"]
+        self.assertEqual(payload["output_mode"], "catalog")
+        self.assertIn("catalog", payload)
+        options = payload["catalog"]["options"]
+        self.assertTrue(options)
+        option = next(item for item in options if item["group_id"] == "domain:banking_risk")
+        for key in ("label", "value", "description", "group_id", "group_type"):
+            self.assertIn(key, option)
+        self.assertEqual(option["value"], option["group_id"])
+        self.assertEqual(option["group_type"], "domain")
+        self.assertGreaterEqual(int(option["core_memory_count"]), 2)
+        self.assertGreaterEqual(int(option["core_exportable_count"]), 2)
+
+    def test_memory_group_discover_catalog_mode_omits_verbose_fields(self) -> None:
+        one = self.record("catalog compact alpha", kind="context_block", title="Compact Alpha")
+        two = self.record("catalog compact beta", kind="hippocampus_entry", title="Compact Beta")
+        for memory_id in (str(one["id"]), str(two["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "catalog-compact-topic", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        result = self._memory_group_discover(
+            output_mode="catalog",
+            catalog_for="export",
+            limit_groups=10,
+            include_raw_groups=False,
+        )
+        payload = result["structuredContent"]
+        self.assertNotIn("groups", payload)
+        option = next(item for item in payload["catalog"]["options"] if item["group_id"] == "topic:catalog-compact-topic")
+        for forbidden in ("core_topics", "related_topics", "domains", "touched_paths", "sample_memory_ids", "sample_titles", "reasons"):
+            self.assertNotIn(forbidden, option)
+
+    def test_memory_group_discover_catalog_mode_core_counts(self) -> None:
+        self.record("banking counts one", kind="context_block", domain="banking_risk")
+        self.record("banking counts two", kind="hippocampus_entry", domain="banking_risk")
+        self.record("banking counts nonexportable", kind="interaction_log", summary="banking log", domain="banking_risk")
+        result = self._memory_group_discover(
+            output_mode="catalog",
+            catalog_for="export",
+            limit_groups=10,
+            include_raw_groups=False,
+        )
+        option = next(item for item in result["structuredContent"]["catalog"]["options"] if item["group_id"] == "domain:banking_risk")
+        self.assertEqual(int(option["core_memory_count"]), 3)
+        self.assertEqual(int(option["core_exportable_count"]), 2)
+
+    def test_memory_group_discover_catalog_mode_sorts_domain_before_synthetic_path(self) -> None:
+        self.record("domain group row one", kind="context_block", domain="banking_risk")
+        self.record("domain group row two", kind="hippocampus_entry", domain="banking_risk")
+        synthetic_path = "state/mnemo/synthetic_files/uxlab/demo/component.md"
+        synthetic_file = self.workspace / synthetic_path
+        synthetic_file.parent.mkdir(parents=True, exist_ok=True)
+        synthetic_file.write_text("synthetic demo component", encoding="utf-8")
+        self.record(
+            "synthetic path alpha",
+            kind="context_block",
+            title="Synthetic Path Alpha",
+            touched_files=[synthetic_path],
+        )
+        self.record(
+            "synthetic path beta",
+            kind="hippocampus_entry",
+            title="Synthetic Path Beta",
+            touched_files=[synthetic_path],
+        )
+        result = self._memory_group_discover(
+            output_mode="catalog",
+            catalog_for="export",
+            limit_groups=10,
+            include_raw_groups=False,
+        )
+        options = result["structuredContent"]["catalog"]["options"]
+        self.assertTrue(options)
+        self.assertEqual(str(options[0]["group_id"]), "domain:banking_risk")
+        synthetic_option = next(
+            item for item in options if bool(item["synthetic"]) and "state/mnemo/synthetic_files/" in str(item["value"])
+        )
+        self.assertEqual(str(synthetic_option["group_type"]), "path")
+
+    def test_memory_group_discover_catalog_mode_no_groups(self) -> None:
+        result = self._memory_group_discover(
+            output_mode="catalog",
+            catalog_for="export",
+            limit_groups=10,
+            include_raw_groups=False,
+        )
+        payload = result["structuredContent"]
+        self.assertEqual(payload["output_mode"], "catalog")
+        self.assertEqual(payload["catalog"]["options"], [])
+        self.assertNotIn("groups", payload)
+
+    def test_memory_group_preview_core_scope(self) -> None:
+        first = self.record("core preview first", kind="context_block", title="Core first")
+        second = self.record("core preview second", kind="hippocampus_entry", title="Core second")
+        for memory_id in (str(first["id"]), str(second["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase213-group-core", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+
+        result = self._memory_group_preview(group_id="topic:phase213-group-core", scope="core", limit=50)
+        selection = result["structuredContent"]["selection"]
+        self.assertEqual(set(selection["memory_ids"]), {str(first["id"]), str(second["id"])})
+        readiness = result["structuredContent"]["pack_readiness"]
+        self.assertTrue(readiness["can_export_default"])
+
+    def test_memory_group_preview_core_plus_related_scope(self) -> None:
+        core = self.record("related preview core", kind="context_block", title="Related core")
+        peer = self.record("related preview peer", kind="hippocampus_entry", title="Related peer")
+        related = self.record("related preview extra", kind="context_block", title="Related extra")
+        for memory_id in (str(core["id"]), str(peer["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase213-group-related", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        linked = server.memory_link({"source_id": str(core["id"]), "target_id": str(related["id"]), "relation": "related"})
+        self.assertFalse(linked["isError"], linked)
+
+        result = self._memory_group_preview(group_id="topic:phase213-group-related", scope="core_plus_related", limit=50)
+        ids = set(result["structuredContent"]["selection"]["memory_ids"])
+        self.assertIn(str(core["id"]), ids)
+        self.assertIn(str(peer["id"]), ids)
+        self.assertIn(str(related["id"]), ids)
+        reasons = result["structuredContent"]["membership_reasons"][str(related["id"])]
+        self.assertTrue(any("explicit link" in str(item) for item in reasons))
+
+    def test_memory_group_preview_unknown_group(self) -> None:
+        result = server.memory_group_preview({"group_id": "topic:missing-group"})
+        self.assertTrue(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["error"]["code"], "memory_group_not_found")
+
+    def test_memory_group_discover_alias_groups(self) -> None:
+        alpha = self.record("hippocampus bridge operator notes", kind="context_block", domain="agentic")
+        beta = self.record("bridge for recall workflows", kind="hippocampus_entry", domain="agentic")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        concept_id = str(approved["structuredContent"]["concept"]["concept_id"])
+
+        result = self._memory_group_discover(limit_groups=20)
+        groups = result["structuredContent"]["groups"]
+        group = next(item for item in groups if item["group_id"] == f"alias:{concept_id}")
+        self.assertEqual(group["group_type"], "alias")
+        self.assertEqual(str(group["label"]), "memory recall pipeline")
+        self.assertGreaterEqual(int(group["core_memory_count"]), 2)
+        self.assertIn(str(alpha["id"]), set(group["sample_memory_ids"]))
+        self.assertIn("alias concept:memory recall pipeline", list(group["reasons"]))
+
+    def test_memory_group_preview_alias_core_scope(self) -> None:
+        alpha = self.record("hippocampus bridge sync", kind="context_block", domain="agentic")
+        beta = self.record("memory recall pipeline design", kind="hippocampus_entry", domain="agentic")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        concept_id = str(approved["structuredContent"]["concept"]["concept_id"])
+
+        result = self._memory_group_preview(group_id=f"alias:{concept_id}", scope="core", limit=50)
+        payload = result["structuredContent"]
+        self.assertEqual(set(payload["selection"]["memory_ids"]), {str(alpha["id"]), str(beta["id"])})
+        reasons = payload["membership_reasons"][str(alpha["id"])]
+        self.assertTrue(any("matched alias concept memory recall pipeline" in str(item) for item in reasons))
+
+    def test_memory_group_preview_alias_core_plus_related_scope(self) -> None:
+        core = self.record("hippocampus bridge sync", kind="context_block", domain="agentic")
+        peer = self.record("memory recall pipeline design", kind="hippocampus_entry", domain="agentic")
+        related = self.record("supporting related memory", kind="context_block", domain="ops")
+        topic_added = server.topic_add({"memory_id": str(core["id"]), "topic": "alias-related-support", "source": "operator"})
+        self.assertFalse(topic_added["isError"], topic_added)
+        topic_added = server.topic_add({"memory_id": str(related["id"]), "topic": "alias-related-support", "source": "operator"})
+        self.assertFalse(topic_added["isError"], topic_added)
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        concept_id = str(approved["structuredContent"]["concept"]["concept_id"])
+
+        result = self._memory_group_preview(group_id=f"alias:{concept_id}", scope="core_plus_related", limit=50)
+        payload = result["structuredContent"]
+        ids = set(payload["selection"]["memory_ids"])
+        self.assertIn(str(core["id"]), ids)
+        self.assertIn(str(peer["id"]), ids)
+        self.assertIn(str(related["id"]), ids)
+        self.assertTrue(any("shared topic:alias-related-support" in str(item) for item in payload["membership_reasons"][str(related["id"])]))
+
+    def test_memory_group_discover_ignores_inactive_aliases(self) -> None:
+        self.record("hippocampus bridge sync", kind="context_block", domain="agentic")
+        self.record("bridge for recall workflows", kind="hippocampus_entry", domain="agentic")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        alias_id = str(approved["structuredContent"]["alias"]["alias_id"])
+        concept_id = str(approved["structuredContent"]["concept"]["concept_id"])
+        disabled = server.memory_maintenance({"action": "disable_alias", "alias_id": alias_id, "reason": "inactive"})
+        self.assertFalse(disabled["isError"], disabled)
+
+        result = self._memory_group_discover(limit_groups=20)
+        group_ids = {str(item["group_id"]) for item in result["structuredContent"]["groups"]}
+        self.assertNotIn(f"alias:{concept_id}", group_ids)
+
+    def test_memory_group_discover_ignores_pending_alias_proposals(self) -> None:
+        self.record("hippocampus bridge sync", kind="context_block", domain="agentic")
+        self.record("bridge for recall workflows", kind="hippocampus_entry", domain="agentic")
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            conn.execute(
+                """
+                INSERT INTO alias_proposals(
+                    proposal_id, canonical, candidate_alias, domain, language, status,
+                    normalized_alias, score, evidence_json, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "alias-group-pending-only",
+                    "memory recall pipeline",
+                    "hippocampus bridge",
+                    "agentic",
+                    "en",
+                    "pending",
+                    server._normalize_alias_term("hippocampus bridge"),
+                    0.75,
+                    json.dumps([], ensure_ascii=False),
+                    server.now_iso(),
+                    server.now_iso(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = self._memory_group_discover(limit_groups=20)
+        self.assertFalse(
+            any(str(item["group_id"]).startswith("alias:") for item in result["structuredContent"]["groups"])
+        )
+
+    def test_memory_group_discover_alias_respects_visibility(self) -> None:
+        trusted_pack_id = "alias-trusted-pack"
+        quarantine_pack_id = "alias-quarantine-pack"
+        trusted_namespace = f"pack:trusted:{trusted_pack_id}"
+        quarantine_namespace = f"pack:quarantine:{quarantine_pack_id}"
+        self._insert_imported_pack(pack_id=trusted_pack_id, trust_level="trusted", namespace=trusted_namespace)
+        self._insert_imported_pack(pack_id=quarantine_pack_id, trust_level="quarantine", namespace=quarantine_namespace)
+        trusted = self.record(
+            "hippocampus bridge trusted visibility",
+            kind="context_block",
+            domain="agentic",
+            namespace=trusted_namespace,
+            origin="imported",
+        )
+        quarantine = self.record(
+            "hippocampus bridge quarantine visibility",
+            kind="context_block",
+            domain="agentic",
+            namespace=quarantine_namespace,
+            origin="imported",
+        )
+        local = self.record("hippocampus bridge local visibility", kind="context_block", domain="agentic")
+        local_peer = self.record("memory recall pipeline local peer", kind="hippocampus_entry", domain="agentic")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        concept_id = str(approved["structuredContent"]["concept"]["concept_id"])
+
+        default_group = next(
+            item
+            for item in self._memory_group_discover(limit_groups=20)["structuredContent"]["groups"]
+            if item["group_id"] == f"alias:{concept_id}"
+        )
+        self.assertEqual(int(default_group["core_memory_count"]), 2)
+
+        trusted_group = next(
+            item
+            for item in self._memory_group_discover(include_imported=True, limit_groups=20)["structuredContent"]["groups"]
+            if item["group_id"] == f"alias:{concept_id}"
+        )
+        self.assertEqual(int(trusted_group["core_memory_count"]), 3)
+
+        quarantine_group = next(
+            item
+            for item in self._memory_group_discover(include_quarantine=True, limit_groups=20)["structuredContent"]["groups"]
+            if item["group_id"] == f"alias:{concept_id}"
+        )
+        self.assertEqual(int(quarantine_group["core_memory_count"]), 3)
+
+        all_group = next(
+            item
+            for item in self._memory_group_discover(include_imported=True, include_quarantine=True, limit_groups=20)["structuredContent"]["groups"]
+            if item["group_id"] == f"alias:{concept_id}"
+        )
+        self.assertEqual(int(all_group["core_memory_count"]), 4)
+
+        trusted_preview = self._memory_group_preview(
+            group_id=f"alias:{concept_id}",
+            scope="core",
+            include_imported=True,
+            limit=50,
+        )
+        self.assertIn(str(trusted["id"]), set(trusted_preview["structuredContent"]["selection"]["memory_ids"]))
+        self.assertNotIn(str(quarantine["id"]), set(trusted_preview["structuredContent"]["selection"]["memory_ids"]))
+
+    def test_memory_group_preview_alias_unknown_group(self) -> None:
+        result = server.memory_group_preview({"group_id": "alias:missing-concept"})
+        self.assertTrue(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["error"]["code"], "memory_group_not_found")
+
+    def test_no_schema_bump_for_alias_groups(self) -> None:
+        self.record("hippocampus bridge sync", kind="context_block", domain="agentic")
+        self.record("bridge for recall workflows", kind="hippocampus_entry", domain="agentic")
+        approved = server.memory_maintenance(
+            {
+                "action": "approve_alias",
+                "canonical": "memory recall pipeline",
+                "candidate_alias": "hippocampus bridge",
+                "domain": "agentic",
+                "approved_by": "unit-test",
+            }
+        )
+        self.assertFalse(approved["isError"], approved)
+        discover = self._memory_group_discover(limit_groups=20)
+        self.assertFalse(discover["isError"], discover)
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            schema_version = int(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertEqual(schema_version, 7)
+        self.assertEqual(int(server.SQLITE_SCHEMA_VERSION), 7)
+
+    def test_memory_group_actions_read_only(self) -> None:
+        first = self.record("group read only row a", kind="context_block", title="Read only row a")
+        second = self.record("group read only row b", kind="hippocampus_entry", title="Read only row b")
+        for memory_id in (str(first["id"]), str(second["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase213-read-only", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        before = self._read_only_snapshot()
+        discover = self._memory_group_discover(limit_groups=10)
+        self.assertFalse(discover["isError"], discover)
+        preview = self._memory_group_preview(group_id="topic:phase213-read-only", scope="core", limit=50)
+        self.assertFalse(preview["isError"], preview)
+        after = self._read_only_snapshot()
+        self.assertEqual(before, after)
+
+    def test_no_schema_bump(self) -> None:
+        server.load_store()
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            schema_version = int(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0])
+        finally:
+            conn.close()
+        self.assertEqual(schema_version, 7)
+        self.assertEqual(int(server.SQLITE_SCHEMA_VERSION), 7)
+
     def test_pack_preview_strict_read_only_empty_db(self) -> None:
         result = server.pack_preview({})
         self.assertFalse(result["isError"], result)
@@ -3829,6 +4348,41 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertTrue(samples)
         self.assertIn("[REDACTED:email]", samples[0]["redacted_preview"])
         self.assertNotIn(literal, json.dumps(result["structuredContent"], ensure_ascii=True))
+
+    def test_pack_redaction_preview_memory_ids_exact_selector(self) -> None:
+        first_literal = "exact.one@example.test"
+        second_literal = "exact.two@example.test"
+        first = self.record(f"phase213 redaction exact {first_literal}", kind="context_block")
+        self.record(f"phase213 redaction ignored {second_literal}", kind="context_block")
+        result = self._pack_redaction_preview(memory_ids=[str(first["id"])], limit=50)
+        redaction = result["structuredContent"]["redaction"]
+        self.assertEqual(int(redaction["affected_rows"]), 1)
+        self.assertGreaterEqual(int(redaction["by_category"].get("email", 0)), 1)
+        payload_text = json.dumps(result["structuredContent"], ensure_ascii=True)
+        self.assertIn("exact.one@example.test".replace("exact.one@example.test", "[REDACTED:email]"), payload_text)
+        self.assertNotIn(second_literal, payload_text)
+
+    def test_pack_redaction_preview_group_selector_matches_memory_group_preview(self) -> None:
+        first = self.record("group redaction first alpha@example.test", kind="context_block")
+        second = self.record("group redaction second beta@example.test", kind="hippocampus_entry")
+        ignored = self.record("group redaction ignored gamma@example.test", kind="context_block")
+        for memory_id in (str(first["id"]), str(second["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase216-group-redaction", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+
+        group = self._memory_group_preview(group_id="topic:phase216-group-redaction", scope="core", limit=50)
+        expected_ids = group["structuredContent"]["selection"]["memory_ids"]
+        result = self._pack_redaction_preview(group_id="topic:phase216-group-redaction", scope="core", limit=50)
+        structured = result["structuredContent"]
+        self.assertEqual(structured["filters"]["group_id"], "topic:phase216-group-redaction")
+        self.assertEqual(structured["filters"]["scope"], "core")
+        self.assertEqual(structured["selection"]["row_ids"], expected_ids)
+        self.assertNotIn(str(ignored["id"]), structured["selection"]["row_ids"])
+
+    def test_pack_redaction_preview_group_selector_rejects_mixed_selectors(self) -> None:
+        result = server.pack_redaction_preview({"group_id": "topic:phase216-redact-mixed", "memory_ids": ["mem_1"]})
+        self.assertTrue(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["error"]["code"], "ambiguous_selector")
 
     def test_pack_redaction_preview_secret_patterns(self) -> None:
         jwt_literal = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
@@ -4107,7 +4661,31 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertIn("allow_unsigned=true", result["content"][0]["text"])
         self.assertEqual(self._exported_packs_count(), before_audit)
         if output_dir.exists():
-            self.assertEqual(list(output_dir.glob("*.zip")), [])
+            self.assertEqual(list(output_dir.glob("*.mem")), [])
+
+    def test_pack_export_uses_mem_extension(self) -> None:
+        self.record("phase2c mem extension", kind="context_block")
+        output_dir = self.root / "phase2c_mem_extension"
+        result = self._pack_export(
+            pack_name="phase2c_mem_extension",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        self.assertEqual(output_path.suffix.lower(), ".mem")
+        self.assertTrue(output_path.exists())
+
+    def test_pack_export_mem_opens_as_zip(self) -> None:
+        self.record("phase2c mem opens as zip", kind="context_block")
+        output_dir = self.root / "phase2c_mem_zip"
+        result = self._pack_export(
+            pack_name="phase2c_mem_zip",
+            output_dir=str(output_dir),
+            allow_unsigned=True,
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        with zipfile.ZipFile(output_path, "r") as archive:
+            self.assertIn("manifest.json", archive.namelist())
 
     def test_pack_export_creates_zip_with_required_members(self) -> None:
         self.record("phase2c zip member email test.user@example.test", kind="context_block")
@@ -4204,6 +4782,21 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertNotIn(first["id"], bundle_text)
         self.assertNotIn(second["id"], bundle_text)
 
+    def test_pack_export_memory_ids_exact_selector_does_not_leak_source_ids_in_zip(self) -> None:
+        first = self.record("phase2c exact id no leak first", kind="context_block")
+        second = self.record("phase2c exact id no leak second", kind="hippocampus_entry")
+        result = self._pack_export(
+            pack_name="phase2c_exact_id_no_leak",
+            output_dir=str(self.root / "phase2c_exact_id_no_leak"),
+            allow_unsigned=True,
+            memory_ids=[first["id"], second["id"]],
+        )
+        output_path = Path(result["structuredContent"]["output_path"])
+        members = self._read_zip_members(output_path)
+        bundle_text = "\n".join(blob.decode("utf-8", errors="ignore") for blob in members.values())
+        self.assertNotIn(first["id"], bundle_text)
+        self.assertNotIn(second["id"], bundle_text)
+
     def test_pack_export_writes_exported_packs_audit_row(self) -> None:
         self.record("phase2c audit row one", kind="context_block")
         before = self._exported_packs_count()
@@ -4261,7 +4854,7 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertIn("kind 'agent_feedback' is previewable but not exportable", bad_feedback["content"][0]["text"])
         self.assertEqual(self._exported_packs_count(), before)
         if output_dir.exists():
-            self.assertEqual(list(output_dir.glob("*.zip")), [])
+            self.assertEqual(list(output_dir.glob("*.mem")), [])
 
     def test_pack_export_empty_selection_fails(self) -> None:
         self.record("phase2c empty selection marker", kind="context_block")
@@ -4276,7 +4869,7 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertIn("selection returned zero rows", result["content"][0]["text"])
         self.assertEqual(self._exported_packs_count(), before)
         if output_dir.exists():
-            self.assertEqual(list(output_dir.glob("*.zip")), [])
+            self.assertEqual(list(output_dir.glob("*.mem")), [])
 
     def test_pack_export_limited_selection_requires_override(self) -> None:
         for idx in range(6):
@@ -4288,6 +4881,7 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
             allow_unsigned=True,
             limit=2,
         )
+        self.assertEqual(failed["structuredContent"]["error"]["code"], "limited_export_requires_confirmation")
         self.assertIn("selection is limited", failed["content"][0]["text"])
         success = self._pack_export(
             pack_name="phase2c_limited_success",
@@ -4304,6 +4898,71 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         selection = manifest["selection"]
         self.assertGreater(int(selection["total_rows"]), int(selection["exported_rows"]))
         self.assertEqual(int(selection["exported_rows"]), 2)
+
+    def test_pack_export_group_selector_matches_memory_group_preview_export(self) -> None:
+        first = self.record("group export first", kind="context_block")
+        second = self.record("group export second", kind="hippocampus_entry")
+        extra = self.record("group export extra", kind="context_block")
+        for memory_id in (str(first["id"]), str(second["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase216-group-export", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        linked = server.memory_link({"source_id": str(first["id"]), "target_id": str(extra["id"]), "relation": "related"})
+        self.assertFalse(linked["isError"], linked)
+
+        group = self._memory_group_preview(group_id="topic:phase216-group-export", scope="core_plus_related", limit=50)
+        expected_ids = group["structuredContent"]["selection"]["memory_ids"]
+        result = self._pack_export(
+            pack_name="phase216_group_selector",
+            output_dir=str(self.root / "phase216_group_selector"),
+            group_id="topic:phase216-group-export",
+            scope="core_plus_related",
+            allow_unsigned=True,
+        )
+        members = self._read_zip_members(Path(result["structuredContent"]["output_path"]))
+        manifest = json.loads(members["manifest.json"].decode("utf-8"))
+        rows = [json.loads(line) for line in members["content/memories.jsonl"].decode("utf-8").splitlines() if line.strip()]
+        self.assertEqual(manifest["selection"]["filters"]["group_id"], "topic:phase216-group-export")
+        self.assertEqual(manifest["selection"]["filters"]["scope"], "core_plus_related")
+        self.assertEqual(len(rows), len(expected_ids))
+
+    def test_pack_export_group_selector_rejects_mixed_selectors(self) -> None:
+        result = self._pack_export_error(
+            pack_name="phase216_group_selector_mixed",
+            output_dir=str(self.root / "phase216_group_selector_mixed"),
+            group_id="topic:phase216-group-mixed",
+            memory_ids=["mem_1"],
+            allow_unsigned=True,
+        )
+        self.assertEqual(result["structuredContent"]["error"]["code"], "ambiguous_selector")
+
+    def test_pack_export_group_selector_limited_requires_confirmation(self) -> None:
+        first = self.record("group limited 1", kind="context_block")
+        second = self.record("group limited 2", kind="context_block")
+        third = self.record("group limited 3", kind="context_block")
+        for memory_id in (str(first["id"]), str(second["id"]), str(third["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase216-group-limited", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+
+        failed = self._pack_export_error(
+            pack_name="phase216_group_limited_fail",
+            output_dir=str(self.root / "phase216_group_limited"),
+            group_id="topic:phase216-group-limited",
+            scope="core",
+            limit=2,
+            allow_unsigned=True,
+        )
+        self.assertEqual(failed["structuredContent"]["error"]["code"], "limited_export_requires_confirmation")
+        success = self._pack_export(
+            pack_name="phase216_group_limited_ok",
+            output_dir=str(self.root / "phase216_group_limited"),
+            group_id="topic:phase216-group-limited",
+            scope="core",
+            limit=2,
+            allow_unsigned=True,
+            allow_limited_export=True,
+        )
+        warnings = success["structuredContent"]["warnings"]
+        self.assertTrue(any(item.get("code") == "limited_export" for item in warnings))
 
     def test_pack_export_topic_filter_uses_memory_topics(self) -> None:
         body_only = self.record("phase2c topic auth body-only marker", kind="context_block")
@@ -4329,6 +4988,36 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         text_value = rows[0]["text_fields"]["text"]
         self.assertIn("phase2c tagged memory", text_value)
         self.assertNotIn(body_only["id"], json.dumps(rows, ensure_ascii=True))
+
+    def test_pack_export_memory_ids_exact_selector(self) -> None:
+        first = self.record("phase213 exact export first", kind="context_block")
+        second = self.record("phase213 exact export second", kind="hippocampus_entry")
+        self.record("phase213 exact export ignored", kind="context_block")
+        result = self._pack_export(
+            pack_name="phase213_exact_export",
+            output_dir=str(self.root / "phase213_exact_export"),
+            allow_unsigned=True,
+            memory_ids=[str(first["id"]), str(second["id"])],
+            limit=50,
+        )
+        members = self._read_zip_members(Path(result["structuredContent"]["output_path"]))
+        rows = [
+            json.loads(line)
+            for line in members["content/memories.jsonl"].decode("utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sorted(str(row["row_id_in_pack"]) for row in rows), ["ctx_001", "hip_001"])
+
+    def test_pack_export_memory_ids_unknown_ids_safe(self) -> None:
+        result = self._pack_export_error(
+            pack_name="phase213_unknown_ids_safe",
+            output_dir=str(self.root / "phase213_unknown_ids_safe"),
+            allow_unsigned=True,
+            memory_ids=["mem_missing_a", "mem_missing_b"],
+            limit=50,
+        )
+        self.assertIn("nothing to export", result["content"][0]["text"].lower())
 
     def test_pack_export_touched_paths_filter(self) -> None:
         auth_file = self.workspace / "src" / "auth" / "session.py"
@@ -4445,7 +5134,11 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertIn("forced invalid zip", result["content"][0]["text"])
         self.assertEqual(self._exported_packs_count(), before)
         if output_dir.exists():
-            leftovers = [path for path in output_dir.iterdir() if path.suffix in {".zip", ".tmp"} or path.name.endswith(".zip.tmp")]
+            leftovers = [
+                path
+                for path in output_dir.iterdir()
+                if path.suffix in {".mem", ".tmp"} or path.name.endswith(".mem.tmp")
+            ]
             self.assertEqual(leftovers, [])
 
     def test_pack_export_rejects_unsafe_pack_name(self) -> None:
@@ -4544,6 +5237,32 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertEqual(payload["import_recommendation"], "quarantine_only")
         warnings = payload["warnings"]
         self.assertTrue(any(item.get("code") == "unsigned_pack" for item in warnings))
+
+    def test_pack_inspect_mem_no_non_zip_warning(self) -> None:
+        self.record("phase3a mem inspect row", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_mem_pack",
+            output_dir=self.root / "phase3a_mem_pack",
+        )
+        self.assertEqual(pack_path.suffix.lower(), ".mem")
+        result = self._pack_inspect(pack_path=str(pack_path))
+        warnings = result["structuredContent"]["warnings"]
+        codes = {str(item.get("code", "")) for item in warnings if isinstance(item, dict)}
+        self.assertNotIn("non_zip_suffix", codes)
+        self.assertNotIn("nonstandard_pack_suffix", codes)
+        self.assertNotIn("legacy_zip_suffix", codes)
+
+    def test_pack_inspect_zip_legacy_warning(self) -> None:
+        self.record("phase3a zip legacy warning row", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3a_zip_legacy",
+            output_dir=self.root / "phase3a_zip_legacy",
+        )
+        legacy_path = pack_path.with_suffix(".zip")
+        shutil.copyfile(pack_path, legacy_path)
+        result = self._pack_inspect(pack_path=str(legacy_path))
+        warnings = result["structuredContent"]["warnings"]
+        self.assertTrue(any(str(item.get("code", "")) == "legacy_zip_suffix" for item in warnings))
 
     def test_pack_inspect_content_hash_verifies(self) -> None:
         self.record("phase3a hash verify", kind="context_block")
@@ -4920,6 +5639,32 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertEqual(payload["trust_level"], "quarantine")
         self.assertTrue(str(payload["namespace"]).startswith("pack:quarantine:"))
         self.assertIn(str(payload["pack_id"]), str(payload["namespace"]))
+
+    def test_pack_import_mem_supported(self) -> None:
+        self.record("phase3b mem import supported", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_mem_supported",
+            output_dir=self.root / "phase3b_mem_supported",
+        )
+        self.assertEqual(pack_path.suffix.lower(), ".mem")
+        result = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        payload = result["structuredContent"]
+        self.assertEqual(payload["status"], "ok")
+        warnings = payload.get("warnings", [])
+        codes = {str(item.get("code", "")) for item in warnings if isinstance(item, dict)}
+        self.assertNotIn("legacy_zip_suffix", codes)
+
+    def test_pack_import_zip_legacy_warning_supported(self) -> None:
+        self.record("phase3b legacy zip import supported", kind="context_block")
+        pack_path = self._create_exported_pack(
+            pack_name="phase3b_legacy_zip_supported",
+            output_dir=self.root / "phase3b_legacy_zip_supported",
+        )
+        legacy_path = pack_path.with_suffix(".zip")
+        shutil.copyfile(pack_path, legacy_path)
+        result = self._pack_import(pack_path=str(legacy_path), allow_unsigned_quarantine=True)
+        warnings = result["structuredContent"].get("warnings", [])
+        self.assertTrue(any(str(item.get("code", "")) == "legacy_zip_suffix" for item in warnings))
 
     def test_pack_import_inserts_imported_packs_row(self) -> None:
         self.record("phase3b imported pack row", kind="context_block")
@@ -5533,6 +6278,27 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         self.assertIn("by_import_freshness", payload["counts"])
         self.assertIn("top_referenced_files", payload["files"])
         self.assertIn("samples", payload)
+
+    def test_pack_review_import_grouped_summary(self) -> None:
+        first = self.record("phase213 grouped review alpha", kind="context_block", title="Grouped alpha")
+        second = self.record("phase213 grouped review beta", kind="hippocampus_entry", title="Grouped beta")
+        for memory_id in (str(first["id"]), str(second["id"])):
+            added = server.topic_add({"memory_id": memory_id, "topic": "phase213-grouped-review", "source": "operator"})
+            self.assertFalse(added["isError"], added)
+        pack_path = self._create_exported_pack(
+            pack_name="phase213_grouped_review",
+            output_dir=self.root / "phase213_grouped_review",
+            kinds=["context_block", "hippocampus_entry"],
+        )
+        imported = self._pack_import(pack_path=str(pack_path), allow_unsigned_quarantine=True)
+        reviewed = self._pack_review_import(
+            pack_id=str(imported["structuredContent"]["pack_id"]),
+            include_grouped_summary=True,
+        )
+        grouped = reviewed["structuredContent"]["grouped_summary"]
+        self.assertIn("top_topic_groups", grouped)
+        self.assertIn("freshness_counts", grouped)
+        self.assertTrue(grouped["top_topic_groups"])
 
     def test_pack_review_import_unknown_pack(self) -> None:
         self.record("phase4a review unknown seed", kind="context_block")
@@ -10215,6 +10981,600 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         pack_id = str(imported_sc["pack_id"])
         review = self._pack_review_import(pack_id=pack_id, include_samples=False, limit=600)
         self.assertEqual(int(review["structuredContent"]["selection"]["total_pack_rows"]), 500)
+
+
+class MemoryPacksLargeSyntheticHarnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._tmp_path = Path(cls._tmp.name)
+        cls._runner_path = (
+            Path(__file__).resolve().parent
+            / "_test_results"
+            / "memory_packs_large_synthetic"
+            / "run_check.py"
+        )
+        if not cls._runner_path.exists():
+            raise unittest.SkipTest("large synthetic runner script is not present")
+
+        cls._quick_run_dir = cls._tmp_path / "quick_run"
+        env = dict(os.environ)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(cls._runner_path),
+                "--profile",
+                "quick",
+                "--seed",
+                "424242",
+                "--work-dir",
+                str(cls._quick_run_dir),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        cls._quick_proc = proc
+        if proc.returncode != 0:
+            raise AssertionError(
+                "quick synthetic runner failed\nstdout:\n{0}\nstderr:\n{1}".format(
+                    proc.stdout, proc.stderr
+                )
+            )
+        cls._report_json_path = cls._quick_run_dir / "memory_packs_large_synthetic_report.json"
+        cls._report_md_path = cls._quick_run_dir / "memory_packs_large_synthetic_report.md"
+        if not cls._report_json_path.exists():
+            raise AssertionError(f"expected synthetic report missing: {cls._report_json_path}")
+        cls._report = json.loads(cls._report_json_path.read_text(encoding="utf-8"))
+        cls._checks = {
+            str(item.get("name", "")): bool(item.get("passed"))
+            for item in cls._report.get("checks", [])
+            if isinstance(item, dict)
+        }
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls._tmp.cleanup()
+        finally:
+            super().tearDownClass()
+
+    def _assert_check_pass(self, name: str) -> None:
+        self.assertIn(name, self._checks, f"missing check row: {name}")
+        self.assertTrue(self._checks[name], f"synthetic check failed: {name}")
+
+    def test_synthetic_memory_pack_runner_exists(self) -> None:
+        self.assertTrue(self._runner_path.exists(), self._runner_path)
+
+    def test_synthetic_runner_quick_profile_passes(self) -> None:
+        summary = self._report.get("summary", {})
+        self.assertEqual(str(summary.get("status", "")), "ready")
+        self.assertEqual(int(summary.get("failed", 0)), 0)
+
+    def test_synthetic_dataset_deterministic_for_seed(self) -> None:
+        spec = importlib.util.spec_from_file_location("phase213_runner", str(self._runner_path))
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        first = module.build_dataset_plan("quick", 424242)
+        second = module.build_dataset_plan("quick", 424242)
+        self.assertEqual(first["cohort_counts"], second["cohort_counts"])
+        self.assertEqual(first["cohort_signature"], second["cohort_signature"])
+        self.assertEqual(first["dataset_signature"], second["dataset_signature"])
+
+    def test_synthetic_export_preview_counts_match(self) -> None:
+        self._assert_check_pass("synthetic_export_preview_counts_match")
+
+    def test_synthetic_redaction_cohort_detects_expected_categories(self) -> None:
+        self._assert_check_pass("synthetic_redaction_cohort_detects_expected_categories")
+
+    def test_synthetic_export_import_roundtrip_counts(self) -> None:
+        self._assert_check_pass("synthetic_export_import_roundtrip_counts")
+
+    def test_synthetic_trusted_import_flow_quick(self) -> None:
+        self._assert_check_pass("synthetic_trusted_import_flow_quick")
+
+    def test_synthetic_quarantine_flow_quick(self) -> None:
+        self._assert_check_pass("synthetic_quarantine_flow_quick")
+
+    def test_synthetic_reports_do_not_contain_raw_secrets(self) -> None:
+        payload_text = self._report_json_path.read_text(encoding="utf-8")
+        self._assert_check_pass("synthetic_reports_do_not_contain_raw_secrets")
+        self.assertNotIn("synthetic-trusted-signing-secret-0000424242-0123456789abcdef", payload_text)
+        self.assertNotIn("synthetic-quarantine-signing-secret-0000424242-fedcba9876543210", payload_text)
+        self.assertNotIn("synthetic-wrong-secret-0000424242-11112222333344445555", payload_text)
+
+    def test_memory_pack_export_prompt_exists_and_is_deterministic(self) -> None:
+        prompt_path = (
+            Path(__file__).resolve().parent
+            / ".github"
+            / "prompts"
+            / "mnemo.memory-pack-export.prompt.md"
+        )
+        self.assertTrue(prompt_path.exists(), prompt_path)
+        text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("pack_preview", text)
+        self.assertIn("pack_redaction_preview", text)
+        self.assertIn("pack_export", text)
+        self.assertIn("mnemo.memory_group_discover", text)
+        self.assertIn("Never use fuzzy query results as the final export selector", text)
+        self.assertIn("mnemo.pack_preview", text)
+        self.assertIn('"group_id": "<exact-group-id-from-catalog>"', text)
+        self.assertNotIn('"<MEMORY_IDS>"', text)
+        self.assertIn("local HMAC", text)
+
+    def test_memory_pack_import_prompt_exists_and_is_safe(self) -> None:
+        prompt_path = (
+            Path(__file__).resolve().parent
+            / ".github"
+            / "prompts"
+            / "mnemo.memory-pack-import.prompt.md"
+        )
+        self.assertTrue(prompt_path.exists(), prompt_path)
+        text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("pack_landing_list", text)
+        self.assertIn("pack_inspect", text)
+        self.assertIn("pack_import", text)
+        self.assertIn("pack_review_import", text)
+        self.assertIn("pack_promote_preview", text)
+        self.assertIn("pack_promote", text)
+        self.assertIn("Never auto-promote", text)
+        self.assertIn("confirm_promote=true", text)
+        self.assertIn("mnemo.pack_import", text)
+
+    def test_no_large_profile_in_unit_tests_by_default(self) -> None:
+        spec = importlib.util.spec_from_file_location("phase213_runner_default", str(self._runner_path))
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        self.assertEqual(str(module.DEFAULT_PROFILE), "quick")
+        self.assertNotIn("large", set(module.UNITTEST_SAFE_PROFILES))
+        cmd_text = " ".join(self._quick_proc.args if isinstance(self._quick_proc.args, list) else [str(self._quick_proc.args)])
+        self.assertIn("--profile quick", cmd_text)
+
+
+class MemoryPacksLiveUxLabTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._mnemo_root = Path(__file__).resolve().parent
+        cls._workspace_root = None
+        for candidate in [cls._mnemo_root.parent, cls._mnemo_root.parent.parent, cls._mnemo_root.parent.parent.parent, cls._mnemo_root.parent.parent.parent.parent]:
+            if (candidate / "agentic" / "scripts").exists():
+                cls._workspace_root = candidate
+                break
+        if cls._workspace_root is None:
+            cls._workspace_root = cls._mnemo_root.parent.parent.parent.parent
+        cls._agentic_root = cls._workspace_root / "agentic"
+        cls._scripts_root = cls._agentic_root / "scripts"
+        cls._seed_script = cls._scripts_root / "mnemo_seed_synthetic_live.py"
+        cls._stats_script = cls._scripts_root / "mnemo_synthetic_stats.py"
+        cls._smoke_script = cls._scripts_root / "mnemo_ux_lab_smoke.py"
+
+    def _load_script_module(self, path: Path, module_name: str):
+        script_dir = str(path.parent)
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _run_script(self, script: Path, *args: str, timeout_ms: int = 120000):
+        return subprocess.run(
+            [sys.executable, str(script), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_ms / 1000.0,
+        )
+
+    def test_runtime_version_surfaces_for_live_ux_lab(self) -> None:
+        pyproject = (self._mnemo_root / "pyproject.toml").read_text(encoding="utf-8")
+        readme = (self._mnemo_root / "README.md").read_text(encoding="utf-8")
+        changelog = (self._mnemo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        pyproject_match = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+        readme_match = re.search(r"Current version: \*\*([^\*]+)\*\*", readme)
+        changelog_match = re.search(r"^##\s+([^\n]+)", changelog, re.M)
+        self.assertIsNotNone(pyproject_match)
+        self.assertIsNotNone(readme_match)
+        self.assertIsNotNone(changelog_match)
+        self.assertEqual(server.SERVER_VERSION, pyproject_match.group(1))
+        self.assertEqual(server.SERVER_VERSION, readme_match.group(1))
+        self.assertEqual(server.SERVER_VERSION, changelog_match.group(1))
+
+    def test_live_synthetic_profile_sizes_are_small(self) -> None:
+        module = self._load_script_module(self._seed_script, "mnemo_live_seed_sizes")
+        self.assertEqual(module.PROFILE_ROW_TARGETS["quick"], 120)
+        self.assertEqual(module.PROFILE_ROW_TARGETS["medium"], 400)
+        self.assertEqual(module.PROFILE_ROW_TARGETS["large"], 1000)
+
+    def test_live_synthetic_seeder_exists(self) -> None:
+        self.assertTrue(self._seed_script.exists(), self._seed_script)
+
+    def test_live_synthetic_seeder_dry_run_deterministic(self) -> None:
+        if not self._seed_script.exists():
+            self.skipTest("agentic seeder script not present")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "mnemo.sqlite"
+            workspace_root = root / "workspace"
+            report_a = root / "report_a"
+            report_b = root / "report_b"
+            workspace_root.mkdir(parents=True)
+            args = [
+                sys.executable,
+                str(self._seed_script),
+                "--profile",
+                "quick",
+                "--seed",
+                "424242",
+                "--target-sqlite",
+                str(sqlite_path),
+                "--workspace-root",
+                str(workspace_root),
+                "--run-id",
+                "dry-run-deterministic",
+                "--report-dir",
+                str(report_a),
+                "--dry-run",
+            ]
+            first = subprocess.run(args, capture_output=True, text=True, check=False)
+            self.assertEqual(first.returncode, 0, first.stderr or first.stdout)
+            second_args = list(args)
+            second_args[second_args.index(str(report_a))] = str(report_b)
+            second = subprocess.run(second_args, capture_output=True, text=True, check=False)
+            self.assertEqual(second.returncode, 0, second.stderr or second.stdout)
+            first_manifest = json.loads((report_a / "dry-run-deterministic.json").read_text(encoding="utf-8"))
+            second_manifest = json.loads((report_b / "dry-run-deterministic.json").read_text(encoding="utf-8"))
+            self.assertEqual(first_manifest["deterministic_plan_checksum"], second_manifest["deterministic_plan_checksum"])
+            self.assertEqual(first_manifest["counts_by_kind"], second_manifest["counts_by_kind"])
+            self.assertEqual(first_manifest["export_cohort_counts"], second_manifest["export_cohort_counts"])
+            self.assertIn("preflight", first_manifest)
+            self.assertIn("requested_count", first_manifest)
+
+    def test_live_synthetic_seeder_requires_allow_live_state_for_agentic_state(self) -> None:
+        if not self._seed_script.exists():
+            self.skipTest("agentic seeder script not present")
+        proc = self._run_script(
+            self._seed_script,
+            "--profile",
+            "quick",
+            "--seed",
+            "424242",
+            "--target-sqlite",
+            str(self._agentic_root / "state" / "mnemo" / "mnemo.sqlite"),
+            "--workspace-root",
+            str(self._agentic_root),
+            "--run-id",
+            "needs-live-allow",
+            "--dry-run",
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--allow-live-state", proc.stderr + proc.stdout)
+
+    def test_live_synthetic_seeder_temp_db_quick_profile(self) -> None:
+        if not self._seed_script.exists():
+            self.skipTest("agentic seeder script not present")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "mnemo.sqlite"
+            workspace_root = root / "workspace"
+            report_dir = root / "reports"
+            workspace_root.mkdir(parents=True)
+            proc = self._run_script(
+                self._seed_script,
+                "--profile",
+                "quick",
+                "--seed",
+                "424242",
+                "--target-sqlite",
+                str(sqlite_path),
+                "--workspace-root",
+                str(workspace_root),
+                "--run-id",
+                "temp-quick-seed",
+                "--report-dir",
+                str(report_dir),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+            manifest = json.loads((report_dir / "temp-quick-seed.json").read_text(encoding="utf-8"))
+            self.assertEqual(int(manifest["inserted_memory_count"]), 120)
+            self.assertLess(float(manifest["preflight"]["estimated_final_db_mb"]), 25.0)
+            conn = sqlite3.connect(str(sqlite_path))
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT memory_id) FROM memory_topics WHERE topic = ?",
+                    ("synthetic:run:temp-quick-seed",),
+                ).fetchone()
+                self.assertEqual(int(row[0]), 120)
+            finally:
+                conn.close()
+            self.assertLess(sqlite_path.stat().st_size, 25 * 1024 * 1024)
+
+    def test_live_synthetic_live_cap_blocks_oversized_seed(self) -> None:
+        if not self._seed_script.exists():
+            self.skipTest("agentic seeder script not present")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live_like = self._agentic_root / "state" / "mnemo" / "mnemo.sqlite"
+            proc = self._run_script(
+                self._seed_script,
+                "--profile",
+                "quick",
+                "--count",
+                "1500",
+                "--max-live-count",
+                "1000",
+                "--target-sqlite",
+                str(live_like),
+                "--workspace-root",
+                str(self._agentic_root),
+                "--run-id",
+                "too-many-live",
+                "--allow-live-state",
+                "--dry-run",
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("live_seed_count_exceeds_cap", proc.stderr + proc.stdout)
+
+    def test_live_synthetic_dry_run_reports_size_estimate(self) -> None:
+        if not self._seed_script.exists():
+            self.skipTest("agentic seeder script not present")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "mnemo.sqlite"
+            workspace_root = root / "workspace"
+            report_dir = root / "reports"
+            workspace_root.mkdir(parents=True)
+            proc = self._run_script(
+                self._seed_script,
+                "--profile",
+                "quick",
+                "--target-sqlite",
+                str(sqlite_path),
+                "--workspace-root",
+                str(workspace_root),
+                "--run-id",
+                "size-dry-run",
+                "--report-dir",
+                str(report_dir),
+                "--dry-run",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+            self.assertIn("PREFLIGHT", proc.stdout)
+            manifest = json.loads((report_dir / "size-dry-run.json").read_text(encoding="utf-8"))
+            preflight = manifest["preflight"]
+            self.assertIn("current_db_mb", preflight)
+            self.assertIn("estimated_final_db_mb", preflight)
+            self.assertEqual(int(preflight["requested_count"]), 120)
+
+    def test_synthetic_stats_reports_db_size_and_bloat_warnings(self) -> None:
+        if not self._stats_script.exists():
+            self.skipTest("agentic stats script not present")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "mnemo.sqlite"
+            # Reuse the seeder for a small temp corpus.
+            workspace_root = root / "workspace"
+            report_dir = root / "reports"
+            workspace_root.mkdir(parents=True)
+            seeded = self._run_script(
+                self._seed_script,
+                "--profile",
+                "quick",
+                "--target-sqlite",
+                str(sqlite_path),
+                "--workspace-root",
+                str(workspace_root),
+                "--run-id",
+                "stats-small",
+                "--report-dir",
+                str(report_dir),
+            )
+            self.assertEqual(seeded.returncode, 0, seeded.stderr or seeded.stdout)
+            stats_proc = self._run_script(
+                self._stats_script,
+                "--target-sqlite",
+                str(sqlite_path),
+                "--run-id",
+                "stats-small",
+                "--json",
+            )
+            self.assertEqual(stats_proc.returncode, 0, stats_proc.stderr or stats_proc.stdout)
+            payload = json.loads(stats_proc.stdout)
+            self.assertIn("db_size_mb", payload)
+            self.assertIn("warnings", payload)
+            self.assertIsInstance(payload["warnings"], list)
+            self.assertIn("memory_group_discover_summary", payload)
+
+    def test_cleanup_run_dry_run_only_targets_synthetic_rows(self) -> None:
+        if not self._seed_script.exists():
+            self.skipTest("agentic seeder script not present")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sqlite_path = root / "mnemo.sqlite"
+            workspace_root = root / "workspace"
+            report_dir = root / "reports"
+            workspace_root.mkdir(parents=True)
+            seeded = self._run_script(
+                self._seed_script,
+                "--profile",
+                "quick",
+                "--target-sqlite",
+                str(sqlite_path),
+                "--workspace-root",
+                str(workspace_root),
+                "--run-id",
+                "cleanup-small",
+                "--report-dir",
+                str(report_dir),
+            )
+            self.assertEqual(seeded.returncode, 0, seeded.stderr or seeded.stdout)
+            os.environ["MNEMO_STORE"] = "sqlite"
+            os.environ["MNEMO_SQLITE_FILE"] = str(sqlite_path)
+            os.environ["MNEMO_FILE"] = str(root / "memory.json")
+            os.environ["MNEMO_WORKSPACE_ROOT"] = str(workspace_root)
+            server._SQLITE_BOOTSTRAPPED.clear()
+            local = server.record_memory({"text": "non synthetic local row", "kind": "context_block"})
+            self.assertFalse(local["isError"], local)
+            cleanup = self._run_script(
+                self._seed_script,
+                "--target-sqlite",
+                str(sqlite_path),
+                "--workspace-root",
+                str(workspace_root),
+                "--cleanup-run",
+                "cleanup-small",
+                "--report-dir",
+                str(report_dir),
+                "--dry-run",
+            )
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr or cleanup.stdout)
+            payload = json.loads((report_dir / "cleanup-small.json").read_text(encoding="utf-8"))
+            self.assertGreater(int(payload["cleanup_result"]["memories_targeted"]), 0)
+            conn = sqlite3.connect(str(sqlite_path))
+            try:
+                synthetic_count = int(conn.execute("SELECT COUNT(*) FROM memory_topics WHERE topic = ?", ("synthetic:run:cleanup-small",)).fetchone()[0])
+                total_memories = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            finally:
+                conn.close()
+            self.assertGreater(synthetic_count, 0)
+            self.assertGreater(total_memories, synthetic_count)
+
+    def test_no_version_or_changelog_change_for_ux_lab_sizing(self) -> None:
+        pyproject = (self._mnemo_root / "pyproject.toml").read_text(encoding="utf-8")
+        readme = (self._mnemo_root / "README.md").read_text(encoding="utf-8")
+        changelog = (self._mnemo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        pyproject_match = re.search(r'^version = "([^"]+)"', pyproject, re.M)
+        readme_match = re.search(r"Current version: \*\*([^\*]+)\*\*", readme)
+        changelog_match = re.search(r"^##\s+([^\n]+)", changelog, re.M)
+        self.assertIsNotNone(pyproject_match)
+        self.assertIsNotNone(readme_match)
+        self.assertIsNotNone(changelog_match)
+        self.assertEqual(server.SERVER_VERSION, pyproject_match.group(1))
+        self.assertEqual(server.SERVER_VERSION, readme_match.group(1))
+        self.assertEqual(server.SERVER_VERSION, changelog_match.group(1))
+
+    def test_synthetic_stats_script_exists(self) -> None:
+        self.assertTrue(self._stats_script.exists(), self._stats_script)
+
+    def test_memory_list_select_prompt_is_stubbed_to_export_prompt(self) -> None:
+        prompt_path = self._mnemo_root / ".github" / "prompts" / "mnemo.memory-list-select.prompt.md"
+        self.assertTrue(prompt_path.exists(), prompt_path)
+        text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("/mnemo.memory-pack-export", text)
+        self.assertIn("merged into", text)
+        self.assertIn("use `/mnemo.memory-pack-export` with no argument", text)
+        self.assertIn("use `/mnemo.memory-pack-export <topic-or-group>`", text)
+        self.assertNotIn("mnemo.memory_group_discover", text)
+        self.assertNotIn("mnemo.pack_export", text)
+
+    def test_memory_pack_export_prompt_is_interactive_and_deterministic(self) -> None:
+        prompt_path = self._mnemo_root / ".github" / "prompts" / "mnemo.memory-pack-export.prompt.md"
+        self.assertTrue(prompt_path.exists(), prompt_path)
+        text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("If invoked with no input", text)
+        self.assertIn("mnemo.memory_group_discover", text)
+        self.assertIn('"output_mode": "catalog"', text)
+        self.assertIn('"catalog_for": "export"', text)
+        self.assertIn("Use `catalog.options` directly", text)
+        self.assertIn("Do not reconstruct option values", text)
+        self.assertIn("Do not invent group IDs", text)
+        self.assertIn('must never say "No suitable list available" when `catalog.options` is non-empty', text)
+        self.assertIn("vscode_askQuestions", text)
+        self.assertIn("mnemo.pack_preview", text)
+        self.assertIn("mnemo.pack_redaction_preview", text)
+        self.assertIn("mnemo.pack_export", text)
+        self.assertIn("exact topic", text)
+        self.assertIn("exact group_id", text)
+        self.assertIn("group label", text)
+        self.assertIn("memory_ids", text)
+        self.assertIn("Never use fuzzy query results as the final export selector", text)
+        self.assertNotIn("- `mnemo.search`", text)
+        self.assertIn("Do not call `mnemo.search`.", text)
+        self.assertIn("Do not require a handoff object for normal use", text)
+        self.assertIn("Do not transfer raw `memory_ids` through chat or placeholders.", text)
+        self.assertNotIn('"<MEMORY_IDS>"', text)
+        self.assertIn('"group_id": "<exact-group-id-from-catalog>"', text)
+        self.assertIn('"scope": "core_plus_related"', text)
+        self.assertIn("Run `mnemo.pack_preview` before `mnemo.pack_export`", text)
+        self.assertIn("Run `mnemo.pack_redaction_preview` before `mnemo.pack_export`", text)
+        self.assertIn("Require explicit approval before `mnemo.pack_export`", text)
+        self.assertIn("Never call `mnemo.pack_export` without `pack_name`", text)
+        self.assertIn("Never call `mnemo.pack_export` without either `allow_unsigned=true` or `sign_pack=true`", text)
+        self.assertIn("allow_limited_export=true", text)
+        self.assertIn("The output extension is `.mem`", text)
+        self.assertIn("content/file_fingerprints.json", text)
+        self.assertIn("paths and hashes, not file contents", text)
+        self.assertIn("local HMAC", text)
+
+    def test_memory_pack_import_prompt_is_interactive_and_safe(self) -> None:
+        prompt_path = self._mnemo_root / ".github" / "prompts" / "mnemo.memory-pack-import.prompt.md"
+        self.assertTrue(prompt_path.exists(), prompt_path)
+        text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("mnemo.pack_landing_list", text)
+        self.assertIn("landing folder", text)
+        self.assertIn(".mem", text)
+        self.assertIn("mnemo.pack_inspect", text)
+        self.assertIn("mnemo.pack_import", text)
+        self.assertIn("mnemo.pack_review_import", text)
+        self.assertIn("include_grouped_summary", text)
+        self.assertIn("mnemo.pack_promote_preview", text)
+        self.assertIn("mnemo.pack_promote", text)
+        self.assertIn("Never auto-promote", text)
+        self.assertIn("confirm_promote=true", text)
+        self.assertIn("Trusted import is NOT local adoption", text)
+        self.assertIn("Stop before promotion", text)
+
+    def test_docs_present_export_as_primary_and_do_not_point_to_list_select(self) -> None:
+        readme = (self._mnemo_root / "README.md").read_text(encoding="utf-8")
+        tool_ref = (self._mnemo_root / "docs" / "tool_reference.md").read_text(encoding="utf-8")
+        combined = f"{readme}\n{tool_ref}"
+        self.assertNotIn("normal workflow: /mnemo.memory-list-select", combined)
+        self.assertIn("/mnemo.memory-pack-export", combined)
+        self.assertIn("/mnemo.memory-pack-import", combined)
+        self.assertIn("pack_landing_list", combined)
+
+    def test_prompt_files_include_nexus_pack_actions(self) -> None:
+        prompt_names = [
+            "mnemo.memory-list-select.prompt.md",
+            "mnemo.memory-pack-export.prompt.md",
+            "mnemo.memory-pack-import.prompt.md",
+        ]
+        combined = "\n".join(
+            (self._mnemo_root / ".github" / "prompts" / name).read_text(encoding="utf-8")
+            for name in prompt_names
+        )
+        for token in (
+            "mnemo.memory_group_discover",
+            "mnemo.memory_group_preview",
+            "mnemo.pack_preview",
+            "mnemo.pack_redaction_preview",
+            "mnemo.pack_export",
+            "mnemo.pack_landing_list",
+            "mnemo.pack_inspect",
+            "mnemo.pack_import",
+            "mnemo.pack_review_import",
+            "mnemo.pack_promote_preview",
+            "mnemo.pack_promote",
+        ):
+            self.assertIn(token, combined)
+
+    def test_ux_lab_smoke_script_exists(self) -> None:
+        self.assertTrue(self._smoke_script.exists(), self._smoke_script)
 
 
 class IdfActivationTests(MnemoTestCase):

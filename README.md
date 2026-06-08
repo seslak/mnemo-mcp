@@ -8,7 +8,7 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.21.2**
+Current version: **0.21.7**
 
 Runtime requirements:
 
@@ -32,20 +32,17 @@ Mnemo is local-first. It does not require a cloud service, vector database, exte
 - Maintenance actions for log compaction, consolidation, JSON import, signature backfill, and alias proposal analysis
 - Git-aware memory metadata on new writes (`git_sha`, `git_branch`, `git_dirty`) with touched-file tracking
 - Freshness-aware retrieval multiplier in SQLite mode for file-linked memories
-- Memory Packs Phase 1 substrate: namespaces/origins, topic metadata, and namespace-aware retrieval filters
-- Memory Packs Phase 2a read-only pack selection preview (`pack_preview`)
-- Memory Packs Phase 2b redaction dry-run preview (`pack_redaction_preview`)
-- Memory Packs Phase 2c unsigned local ZIP export (`pack_export`)
-- Memory Packs Phase 3a read-only ZIP inspect/validate (`pack_inspect`)
-- Memory Packs Phase 3b basic unsigned ZIP import into quarantine (`pack_import`)
-- Memory Packs Phase 4a read-only quarantine review and promotion preview (`pack_list_imports`, `pack_review_import`, `pack_promote_preview`)
-- Memory Packs Phase 4b manual quarantine promotion to local (`pack_promote`)
-- Memory Packs Phase 5b trusted-import policy and implementation (`pack_import` trusted mode to `pack:trusted:<pack_id>`)
-- Memory Packs Phase 5a signing/trust foundation (`signer_add`, `signer_list`, `signer_disable`, `signer_enable`) and optional local-HMAC pack signing
+- Memory Packs for scripted `.mem` export, inspect, import, review, and promotion workflows
+- Group-first runtime selection support (`memory_group_discover`, `memory_group_preview`), including active alias concept groups
+- Landing-folder pack listing for import UX (`pack_landing_list`)
+- Local-HMAC pack signing and trusted import controls (`signer_add`, `signer_list`, `signer_disable`, `signer_enable`)
+- Direct group selectors for pack preview, redaction preview, and export (`group_id` + `scope`)
+- Scripted Copilot prompt workflows for Memory Pack export, import, and promotion under `.github/prompts/`
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
 - Automatic local IDF activation when project/domain corpus maturity thresholds are met
 - Lightweight symbol lookup under a configured workspace root
+
 
 ## Non-goals
 
@@ -84,462 +81,47 @@ Safety and compatibility:
 - No backfill is performed for legacy rows.
 - Legacy rows remain neutral (`1.0`) to preserve prior retrieval behavior.
 
-## Memory Packs Phase 1 (0.14.0)
 
-Phase 1 adds the SQLite substrate for future memory-pack workflows without enabling pack import/export policy workflows yet.
+## Memory Packs
 
-New memory metadata columns on `memories`:
+Memory Packs are portable `.mem` artifacts for moving selected Mnemo memories between local environments.
 
-- `namespace` (defaults to `local`)
-- `origin` (defaults to `local`)
-- `import_freshness` (nullable placeholder for later import phases)
+A normal pack lifecycle is:
 
-New SQLite tables:
+```text
+export -> .mem file
+import -> staged rows in imported_pack_rows
+promote -> regular local rows in memories
+```
 
-- `memory_topics(memory_id, topic, created_at, source)`
-- `imported_packs` (placeholder registry)
-- `exported_packs` (placeholder registry)
+Key runtime actions:
 
-New first-class topic actions:
+- `memory_group_discover` and `memory_group_preview` discover exportable memory groups.
+- `pack_preview` previews a selector before export.
+- `pack_redaction_preview` checks the export selection for baseline sensitive patterns.
+- `pack_export` creates a `.mem` file. The public suffix is `.mem`; the internal container is ZIP.
+- `pack_landing_list` lists `.mem` files from the configured landing folder.
+- `pack_inspect` validates and summarizes a pack before import.
+- `pack_import` stages pack rows for review in `imported_pack_rows`.
+- `pack_review_import` summarizes staged imported rows.
+- `pack_promote_preview` previews materialization of staged rows into local memory.
+- `pack_promote` creates regular local memories after explicit approval.
+- `signer_add`, `signer_list`, `signer_disable`, and `signer_enable` manage local-HMAC signing metadata.
 
-- `topic_add`
-- `topic_remove`
-- `topic_list`
+Pack import is intentionally staged. Imported rows are not regular local memories until promotion. Promotion is explicit and approval-gated.
 
-Namespace-aware retrieval filters are now available across retrieval paths:
+The repository also includes scripted Copilot prompt workflows:
 
-- default namespace scope is `local`
-- `include_imported=true` adds trusted imported namespaces
-- `include_quarantine=true` adds quarantine namespaces (never auto-included otherwise)
-- origin filtering is applied only when `origin`/`origins` is explicitly provided
+- `.github/prompts/mnemo.memory-pack-export.prompt.md`
+- `.github/prompts/mnemo.memory-pack-import.prompt.md`
+- `.github/prompts/mnemo.memory-pack-promote.prompt.md`
 
-Freshness multiplier rules remain unchanged and are still applied after lexical/IDF scoring:
+Security and provenance notes:
 
-- legacy row or `git_sha=NULL`: `1.0`
-- all touched files unchanged: `1.0`
-- any touched file changed: `0.7`
-- any touched file missing/deleted: `0.3`
-- mixed file states use the minimum multiplier
+- `.mem` files can contain project-sensitive memory text and metadata.
+- `content/file_fingerprints.json` records touched-file paths and hashes; it does not embed file contents.
+- Local-HMAC signing is a local integrity/trust workflow, not public-key identity or non-repudiation.
 
-Compatibility notes:
-
-- existing rows default to `namespace='local'`, `origin='local'`, `import_freshness=NULL`
-- legacy rows remain retrieval-neutral unless explicitly filtered
-- no backfill is performed for topic metadata
-- Phase 1 does **not** add pack export/import, redaction, signing, trust-store policy, or promotion flows
-
-## Memory Packs Phase 2a (0.15.0)
-
-Phase 2a adds a read-only selection engine for future pack export workflows via `pack_preview`.
-
-`pack_preview` supports deterministic preview filtering by:
-
-- `topics` (via `memory_topics` joins, not body text)
-- `kinds` (default preview kinds: `context_block`, `hippocampus_entry`)
-- `namespace` / `namespaces` with existing Phase 1 scope semantics
-- `include_imported` / `include_quarantine`
-- `origin` / `origins` (applied only when explicitly provided)
-- `created_after` / `created_before`
-- `touched_paths` (via `memory_files` joins)
-
-Preview output includes:
-
-- true selected row count and bounded row ID list
-- counts by kind, namespace, origin, and top topics
-- top referenced files from `memory_files`
-- bounded per-kind samples with compact text previews
-- structured warnings (for example, preview-policy warnings for `interaction_log`/`agent_feedback`)
-
-Phase 2a is intentionally read-only:
-
-- no `exported_packs` writes
-- no pack files
-- no zip export/import
-- no redaction/signing/trust/promotion logic
-
-## Memory Packs Phase 2b (0.16.0)
-
-Phase 2b adds a read-only redaction dry-run action: `pack_redaction_preview`.
-
-Phase 2b behavior:
-
-- reuses the same pack selection semantics as `pack_preview`
-- scans selected rows for baseline built-in redaction categories
-- returns category counts and bounded redacted samples
-- never returns original matched sensitive literals in structured output
-
-Built-in baseline categories in this phase:
-
-- `private_key_header`
-- `jwt`
-- `aws_access_key`
-- `email`
-- `user_path`
-- `ipv4`
-
-Compatibility and scope:
-
-- `pack_preview` no longer performs content bootstrap on empty/fresh SQLite DBs
-- schema creation/migration may still occur on first open
-- no ZIP export/import/signing/trust/promotion flows
-- baseline ruleset is intentionally limited and does not cover all secret formats (for example IPv6 and many provider-specific token formats)
-
-## Memory Packs Phase 2c (0.17.0)
-
-Phase 2c adds a local ZIP export action: `pack_export`.
-
-Key behavior:
-
-- requires `allow_unsigned=true` because signing is not implemented yet
-- reuses `pack_preview` selection semantics (topic/kind/namespace/origin/date/touched_paths filters)
-- export policy is strict in this phase:
-  - exportable kinds: `context_block`, `hippocampus_entry`
-  - non-exportable kinds (`interaction_log`, `agent_feedback`) fail early
-- mandatory baseline-v1 redaction runs again during export (dry-run output is not trusted)
-- exported content uses pack-local row IDs (`ctx_###`, `hip_###`), not source DB `mem_*` IDs
-- writes a ZIP with required members:
-  - `manifest.json`
-  - `content/memories.jsonl`
-  - `content/topics.json`
-  - `content/file_fingerprints.json`
-  - `provenance/origin.json`
-  - `provenance/redactions.json`
-- `manifest.json` includes a SHA-256 `content_hash` over covered content/provenance members
-- successful exports write one `exported_packs` audit row
-- default output directory is `state/mnemo/packs/exports/`
-
-Scope limits in 0.17.0:
-
-- unsigned development packs only
-- no import, signing, trust-store policy, or promotion workflows
-- baseline redaction ruleset is intentionally incomplete and not a full DLP system
-
-## Memory Packs Phase 3a (0.18.0)
-
-Phase 3a adds a read-only ZIP inspection action: `pack_inspect`.
-
-Key behavior:
-
-- validates required pack members and JSON/JSONL structure without extracting ZIPs
-- enforces ZIP safety checks (member-path validation, duplicate/traversal rejection, bounded ZIP size limits)
-- validates `manifest.json` schema and key metadata for Phase 2c packs (`pack_schema_version=1`)
-- recomputes `content_hash` over the canonical covered-member list:
-  - `content/file_fingerprints.json`
-  - `content/memories.jsonl`
-  - `content/topics.json`
-  - `provenance/origin.json`
-  - `provenance/redactions.json`
-- rejects covered-member list tampering even if attacker-provided manifest hashes are internally consistent
-- validates redaction metadata consistency between manifest and provenance payloads
-- rejects packs that leak source DB-style IDs matching `mem_*`
-
-Status and recommendation model:
-
-- `status` is one of: `valid`, `invalid`, `unsupported`
-- valid unsigned packs (`signed=false`, `unsigned_reason=signing_not_implemented`) return recommendation `quarantine_only`
-- malformed/tampered/unsupported packs return recommendation `reject`
-
-Scope limits in 0.18.0:
-
-- inspection only; no import is performed
-- no signing verification, trust store, or promotion flow
-- one bad row invalidates the whole pack in this phase (no partial-row acceptance logic)
-
-## Memory Packs Phase 3b (0.18.5)
-
-Phase 3b adds basic quarantined import via `pack_import`.
-
-Import gate and scope:
-
-- import uses the same shared validation engine as `pack_inspect`
-- import is allowed only when `allow_unsigned_quarantine=true`
-- only valid unsigned packs (`signed=false`, `unsigned_reason=signing_not_implemented`) are accepted
-- target namespace is fixed to `pack:quarantine:<pack_id>`
-- trust level is fixed to `quarantine`
-- no trusted import, signing, signature verification, trust-store, promotion, or alias import in this phase
-
-Imported row behavior:
-
-- imported rows get newly generated local `mem_*` IDs
-- source DB IDs are not imported
-- kind support remains strict (`context_block`, `hippocampus_entry`)
-- pack git provenance is preserved on imported rows:
-  - `git_sha_at_write -> memories.git_sha`
-  - `git_branch_at_write -> memories.git_branch`
-  - `git_dirty_at_write -> memories.git_dirty`
-- topics are imported into `memory_topics` with `source=pack_import`
-- touched files are imported into `memory_files` using:
-  - `memory_table=<memory kind>`
-  - `memory_id=<new local mem_* id>`
-  - `file_sha=<source/export SHA from the pack>`
-
-Import diagnostics and audit:
-
-- `imported_packs` stores `received_zip_sha256` for exact-byte collision checks
-- `imported_pack_rows` maps `pack_id + row_id_in_pack` to local `memory_id`
-- import freshness labels are diagnostic (`verified|stale|missing|unknown`) and use existing git-aware SHA helpers
-- re-import is rejected by default:
-  - same pack ID + same ZIP hash => `pack_already_imported`
-  - same pack ID + different ZIP hash => `pack_id_collision_distinct_content`
-
-Retrieval visibility:
-
-- imported quarantine rows are excluded from default retrieval
-- `include_imported=true` alone does not include quarantine rows
-- quarantine rows are visible only with `include_quarantine=true` or explicit quarantine namespace filtering
-
-## Memory Packs Phase 4a (0.19.0)
-
-Phase 4a adds post-import operator review tooling over imported SQLite data:
-
-- `pack_list_imports`: list imported pack registry rows with compact counts and freshness summaries
-- `pack_review_import`: review one imported pack's mapped quarantine rows from SQLite
-- `pack_promote_preview`: preview a future promotion plan to `namespace=local`, `origin=promoted`
-
-Read-only behavior:
-
-- no pack ZIP reads for review/preview
-- no promotion mutation
-- no trust-level changes
-- quarantine rows remain unchanged
-
-Review/preview details:
-
-- list/review output shows `received_zip_sha256` intentionally for cross-machine pack-byte comparison
-- list/review output normalizes `source_label` to basename display
-- review filters support topics/kinds/import_freshness/row_ids/memory_ids/touched_paths
-- review `query`, when supplied, is simple case-insensitive substring matching over imported `text`/`title` fields only (no FTS/ranking)
-- promotion preview candidates preserve imported git and pack provenance metadata in the returned plan
-
-Scope limits in 0.19.0:
-
-- no actual promotion
-- no trusted import/signing/signature verification/trust-store policy
-- no alias-pack import/export
-
-## Memory Packs Phase 4b (0.19.5)
-
-Phase 4b adds manual promotion from imported quarantine rows into local Mnemo memory via `pack_promote`.
-
-Promotion gate and policy:
-
-- `confirm_promote=true` is required
-- explicit row filters are required, or `allow_promote_all=true` must be supplied
-- if selection exceeds `limit`, promotion fails unless `allow_limited_promotion=true`
-- duplicate promotion of the same `(pack_id, row_id_in_pack)` is rejected in this phase
-- query-based fuzzy selection is intentionally not allowed for mutation (`query_filter_not_allowed_for_promotion`)
-
-Promotion target and invariants:
-
-- source rows remain unchanged in quarantine (`namespace=pack:quarantine:<pack_id>`, `origin=imported`)
-- promoted copies are written as new local rows (`namespace=local`, `origin=promoted`)
-- promoted rows receive new local `mem_*` IDs
-- no quarantine delete/move occurs
-
-Promotion provenance and audit:
-
-- `promoted_pack_rows` maps:
-  - `pack_id + row_id_in_pack + imported_memory_id -> promoted_memory_id`
-  - also stores `promotion_id`, `promoted_at`, and `original_import_freshness`
-- `promotion_audit` stores one row per promotion batch with:
-  - `promotion_id`
-  - canonical `filters_json`
-  - row count and limited/allow flags
-
-Preserved row content/provenance:
-
-- kind/text/title copied from imported quarantine row
-- topics copied to promoted row with `memory_topics.source=promotion`
-- `memory_files` copied with new promoted memory ID and same source/export `file_sha`
-- git provenance copied (`git_sha`, `git_branch`, `git_dirty`)
-- `import_freshness` copied from import-time label (not recomputed during promotion)
-- promoted-row created timestamp is promotion time by design (local adoption time)
-
-Operational note:
-
-- repeated limited promotions should use narrower filters or explicit `row_ids`
-- `skip_already_promoted` and `allow_repromote` are not implemented in 0.21.1
-
-## Memory Packs Stabilization (0.19.6)
-
-0.19.6 is a stabilization pass, not a new Memory Packs feature phase.
-
-What is tightened in this release:
-
-- full lifecycle regression coverage for:
-  - record/topic_add → pack_preview → pack_redaction_preview → pack_export → pack_inspect → pack_import → pack_list_imports → pack_review_import → pack_promote_preview → pack_promote
-- migration/idempotency checks against multiple schema shapes
-- action dispatch coverage for all Memory Packs actions
-- read-only contract regression checks for read-only pack actions
-- export artifact safety regression checks (required members, content hash verification, redaction, source-ID leak guard)
-- retrieval boundary regression checks (local/promoted/quarantine visibility rules)
-- synthetic stabilization run/report support under `_test_results/memory_packs_stabilization/`
-
-Current lifecycle remains:
-
-- export pack ZIP (`pack_export`)
-- inspect/validate ZIP (`pack_inspect`)
-- import valid unsigned pack into quarantine (`pack_import`)
-- review imported quarantine rows (`pack_list_imports`, `pack_review_import`)
-- preview promotion (`pack_promote_preview`)
-- manually promote selected rows to local/promoted (`pack_promote`)
-
-## Memory Packs Signing/Trust Foundation (0.20.0)
-
-0.20.0 adds the first signing/trust layer while preserving quarantine-first import behavior.
-
-What is added:
-
-- signer registry actions:
-  - `signer_add`
-  - `signer_list`
-  - `signer_disable`
-  - `signer_enable`
-- SQLite signer metadata table:
-  - `trusted_signers`
-- optional signed export mode in `pack_export`:
-  - `sign_pack=true`
-  - `signature_algorithm=hmac-sha256-local-v1`
-  - `signer_id` + `signing_secret`
-- signature verification/classification in `pack_inspect`:
-  - verifies signature when `verification_secret` is supplied
-  - classifies unsigned/not-verified/trusted/unknown/blocked/disabled/invalid/mismatch/unsupported states
-
-Important cryptography scope in 0.20.0/0.20.1:
-
-- default stdlib implementation is local HMAC signing (`hmac-sha256-local-v1`)
-- this is not public-key signing and not non-repudiation
-- the same shared secret signs and verifies
-- anyone with the secret can produce signatures
-- in 0.20.0/0.20.1 trusted import was not implemented; signed packs were `quarantine_only`
-
-Secret policy:
-
-- minimum secret length is 32 characters
-- recommended generation: `secrets.token_hex(32)`
-- raw secrets are never stored in SQLite signer rows, never exported into packs, and are scrubbed from logged params where generic action/event logging exists
-
-## Trusted Import Policy
-
-Trusted import is NOT local adoption.
-
-- trusted imported rows are stored under `namespace=pack:trusted:<pack_id>`
-- imported rows remain `origin=imported`
-- trusted import never writes rows directly into `namespace=local`
-
-Trusted import is NOT automatic promotion.
-
-- `pack_promote` remains the only path that creates local adopted rows (`namespace=local`, `origin=promoted`)
-- promotion gates remain explicit: `confirm_promote=true` and selection/limit checks
-- manual promotion remains explicit
-
-Trusted import is NOT default retrieval.
-
-- default retrieval scope stays `namespace=local`
-- trusted imported rows require `include_imported=true` or explicit namespace filtering
-- quarantine rows require `include_quarantine=true` unless explicitly addressed by namespace
-
-Trusted import requires verified trust.
-
-- `pack_inspect` must verify the signature and classify the pack as `trusted_signer`
-- signer must be registered, active, trusted, and fingerprint-matched
-- operator must pass `allow_trusted_import=true` (and `verification_secret`)
-
-Quarantine remains the safe fallback.
-
-- unsigned, unverified, unknown, invalid, disabled, blocked, mismatch, and unsupported signature cases cannot trusted-import
-- valid unsigned/unverified/unknown packs can still be imported with `allow_unsigned_quarantine=true`
-- even signed trusted packs may still be intentionally imported into quarantine
-
-Phase `0.21.0` still does not implement:
-
-- public-key signing
-- persistent secret store
-- key revocation
-- remote key discovery
-- trusted auto-promotion
-- alias pack import/export
-
-## Memory Packs lifecycle recap
-
-Current lifecycle through `0.21.1`:
-
-1. Build/select local knowledge:
-   - `record`, `topic_add`
-2. Preview selection:
-   - `pack_preview`
-3. Redaction dry-run:
-   - `pack_redaction_preview`
-4. Export:
-   - unsigned: `pack_export` + `allow_unsigned=true`
-   - signed local-HMAC: `pack_export` + `sign_pack=true`
-5. Inspect:
-   - `pack_inspect` (structure/hash validation + signature classification/verification)
-6. Import:
-   - trusted import: `pack_import` + `allow_trusted_import=true` + `verification_secret`
-   - quarantine import: `pack_import` + `allow_unsigned_quarantine=true`
-7. Review imported rows:
-   - `pack_list_imports`, `pack_review_import`
-8. Promotion preview:
-   - `pack_promote_preview`
-9. Manual promotion:
-   - `pack_promote` -> local `origin=promoted` rows
-
-Retrieval semantics in `0.21.0`:
-
-- default: local namespace only
-- `include_imported=true`: adds trusted imported namespaces
-- `include_quarantine=true`: adds quarantine namespaces
-- both flags together: include both trusted and quarantine imported namespaces
-- explicit `namespace`/`namespaces`: overrides include flags and uses listed namespaces verbatim
-
-Operational notes:
-
-- HMAC signing remains local shared-secret trust only (not public-key identity, not non-repudiation)
-- secret distribution is out-of-band
-- no persistent secret store yet; operators provide `verification_secret` at trusted-import time
-- no pre-import trusted content browser yet; operators inspect metadata/signature first, then review rows after import
-
-## Memory Packs 0.21.1 Stabilization
-
-`0.21.1` is a stabilization pass, not a new Memory Packs feature phase.
-
-Stabilization focus:
-
-- trusted/quarantine include-flag semantics and retrieval-boundary regression coverage
-- trusted and quarantine lifecycle regression coverage
-- cross-trust reimport/collision regression coverage
-- trusted-import tamper rejection regression coverage
-- verification-secret scrubbing regression coverage
-- trusted-source promotion provenance and freshness-preservation regression coverage
-- policy/docs consistency checks and sync parity validation
-
-If you previously treated `include_imported=true` as "all imported", migrate callers to:
-
-- `include_imported=true` for trusted imported namespaces
-- `include_quarantine=true` for quarantine imported namespaces
-- both flags for combined imported scope
-
-## Memory Packs v1 status
-
-Complete for practical local export/import workflows when the synthetic readiness gate reports `memory_packs_v1_status=ready`.
-
-Current v1 workflow:
-
-- export
-- inspect
-- import quarantine or trusted
-- review
-- promotion preview
-- manual promotion
-
-Future optional extensions:
-
-- public-key signing
-- persistent secret store
-- revocation/discovery workflows
-- alias-pack flows
-- skip-already-promoted ergonomics
 
 ## Repository layout
 
@@ -547,10 +129,14 @@ Future optional extensions:
 mnemo-mcp/
 ├── server.py
 ├── salience_loader.py
+├── git_context.py
 ├── memory.example.json
 ├── smoke_test.py
 ├── test_server.py
 ├── benchmark_consolidation.py
+├── .github/
+│   ├── prompts/
+│   └── workflows/
 ├── examples/
 ├── docs/
 ├── CHANGELOG.md

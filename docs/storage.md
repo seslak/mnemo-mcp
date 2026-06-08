@@ -52,6 +52,8 @@ Inspection views:
 
 Alias lifecycle is curated through maintenance actions (`propose_aliases`, `list_alias_proposals`, `approve_alias`, `reject_alias_proposal`, `list_aliases`, `disable_alias`, `disable_alias_concept`) instead of editing repository files.
 
+Runtime group discovery can reuse active alias runtime state to compute `group_type="alias"` groups. Pending proposals do not create groups, and disabled alias terms/concepts are excluded.
+
 ## Git-aware memory metadata (0.13.5)
 
 Mnemo stores git context on new memory writes in SQLite mode by adding columns on `memories`:
@@ -149,6 +151,7 @@ Phase 2a adds a read-only selection preview action: `pack_preview`.
 Selection semantics:
 
 - topic filtering joins `memory_topics` (no body-text/FTS topic inference)
+- exact `memory_ids` selectors are supported for pack preview/export workflows
 - touched path filtering joins `memory_files`
 - namespace/origin filtering reuses Phase 1 scope semantics
 - default namespace scope remains `['local']`
@@ -199,13 +202,14 @@ Known scope limit:
 
 - IPv6 and many provider-specific token formats are intentionally out of scope in the baseline-v1 ruleset.
 
-## Memory Packs Phase 2c export ZIP (0.17.0)
+## Memory Packs Phase 2c export artifact (0.17.0, `.mem` suffix in 0.21.5)
 
-Phase 2c adds `pack_export`, which writes an unsigned local development pack ZIP and records one export audit row in `exported_packs`.
+Phase 2c adds `pack_export`, which writes a local development pack artifact and records one export audit row in `exported_packs`.
 
 Export policy and scope:
 
 - requires `allow_unsigned=true` (signing is not implemented yet)
+- exact `memory_ids` selectors resolve only the requested existing rows; unknown IDs do not broaden export scope
 - exportable kinds are strict in this phase:
   - `context_block`
   - `hippocampus_entry`
@@ -215,7 +219,12 @@ Export policy and scope:
 Output location:
 
 - default: `state/mnemo/packs/exports/`
+- default landing/import inbox: `state/mnemo/packs/inbox/`
 - optional `output_dir` is supported, with sanitized filename handling
+- landing-folder override: `MNEMO_PACK_LANDING_DIR`
+- public artifact suffix: `.mem`
+- internal container format: ZIP
+- legacy `.zip` packs remain inspect/import compatible for backward compatibility
 
 Pack safety and identity:
 
@@ -235,6 +244,13 @@ Manifest/content hash:
   - `provenance/redactions.json`
 - `manifest.json` itself is not included in the Phase 2c content hash coverage
 
+`content/file_fingerprints.json`:
+
+- records touched-file paths referenced by exported memories
+- records file hashes used for provenance/freshness checks
+- does not embed file contents
+- may legitimately contain synthetic UX-lab paths such as `state/mnemo/synthetic_files/...` when exported memories reference synthetic touched files
+
 Audit row:
 
 - successful export inserts one row into `exported_packs`:
@@ -246,15 +262,21 @@ Audit row:
   - `signed=0`
   - `manifest_json`
 
-## Memory Packs Phase 3a inspect/validate ZIP (0.18.0)
+## Memory Packs Phase 3a inspect/validate pack artifacts (0.18.0)
 
-Phase 3a adds `pack_inspect`, a read-only validator for exported pack ZIPs.
+Phase 3a adds `pack_inspect`, a read-only validator for exported pack artifacts.
 
 Read-only guarantees:
 
 - no writes to `memories`, `memory_topics`, `memory_files`, `imported_packs`, or `exported_packs`
 - no ZIP extraction to disk
 - no import/signing/trust/promotion behavior
+
+Suffix behavior:
+
+- `.mem` is the preferred public suffix
+- legacy `.zip` is still accepted with compatibility warning
+- other suffixes may be inspected if they open as valid ZIPs, but they are warned as nonstandard
 
 Validation focus:
 
