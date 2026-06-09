@@ -2,7 +2,7 @@
 ![Version 0.22.0](https://img.shields.io/badge/version-0.22.0-green)
 ![License MIT](https://img.shields.io/badge/license-MIT-blue)
 
-# Mnemo MCP
+# Mnemo MCP 
 
 Local-first project memory for MCP-capable coding agents.
 
