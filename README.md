@@ -1,4 +1,3 @@
-![CI](https://github.com/seslak/mnemo-mcp/actions/workflows/<file>.yml/badge.svg)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Version 0.22.0](https://img.shields.io/badge/version-0.22.0-green)
 ![License MIT](https://img.shields.io/badge/license-MIT-blue)
