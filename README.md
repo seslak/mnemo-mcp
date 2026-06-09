@@ -1,3 +1,8 @@
+![CI](https://github.com/seslak/mnemo-mcp/actions/workflows/<file>.yml/badge.svg)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Version 0.22.0](https://img.shields.io/badge/version-0.22.0-green)
+![License MIT](https://img.shields.io/badge/license-MIT-blue)
+
 # Mnemo MCP
 
 Local-first project memory for MCP-capable coding agents.
@@ -8,7 +13,7 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.21.7**
+Current version: **0.22.0**
 
 Runtime requirements:
 
@@ -37,7 +42,8 @@ Mnemo is local-first. It does not require a cloud service, vector database, exte
 - Landing-folder pack listing for import UX (`pack_landing_list`)
 - Local-HMAC pack signing and trusted import controls (`signer_add`, `signer_list`, `signer_disable`, `signer_enable`)
 - Direct group selectors for pack preview, redaction preview, and export (`group_id` + `scope`)
-- Scripted Copilot prompt workflows for Memory Pack export, import, and promotion under `.github/prompts/`
+- Alias proposal admission based on continuous IDF strength, with duplicate-heavy IDF profiles handled by unique-value cutoffs
+- Scripted Copilot prompt workflows for Memory Pack export, import, promotion, and list/select compatibility under `.github/prompts/`
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
 - Automatic local IDF activation when project/domain corpus maturity thresholds are met
@@ -115,6 +121,7 @@ The repository also includes scripted Copilot prompt workflows:
 - `.github/prompts/mnemo.memory-pack-export.prompt.md`
 - `.github/prompts/mnemo.memory-pack-import.prompt.md`
 - `.github/prompts/mnemo.memory-pack-promote.prompt.md`
+- `.github/prompts/mnemo.memory-list-select.prompt.md` (compatibility stub that points to export)
 
 Security and provenance notes:
 
@@ -541,6 +548,7 @@ Mnemo does not hardcode personal agent names. Use metadata fields such as `agent
 | `MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS` | Domain IDF minimum unique terms. Default: `300`. |
 | `MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS` | Domain IDF minimum total tokens. Default: `3000`. |
 | `MNEMO_IDF_MIN_TEXT_TOKENS` | Minimum tokens per memory included in IDF corpus. Default: `5`. |
+| `MNEMO_ALIAS_MIN_IDF_STRENGTH` | Minimum continuous IDF strength required for alias proposals. Default: `0.30`. |
 | `AGENT_SALIENCE_HOME` | Optional path to local `agent-salience` checkout. |
 
 `MNEMO_MCP_PROFILE` is ignored. Mnemo always exposes one public gateway tool.
@@ -566,7 +574,7 @@ Modes:
 - `off`: do not build/use IDF
 - `force`: activate below thresholds (dev/test only)
 
-`doctor` now returns an `idf` object with project/domain status (`cold|ready|disabled|unavailable`), activation flags, corpus counts, and remaining maturity gaps.
+`doctor` returns an `idf` object with project/domain status (`cold|ready|disabled|unavailable`), activation flags, corpus counts, and remaining maturity gaps.
 
 All activation thresholds are AND-gated:
 
@@ -575,6 +583,8 @@ All activation thresholds are AND-gated:
 - total-token threshold must pass
 
 IDF is a scoring aid and does not replace signatures, lexical ranking, FTS, or baseline cosine/Jaccard primitives. It now contributes through both `idf_cosine` and `idf_jaccard`.
+
+Alias proposal admission uses continuous IDF strength instead of requiring a token to land in the top IDF bucket. IDF summary cutoffs are computed over unique values so duplicate-heavy corpora do not collapse the high cutoff onto a single maximum value.
 
 Full LSH/MinHash buckets are still not implemented in this release. See [`docs/salience_lsh_idf_notes.md`](docs/salience_lsh_idf_notes.md).
 

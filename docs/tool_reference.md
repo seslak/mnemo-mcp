@@ -1060,6 +1060,8 @@ Persistence behavior:
 - `dry_run=true`: returns proposals without writing
 - `dry_run=false`: persists pending proposals in SQLite
 
+Admission uses continuous alias `idf_strength` with `MNEMO_ALIAS_MIN_IDF_STRENGTH` (default `0.30`). `idf_terms` and `penalized_terms` remain proposal evidence for review; they are no longer binary admission gates.
+
 #### `list_alias_proposals`
 
 Lists proposal rows from `alias_proposals`.

@@ -686,6 +686,8 @@ When profile status is `ready`, Mnemo scoring paths can use:
 
 This patch does not alter candidate generation; it changes scoring composition only.
 
+Alias proposal admission also depends on active IDF profiles. Mnemo now derives alias evidence cutoffs from unique IDF weight values and gates proposal surfacing on continuous `idf_strength` with `MNEMO_ALIAS_MIN_IDF_STRENGTH` (default `0.30`).
+
 ## Signature columns
 
 Mnemo adds deterministic signature columns to `memories`:

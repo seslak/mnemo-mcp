@@ -4,7 +4,7 @@ Mnemo is a local stdio MCP server. It stores local project memory and can inspec
 
 ## Supported versions
 
-The current pre-1.0 public line is `0.21.x`.
+The current pre-1.0 public line is `0.22.x`.
 
 ## Reporting issues
 

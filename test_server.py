@@ -52,6 +52,7 @@ ENV_KEYS = [
     "MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS",
     "MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS",
     "MNEMO_IDF_MIN_TEXT_TOKENS",
+    "MNEMO_ALIAS_MIN_IDF_STRENGTH",
     "MNEMO_MISS_TOP_SCORE_THRESHOLD",
     "AGENT_SALIENCE_HOME",
 ]
@@ -90,6 +91,7 @@ class MnemoTestCase(unittest.TestCase):
         os.environ.pop("MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS", None)
         os.environ.pop("MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS", None)
         os.environ.pop("MNEMO_IDF_MIN_TEXT_TOKENS", None)
+        os.environ.pop("MNEMO_ALIAS_MIN_IDF_STRENGTH", None)
         os.environ.pop("MNEMO_MISS_TOP_SCORE_THRESHOLD", None)
         os.environ.pop("AGENT_SALIENCE_HOME", None)
         server._SYMBOL_CACHE.clear()
@@ -12661,6 +12663,75 @@ class MissTrackingAndAliasProposalTests(MnemoTestCase):
             }
         ]
 
+    def _duplicate_mass_idf_values(self) -> list[float]:
+        values: list[float] = ([6.402677] * 2297) + ([5.149914] * 1512)
+        interior_values = [round(1.05 + (5.95 - 1.05) * idx / 139, 6) for idx in range(140)]
+        for idx, value in enumerate(interior_values):
+            repetitions = 12 + (1 if idx < 39 else 0)
+            values.extend([value] * repetitions)
+        return values
+
+    def _duplicate_mass_idf_profile(self) -> dict[str, Any]:
+        idf_map: dict[str, float] = {}
+        for idx, value in enumerate(self._duplicate_mass_idf_values()):
+            idf_map[f"corpus_term_{idx}"] = value
+        idf_map.update(
+            {
+                "midaliasalpha": 3.9,
+                "midaliasbeta": 4.2,
+                "weakaliasalpha": 1.08,
+                "weakaliasbeta": 1.12,
+                "strongaliasomega": 6.24,
+            }
+        )
+        return {"idf": idf_map}
+
+    def _proposal_cluster(self, candidate_alias: str) -> dict[str, Any]:
+        miss_events = [{"event_id": f"miss-{idx}", "query_text": candidate_alias} for idx in range(3)]
+        return {
+            "representative": candidate_alias,
+            "miss_events": miss_events,
+            "hints": [],
+            "query_counts": {candidate_alias: len(miss_events)},
+            "domain_counts": {"agentic": len(miss_events)},
+        }
+
+    def _run_alias_proposal_gate(
+        self,
+        candidate_alias: str,
+        idf_profile: dict[str, Any],
+        *,
+        threshold: float | None = None,
+    ) -> dict[str, Any]:
+        cluster = self._proposal_cluster(candidate_alias)
+        idf_selection = {"active": True, "profile": idf_profile, "scope": "project", "status": "ready"}
+        patches = [
+            mock.patch("server._load_recent_alias_source_events", return_value=([{"event_id": "seed"}], [])),
+            mock.patch("server._cluster_miss_events", return_value=[cluster]),
+            mock.patch("server._ensure_idf_profiles", return_value={"project": "ready"}),
+            mock.patch("server._resolve_idf_profile_for_memory_or_query", return_value=idf_selection),
+            mock.patch(
+                "server._alias_candidate_memories",
+                return_value=[(0.64, {"id": "mem-1", "text": "memory recall pipeline", "domain": "agentic"})],
+            ),
+            mock.patch("server._cluster_canonical", return_value="memory recall pipeline"),
+            mock.patch("server._proposal_source_events", return_value=["miss-0", "miss-1", "miss-2"]),
+        ]
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+            if threshold is None:
+                return server._propose_aliases_maintenance({"domain": "agentic", "min_recurrence": 3}, dry_run=True)
+            with mock.patch.object(server, "ALIAS_MIN_IDF_STRENGTH", threshold):
+                return server._propose_aliases_maintenance({"domain": "agentic", "min_recurrence": 3}, dry_run=True)
+
+    def _load_server_module_with_alias_threshold(self, raw_value: str):
+        module_name = f"server_alias_threshold_{raw_value.replace('.', '_')}"
+        os.environ["MNEMO_ALIAS_MIN_IDF_STRENGTH"] = raw_value
+        spec = importlib.util.spec_from_file_location(module_name, str(Path(server.__file__).resolve()))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def test_search_zero_results_writes_miss_event(self) -> None:
         with mock.patch("server.search_rank", return_value=[]):
             result = server.search_memories({"query": "no hit query", "domain": "agentic", "limit": 5})
@@ -12778,6 +12849,90 @@ class MissTrackingAndAliasProposalTests(MnemoTestCase):
         structured = result["structuredContent"]
         self.assertEqual(structured["status"], "ok")
         self.assertGreaterEqual(len(structured["proposals"]), 1)
+
+    def test_idf_unique_value_quantile_handles_duplicate_mass(self) -> None:
+        values = self._duplicate_mass_idf_values()
+        new_high = server._idf_unique_value_quantile(values, 0.75)
+        new_low = server._idf_unique_value_quantile(values, 0.25)
+        old_high = sorted(values)[int(round((len(values) - 1) * 0.75))]
+        self.assertLess(new_high, max(values))
+        self.assertGreater(new_low, min(values))
+        self.assertEqual(old_high, max(values))
+        self.assertLess(new_high, old_high)
+
+    def test_alias_admission_admits_mid_idf_candidate(self) -> None:
+        idf_profile = self._duplicate_mass_idf_profile()
+        idf_terms, penalized_terms, idf_strength = server._alias_idf_evidence("midaliasalpha midaliasbeta", idf_profile)
+        self.assertEqual(idf_terms, [])
+        self.assertEqual(penalized_terms, [])
+        self.assertGreater(idf_strength, server.ALIAS_MIN_IDF_STRENGTH)
+        result = self._run_alias_proposal_gate("midaliasalpha midaliasbeta", idf_profile)
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["status"], "ok")
+        self.assertEqual(len(result["structuredContent"]["proposals"]), 1)
+
+    def test_alias_admission_drops_weak_candidate(self) -> None:
+        idf_profile = self._duplicate_mass_idf_profile()
+        idf_terms, penalized_terms, idf_strength = server._alias_idf_evidence("weakaliasalpha weakaliasbeta", idf_profile)
+        self.assertEqual(idf_terms, [])
+        self.assertGreaterEqual(len(penalized_terms), 2)
+        self.assertLess(idf_strength, server.ALIAS_MIN_IDF_STRENGTH)
+        result = self._run_alias_proposal_gate("weakaliasalpha weakaliasbeta", idf_profile)
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(result["structuredContent"]["status"], "no_proposals")
+        self.assertEqual(result["structuredContent"]["proposals"], [])
+
+    def test_alias_admission_degenerate_profile_returns_neutral(self) -> None:
+        expected_tokens = []
+        seen: set[str] = set()
+        for token in server._normalize_for_signature("degenerate tokens"):
+            if len(token) >= 2 and token not in seen:
+                seen.add(token)
+                expected_tokens.append(token)
+        self.assertEqual(
+            server._alias_idf_evidence("degenerate tokens", {"idf": {}}),
+            ([], expected_tokens, 0.0),
+        )
+        self.assertEqual(
+            server._alias_idf_evidence("degenerate tokens", {"idf": {"degenerate": 0.0, "tokens": 0.0}}),
+            ([], expected_tokens, 0.0),
+        )
+
+    def test_alias_admission_idf_terms_remains_in_evidence(self) -> None:
+        idf_profile = self._duplicate_mass_idf_profile()
+        idf_terms, penalized_terms, idf_strength = server._alias_idf_evidence("strongaliasomega midaliasalpha", idf_profile)
+        self.assertIn("strongaliasomega", idf_terms)
+        self.assertEqual(penalized_terms, [])
+        self.assertGreater(idf_strength, server.ALIAS_MIN_IDF_STRENGTH)
+        result = self._run_alias_proposal_gate("strongaliasomega midaliasalpha", idf_profile)
+        self.assertFalse(result["isError"], result)
+        proposal = result["structuredContent"]["proposals"][0]
+        self.assertIn("strongaliasomega", proposal["evidence"]["idf_terms"])
+
+    def test_alias_proposal_pipeline_emits_previously_dropped_candidate(self) -> None:
+        idf_profile = self._duplicate_mass_idf_profile()
+        result = self._run_alias_proposal_gate("midaliasalpha midaliasbeta", idf_profile)
+        self.assertFalse(result["isError"], result)
+        proposals = result["structuredContent"]["proposals"]
+        self.assertEqual(len(proposals), 1)
+        self.assertGreater(float(proposals[0]["score"]), 0.0)
+        self.assertEqual(proposals[0]["candidate_alias"], "midaliasalpha midaliasbeta")
+
+    def test_alias_min_idf_strength_env_override(self) -> None:
+        module_low = self._load_server_module_with_alias_threshold("0.10")
+        self.assertEqual(module_low.ALIAS_MIN_IDF_STRENGTH, 0.10)
+        module_high = self._load_server_module_with_alias_threshold("0.90")
+        self.assertEqual(module_high.ALIAS_MIN_IDF_STRENGTH, 0.90)
+        _idf_terms, _penalized_terms, idf_strength = module_high._alias_idf_evidence(
+            "midaliasalpha midaliasbeta",
+            self._duplicate_mass_idf_profile(),
+        )
+        self.assertLess(idf_strength, module_high.ALIAS_MIN_IDF_STRENGTH)
+        result = self._run_alias_proposal_gate("midaliasalpha midaliasbeta", self._duplicate_mass_idf_profile(), threshold=0.90)
+        self.assertEqual(result["structuredContent"]["proposals"], [])
+
+    def test_idf_quantile_removal(self) -> None:
+        self.assertFalse(hasattr(server, "_idf_quantile"))
 
     def test_low_idf_common_terms_are_not_proposed(self) -> None:
         self._set_low_idf_thresholds()

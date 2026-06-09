@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.22.0
+
+### Fixed
+
+- IDF cutoff computation now operates on unique weight values rather than the full duplicated value list. When a corpus has high duplicate mass at the top of the IDF distribution, the old quartile method could collapse `high_cutoff` onto the corpus maximum and break both strong-term summaries and alias admission.
+- Alias proposal admission switched from a binary `idf_terms` presence check to a continuous `idf_strength` threshold. Candidates whose tokens are informative but not at the corpus maximum now surface for review instead of being dropped before scoring.
+- Degenerate IDF profiles now return neutral alias evidence explicitly for empty or all-zero profiles instead of relying on zero fallback arithmetic by accident.
+
+### Changed
+
+- `_idf_quantile` is removed and replaced by `_idf_unique_value_quantile`.
+- New environment variable: `MNEMO_ALIAS_MIN_IDF_STRENGTH` (default `0.30`).
+- `idf_terms` and `penalized_terms` remain informational evidence in alias proposals; they are no longer admission gates.
+
+### Compatibility / Scope
+
+- No schema migration. `SQLITE_SCHEMA_VERSION` stays at `7`.
+- No retrieval scoring changes outside the alias path.
+- No Memory Pack format or behavior changes.
+- Visible effect: more alias proposals will surface for operator review. Existing proposals are unchanged.
+
 ## 0.21.7
 
 ### Changed
@@ -10,13 +31,6 @@
 - Limited exports now return stable error code `limited_export_requires_confirmation` unless `allow_limited_export=true`.
 
 ### Prompt / Workflow
-
-- Packaged scripted Memory Pack prompt workflows for:
-  - `/mnemo.memory-pack-export`
-  - `/mnemo.memory-pack-import`
-  - `/mnemo.memory-pack-promote`
-- Import/promotion prompts document the staged lifecycle: import rows are stored in `imported_pack_rows`, and promotion materializes regular local rows in `memories`.
-- Promotion prompt uses the explicit `allow_promote_all=true` safety gate after approval when promoting the full previewed pack.
 
 - `mnemo.memory-pack-export` now drives normal group-based export with direct `group_id`/`scope` pack calls.
 - Export prompt no longer relies on raw `memory_ids` placeholders for standard group export flow.

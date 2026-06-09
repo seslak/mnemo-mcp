@@ -34,6 +34,7 @@ Environment variables:
 - MNEMO_IDF_DOMAIN_MIN_UNIQUE_TERMS: domain corpus unique-terms threshold. Defaults to 300.
 - MNEMO_IDF_DOMAIN_MIN_TOTAL_TOKENS: domain corpus token threshold. Defaults to 3000.
 - MNEMO_IDF_MIN_TEXT_TOKENS: per-memory minimum tokens for IDF corpus inclusion. Defaults to 5.
+- MNEMO_ALIAS_MIN_IDF_STRENGTH: minimum continuous alias-IDF admission strength. Defaults to 0.30.
 - MNEMO_MISS_TOP_SCORE_THRESHOLD: query miss threshold for top score. Defaults to 0.15.
 - AGENT_SALIENCE_HOME: optional path to local agent-salience checkout for diagnostics when not installed.
 """
@@ -65,7 +66,7 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.21.7"
+SERVER_VERSION = "0.22.0"
 SQLITE_SCHEMA_VERSION = "7"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 DEFAULT_MEMORY_NAMESPACE = "local"
@@ -671,6 +672,22 @@ def idf_thresholds(scope: str) -> dict[str, int]:
         "min_unique_terms": positive_int_env("MNEMO_IDF_MIN_UNIQUE_TERMS", 1000),
         "min_total_tokens": positive_int_env("MNEMO_IDF_MIN_TOTAL_TOKENS", 10000),
     }
+
+
+def _alias_min_idf_strength_from_env() -> float:
+    raw = str(os.environ.get("MNEMO_ALIAS_MIN_IDF_STRENGTH", "0.30")).strip() or "0.30"
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.30
+    return max(0.0, min(value, 1.0))
+
+
+# Minimum continuous IDF strength required for a candidate alias to surface
+# as a proposal. 0.30 admits candidates whose token IDF distribution is
+# meaningfully above the corpus 25th percentile. Calibrate per corpus if
+# proposal volume is too low or too high.
+ALIAS_MIN_IDF_STRENGTH = _alias_min_idf_strength_from_env()
 
 
 def estimate_tokens(text: str) -> int:
@@ -6816,15 +6833,20 @@ def _alias_candidate_memories(
     return scored[:max_candidates_per_cluster]
 
 
-def _idf_quantile(values: list[float], quantile: float) -> float:
+def _idf_unique_value_quantile(values: list[float], quantile: float) -> float:
+    """Return the quantile cutoff computed over the sorted set of unique values."""
     if not values:
         return 0.0
-    ordered = sorted(values)
+    ordered = sorted(set(float(value) for value in values))
+    if not ordered:
+        return 0.0
     position = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * quantile))))
     return float(ordered[position])
 
 
 def _alias_idf_evidence(alias_text: str, idf_profile: dict[str, Any]) -> tuple[list[str], list[str], float]:
+    # Corpus-summary cutoffs classify token evidence; alias admission uses the
+    # continuous `idf_strength` returned from this function, not `idf_terms`.
     tokens = []
     seen: set[str] = set()
     for token in _normalize_for_signature(alias_text):
@@ -6845,8 +6867,10 @@ def _alias_idf_evidence(alias_text: str, idf_profile: dict[str, Any]) -> tuple[l
         return [], [], 0.0
     if not idf_values:
         return [], tokens, 0.0
-    low_cutoff = _idf_quantile(idf_values, 0.25)
-    high_cutoff = _idf_quantile(idf_values, 0.75)
+    low_cutoff = _idf_unique_value_quantile(idf_values, 0.25)
+    high_cutoff = _idf_unique_value_quantile(idf_values, 0.75)
+    if high_cutoff <= 0.0:
+        return [], tokens, 0.0
     unknown = max(0.0, low_cutoff * 0.80)
     idf_terms: list[str] = []
     penalized_terms: list[str] = []
@@ -7544,7 +7568,7 @@ def _propose_aliases_maintenance(args: dict[str, Any], dry_run: bool) -> dict[st
         if not candidate_alias:
             continue
         idf_terms, penalized_terms, idf_strength = _alias_idf_evidence(candidate_alias, idf_profile)
-        if not idf_terms:
+        if idf_strength < ALIAS_MIN_IDF_STRENGTH:
             continue
         cluster_domain = _proposal_domain(cluster, domain)
         try:
