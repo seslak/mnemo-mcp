@@ -1,6 +1,10 @@
 # Personal/local memory is ignored by default.
 memory.json
 memory.json.tmp
+state/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 queries.jsonl
 queries.1.jsonl
 queries.archive.jsonl
@@ -8,6 +12,7 @@ events.jsonl
 events.1.jsonl
 events.archive.jsonl
 memory.archive.jsonl
+*.archive.jsonl
 *.lock
 __pycache__/
 

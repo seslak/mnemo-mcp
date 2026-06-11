@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -95,8 +96,12 @@ class MnemoTestCase(unittest.TestCase):
         os.environ.pop("MNEMO_MISS_TOP_SCORE_THRESHOLD", None)
         os.environ.pop("AGENT_SALIENCE_HOME", None)
         server._SYMBOL_CACHE.clear()
+        if hasattr(server, "_SQLITE_SCHEMA_READY"):
+            server._SQLITE_SCHEMA_READY.clear()
         if hasattr(server, "_GIT_CONTEXT_CACHE"):
             server._GIT_CONTEXT_CACHE.clear()
+        if hasattr(salience_loader, "_reset_load_optional_agent_salience_cache"):
+            salience_loader._reset_load_optional_agent_salience_cache()
 
     def tearDown(self) -> None:
         for key, value in self._old_env.items():
@@ -105,8 +110,12 @@ class MnemoTestCase(unittest.TestCase):
             else:
                 os.environ[key] = value
         server._SYMBOL_CACHE.clear()
+        if hasattr(server, "_SQLITE_SCHEMA_READY"):
+            server._SQLITE_SCHEMA_READY.clear()
         if hasattr(server, "_GIT_CONTEXT_CACHE"):
             server._GIT_CONTEXT_CACHE.clear()
+        if hasattr(salience_loader, "_reset_load_optional_agent_salience_cache"):
+            salience_loader._reset_load_optional_agent_salience_cache()
         self.tmp.cleanup()
 
     def read_store(self) -> dict:
@@ -192,6 +201,22 @@ class SalienceLoaderTests(MnemoTestCase):
         after = sys.path.count(target_path)
         self.assertEqual(after, before + (0 if before else 1))
         sys.modules.pop("agent_salience", None)
+
+    def test_salience_loader_memoizes_unavailable_result(self) -> None:
+        os.environ.pop("AGENT_SALIENCE_HOME", None)
+        calls = {"count": 0}
+
+        def side_effect(name: str, package: str | None = None):
+            if name == "agent_salience":
+                calls["count"] += 1
+                raise ModuleNotFoundError("missing")
+            return import_module(name, package=package)
+
+        with mock.patch("salience_loader.importlib.import_module", side_effect=side_effect):
+            first = salience_loader.load_optional_agent_salience()
+            second = salience_loader.load_optional_agent_salience()
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(first, second)
 
 
 class MemorySalienceToolTests(MnemoTestCase):
@@ -953,6 +978,51 @@ class ProfileExposureTests(MnemoTestCase):
         self.assertEqual(self._tools_list_names(), {"mnemo"})
 
 
+class RpcErrorSanitizationTests(MnemoTestCase):
+    def test_tools_call_internal_error_is_sanitized(self) -> None:
+        captured: list[dict] = []
+        stderr = io.StringIO()
+
+        def capture(message: dict) -> None:
+            captured.append(message)
+
+        with mock.patch("server.send", side_effect=capture), mock.patch(
+            "server.mnemo_gateway",
+            side_effect=RuntimeError(str(self.workspace / "secret.txt")),
+        ), mock.patch("sys.stderr", stderr):
+            server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {"name": "mnemo", "arguments": {"action": "doctor", "params": {}}},
+                }
+            )
+
+        payload = captured[-1]["result"]
+        self.assertTrue(payload["isError"])
+        self.assertIn("internal error handling tool call", payload["content"][0]["text"])
+        self.assertNotIn(str(self.workspace), payload["content"][0]["text"])
+        self.assertIn(str(self.workspace), stderr.getvalue())
+
+    def test_non_tool_dispatch_internal_error_returns_jsonrpc_error(self) -> None:
+        captured: list[dict] = []
+        stderr = io.StringIO()
+
+        def capture(message: dict) -> None:
+            captured.append(message)
+
+        with mock.patch("server.send", side_effect=capture), mock.patch(
+            "server.copilot_safe_tools",
+            side_effect=RuntimeError("tools list blew up"),
+        ), mock.patch("sys.stderr", stderr):
+            server.handle_request({"jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": {}})
+
+        self.assertEqual(captured[-1]["error"]["code"], -32603)
+        self.assertEqual(captured[-1]["error"]["message"], "Internal error")
+        self.assertIn("tools list blew up", stderr.getvalue())
+
+
 class ConsolidationCompatibilityTests(MnemoTestCase):
     def test_record_kind_interaction_log_accepts_summary_as_text(self) -> None:
         result = server.record_memory({"kind": "interaction_log", "summary": "startup summary entry"})
@@ -1392,6 +1462,34 @@ class MnemoSafetyLimitTests(MnemoTestCase):
         structured = result["structuredContent"]
         self.assertTrue(any("max total bytes" in warning for warning in structured["warnings"]))
         self.assertGreaterEqual(structured["skipped_files"], 1)
+
+    def test_lookup_symbol_skips_symlink_escape(self) -> None:
+        outside = self.root / "outside_secret.py"
+        outside.write_text("def leaked_secret():\n    return '/tmp/secret'\n", encoding="utf-8")
+        link_path = self.workspace / "linked_secret.py"
+        try:
+            link_path.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        server._SYMBOL_CACHE.clear()
+        result = server.lookup_symbol({"name": "leaked_secret"})
+        structured = result["structuredContent"]
+        self.assertEqual(structured["matches"], [])
+        self.assertGreaterEqual(structured["skipped_files"], 1)
+        self.assertTrue(any("symlink escapes workspace root" in warning for warning in structured["warnings"]))
+
+    def test_max_memories_invalid_env_falls_back(self) -> None:
+        os.environ["MNEMO_MAX_MEMORIES"] = "garbage"
+        self.assertEqual(server.max_memories(), 5000)
+
+    def test_symbol_ttl_invalid_env_falls_back(self) -> None:
+        os.environ["MNEMO_SYMBOL_TTL_SECONDS"] = "garbage"
+        self.assertEqual(server.symbol_ttl_seconds(), 5.0)
+
+    def test_record_uses_safe_consolidate_threshold_parser(self) -> None:
+        os.environ["MNEMO_CONSOLIDATE_THRESHOLD"] = "abc"
+        result = server.record_memory({"kind": "note", "text": "safe threshold parse"})
+        self.assertFalse(result["isError"], result)
 
 
 class PinningTests(MnemoTestCase):
@@ -2053,6 +2151,11 @@ class SqliteStoreTests(MnemoTestCase):
         os.environ["MNEMO_STORE"] = "sqlite"
         os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
         server._SQLITE_BOOTSTRAPPED.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
 
     def _write_json_store(self, path: Path, memories: list[dict]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2147,6 +2250,45 @@ class SqliteStoreTests(MnemoTestCase):
         store = server.load_store()
         self.assertEqual([memory["id"] for memory in store["memories"]], [seed["id"]])
         self.assertTrue(self.sqlite_file.exists())
+
+    def test_sqlite_search_does_not_rerun_migration_updates_after_ready(self) -> None:
+        memory = self.record("search migration sentinel", kind="note")
+        server.search_memories({"query": "search migration sentinel", "limit": 5})
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            before = conn.execute("SELECT updated_at FROM memories WHERE id = ?", (memory["id"],)).fetchone()[0]
+        finally:
+            conn.close()
+        server.search_memories({"query": "search migration sentinel", "limit": 5})
+        conn = sqlite3.connect(str(self.sqlite_file))
+        try:
+            after = conn.execute("SELECT updated_at FROM memories WHERE id = ?", (memory["id"],)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(before, after)
+
+    def test_sqlite_record_upserts_only_new_row(self) -> None:
+        for index in range(5):
+            self.record(f"existing row {index}", kind="note")
+        real_upsert = server._sqlite_upsert_memory
+        calls: list[str] = []
+
+        def wrapped(conn: sqlite3.Connection, memory: dict[str, Any], *args: Any, **kwargs: Any):
+            calls.append(str(memory.get("id")))
+            return real_upsert(conn, memory, *args, **kwargs)
+
+        with mock.patch("server._sqlite_upsert_memory", side_effect=wrapped):
+            result = server.record_memory({"kind": "note", "text": "single row write check"})
+        self.assertFalse(result["isError"], result)
+        self.assertEqual(len(calls), 1)
+
+    def test_sqlite_connect_sets_busy_timeout(self) -> None:
+        conn = server._sqlite_connect()
+        try:
+            timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(int(timeout), 5000)
 
     def test_sqlite_bootstrap_uses_memory_example_when_missing_memory_json(self) -> None:
         seed = {
@@ -2563,6 +2705,10 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         os.environ["MNEMO_STORE"] = "sqlite"
         os.environ["MNEMO_SQLITE_FILE"] = str(self.sqlite_file)
         server._SQLITE_BOOTSTRAPPED.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
 
     def _create_pre_phase1_schema(self, rows: list[dict[str, Any]], *, with_fts: bool = False) -> None:
         self.sqlite_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2740,6 +2886,10 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         finally:
             conn.close()
         server._SQLITE_BOOTSTRAPPED.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
+        server._SQLITE_SCHEMA_READY.clear()
 
     def _insert_imported_pack(self, *, pack_id: str, trust_level: str, namespace: str) -> None:
         server.load_store()
@@ -3006,6 +3156,8 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
             self.sqlite_file.unlink()
         self.sqlite_file.parent.mkdir(parents=True, exist_ok=True)
         server._SQLITE_BOOTSTRAPPED.clear()
+        if hasattr(server, "_SQLITE_SCHEMA_READY"):
+            server._SQLITE_SCHEMA_READY.clear()
 
     def _pack_inspect(self, **params: Any) -> dict[str, Any]:
         result = server.pack_inspect(dict(params))
@@ -8477,6 +8629,7 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
         finally:
             conn.close()
         server._SQLITE_BOOTSTRAPPED.clear()
+        server._SQLITE_SCHEMA_READY.clear()
 
         server.load_store()
         server.load_store()
@@ -9071,8 +9224,10 @@ class MemoryPacksPhase1Tests(MnemoTestCase):
             conn.close()
 
         server._SQLITE_BOOTSTRAPPED.clear()
+        server._SQLITE_SCHEMA_READY.clear()
         server.load_store()
         server._SQLITE_BOOTSTRAPPED.clear()
+        server._SQLITE_SCHEMA_READY.clear()
         server.load_store()
 
         conn = sqlite3.connect(str(self.sqlite_file))

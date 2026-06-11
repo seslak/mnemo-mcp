@@ -1,5 +1,5 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![Version 0.22.0](https://img.shields.io/badge/version-0.22.0-green)
+![Version 0.22.1](https://img.shields.io/badge/version-0.22.1-green)
 ![License MIT](https://img.shields.io/badge/license-MIT-blue)
 
 # Mnemo MCP 
@@ -12,7 +12,7 @@ Mnemo is a small stdio MCP server that gives coding agents a durable, project-sc
 
 ## Status
 
-Current version: **0.22.0**
+Current version: **0.22.1**
 
 Runtime requirements:
 
@@ -42,6 +42,7 @@ Mnemo is local-first. It does not require a cloud service, vector database, exte
 - Local-HMAC pack signing and trusted import controls (`signer_add`, `signer_list`, `signer_disable`, `signer_enable`)
 - Direct group selectors for pack preview, redaction preview, and export (`group_id` + `scope`)
 - Alias proposal admission based on continuous IDF strength, with duplicate-heavy IDF profiles handled by unique-value cutoffs
+- Review-fix hardening for symlink-safe symbol lookup, SQLite busy timeout/schema readiness, row-scoped SQLite writes, defensive environment parsing, sanitized internal MCP errors, and memoized optional Agent Salience load failures
 - Scripted Copilot prompt workflows for Memory Pack export, import, promotion, and list/select compatibility under `.github/prompts/`
 - A single Copilot-friendly gateway MCP tool: `mnemo`
 - Optional deterministic salience diagnostics
@@ -128,6 +129,23 @@ Security and provenance notes:
 - `content/file_fingerprints.json` records touched-file paths and hashes; it does not embed file contents.
 - Local-HMAC signing is a local integrity/trust workflow, not public-key identity or non-repudiation.
 
+
+## Review-fix hardening (0.22.1)
+
+This patch keeps the public action surface stable while tightening runtime behavior:
+
+- `lookup_symbol` skips symlinked files whose resolved targets escape `MNEMO_WORKSPACE_ROOT`.
+- SQLite connections use `PRAGMA busy_timeout=5000`, and schema readiness is memoized per process so read paths do not rerun migration/backfill checks on every session.
+- SQLite `record`, `update`, and `delete` mutations use row-scoped writes instead of rewriting the full store for single-row changes.
+- Numeric environment variables such as `MNEMO_CONSOLIDATE_THRESHOLD`, `MNEMO_MAX_MEMORIES`, and `MNEMO_SYMBOL_TTL_SECONDS` fall back cleanly when invalid.
+- Internal MCP dispatch errors return sanitized client-facing messages while preserving full diagnostics on `stderr`.
+- Optional `agent_salience` load failures are memoized to avoid repeated import attempts in hot paths.
+
+Compatibility notes:
+
+- SQLite schema version remains `7`.
+- No Mnemo action names, parameter shapes, or normal success payload shapes changed.
+- No Memory Pack format or lifecycle changes are included.
 
 ## Repository layout
 

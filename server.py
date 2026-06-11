@@ -53,6 +53,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import traceback
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -66,7 +67,7 @@ from salience_loader import load_optional_agent_salience
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "mnemo"
 SERVER_TITLE = "Mnemo Project Memory"
-SERVER_VERSION = "0.22.0"
+SERVER_VERSION = "0.22.1"
 SQLITE_SCHEMA_VERSION = "7"
 DEFAULT_MEMORY_FILE = Path(__file__).with_name("memory.json")
 DEFAULT_MEMORY_NAMESPACE = "local"
@@ -299,6 +300,7 @@ SKIP_DIRS = {
 _SHOULD_EXIT = False
 _SYMBOL_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
 _SQLITE_BOOTSTRAPPED: set[str] = set()
+_SQLITE_SCHEMA_READY: set[str] = set()
 _GIT_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
 _SQLITE_FTS_CANDIDATE_LIMIT = 500
 DEFAULT_EVENT_LIMIT = 20
@@ -575,16 +577,15 @@ def max_total_chars() -> int:
 
 
 def max_memories() -> int:
-    raw = os.environ.get("MNEMO_MAX_MEMORIES", "5000").strip() or "5000"
-    value = int(raw)
-    if value < 1:
-        raise ValueError("MNEMO_MAX_MEMORIES must be at least 1")
-    return value
+    return positive_int_env("MNEMO_MAX_MEMORIES", 5000)
 
 
 def symbol_ttl_seconds() -> float:
     raw = os.environ.get("MNEMO_SYMBOL_TTL_SECONDS", "5").strip() or "5"
-    return float(raw)
+    try:
+        return float(raw)
+    except ValueError:
+        return 5.0
 
 
 def decay_enabled() -> bool:
@@ -1346,13 +1347,21 @@ def _sqlite_connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
+def _sqlite_db_key() -> str:
+    return str(sqlite_path().resolve())
+
+
 @contextmanager
-def _sqlite_session() -> Any:
+def _sqlite_session(*, ensure: bool = True) -> Any:
     conn = _sqlite_connect()
     try:
+        if ensure:
+            _sqlite_ensure_schema(conn)
+            _sqlite_bootstrap_if_needed(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -1770,6 +1779,9 @@ def _sqlite_enrich_event_record_from_memory(conn: sqlite3.Connection, record: di
 
 
 def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
+    db_key = _sqlite_db_key()
+    if db_key in _SQLITE_SCHEMA_READY:
+        return
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memories (
@@ -2133,6 +2145,11 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
         schema_version = int(schema_version_raw) if schema_version_raw else 0
     except ValueError:
         schema_version = 0
+    if schema_version >= int(SQLITE_SCHEMA_VERSION):
+        _SQLITE_SCHEMA_READY.add(db_key)
+        if _sqlite_get_meta(conn, "created_at") is None:
+            _sqlite_set_meta(conn, "created_at", now_iso())
+        return
 
     # Idempotent column migrations for v0.12.0 signature columns
     _v12_signature_columns = [
@@ -2242,6 +2259,7 @@ def _sqlite_ensure_schema(conn: sqlite3.Connection) -> None:
     _sqlite_set_meta(conn, "schema_version", SQLITE_SCHEMA_VERSION)
     if _sqlite_get_meta(conn, "created_at") is None:
         _sqlite_set_meta(conn, "created_at", now_iso())
+    _SQLITE_SCHEMA_READY.add(db_key)
 
 
 def _memory_to_sqlite_row(memory: dict[str, Any]) -> dict[str, Any]:
@@ -2670,7 +2688,7 @@ def _sqlite_ingest_legacy_events_and_queries(conn: sqlite3.Connection) -> None:
 
 
 def _sqlite_bootstrap_if_needed(conn: sqlite3.Connection) -> None:
-    db_key = str(sqlite_path().resolve())
+    db_key = _sqlite_db_key()
     if db_key in _SQLITE_BOOTSTRAPPED:
         return
     count_row = conn.execute("SELECT COUNT(*) FROM memories").fetchone()
@@ -2721,8 +2739,6 @@ def load_store() -> dict[str, Any]:
     if store_backend() == "json":
         return _json_load_store()
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         return _sqlite_load_store(conn)
 
 
@@ -2760,21 +2776,23 @@ def save_store(data: dict[str, Any]) -> None:
         return
 
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         current_ids = {str(row[0]) for row in conn.execute("SELECT id FROM memories").fetchall()}
         next_memories = [migrate_memory(m) for m in data.get("memories", []) if isinstance(m, dict)]
         next_ids = {str(memory.get("id")) for memory in next_memories}
         delete_ids = sorted(current_ids - next_ids)
         for memory_id in delete_ids:
-            conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            conn.execute("DELETE FROM memory_files WHERE memory_id = ?", (memory_id,))
-            conn.execute("DELETE FROM memory_topics WHERE memory_id = ?", (memory_id,))
-            conn.execute("DELETE FROM links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
-            if _sqlite_has_fts_table(conn):
-                conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
+            _sqlite_delete_memory(conn, memory_id)
         for memory in next_memories:
             _sqlite_upsert_memory(conn, memory)
+
+
+def _sqlite_delete_memory(conn: sqlite3.Connection, memory_id: str) -> None:
+    conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+    conn.execute("DELETE FROM memory_files WHERE memory_id = ?", (memory_id,))
+    conn.execute("DELETE FROM memory_topics WHERE memory_id = ?", (memory_id,))
+    conn.execute("DELETE FROM links WHERE source_id = ? OR target_id = ?", (memory_id, memory_id))
+    if _sqlite_has_fts_table(conn):
+        conn.execute("DELETE FROM memories_fts WHERE id = ?", (memory_id,))
 
 
 def store_lock_path() -> Path:
@@ -2865,6 +2883,21 @@ def tool_error(message: str) -> dict[str, Any]:
         "content": [{"type": "text", "text": f"Error: {message}"}],
         "isError": True,
     }
+
+
+def _log_internal_exception(context: str, exc: Exception) -> None:
+    print(f"[mnemo] {context}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+
+
+def _path_within_root(path: Path, root: Path) -> bool:
+    try:
+        return path.is_relative_to(root)
+    except AttributeError:
+        try:
+            return Path(os.path.commonpath([str(path), str(root)])) == root
+        except ValueError:
+            return False
 
 
 def tool_error_code(code: str, message: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3430,8 +3463,6 @@ def _sqlite_fts_candidate_memories(
     params.append(candidate_limit)
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             if not _sqlite_has_fts_table(conn) and not _sqlite_fts_available(conn):
                 return []
             rows = conn.execute(sql, tuple(params)).fetchall()
@@ -3500,8 +3531,6 @@ def _sqlite_fts_candidate_ids_for_memory(memory: dict[str, Any], *, limit: int, 
     params.append(max(1, int(limit)))
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             if not _sqlite_has_fts_table(conn) and not _sqlite_fts_available(conn):
                 return []
             rows = conn.execute(sql, tuple(params)).fetchall()
@@ -3610,8 +3639,6 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
     search_filters = dict(args)
     if store_backend() == "sqlite":
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
     else:
         resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, None)
@@ -3647,8 +3674,6 @@ def search_rank(args: dict[str, Any], phase: str | None = None) -> list[dict[str
     if store_backend() == "sqlite" and ranked:
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 ranked = _apply_freshness_to_ranked(conn, ranked, _git_repo_root())
         except Exception:
             pass
@@ -3823,8 +3848,6 @@ def select_memories_by_query(
     if store_backend() == "sqlite" and scored:
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 scored = _apply_freshness_to_ranked(conn, scored, _git_repo_root())
         except Exception:
             pass
@@ -3984,8 +4007,6 @@ def append_query_log(
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 _sqlite_insert_event(conn, None, "query", row, str(row["ts"]))
         except Exception:
             pass
@@ -4017,8 +4038,6 @@ def append_event_log(event: str, memory_id: str, details: dict[str, Any]) -> Non
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 _sqlite_insert_event(conn, memory_id, event, scrubbed_details, now_iso())
         except Exception:
             pass
@@ -4040,8 +4059,6 @@ def read_event_rows(include_archive: bool = False) -> list[dict[str, Any]]:
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 rows = conn.execute(
                     """
                     SELECT memory_id, event_type, data_json, COALESCE(ts, created_at) AS ts
@@ -4246,8 +4263,6 @@ def _sqlite_recent_event_records(
     sql += " ORDER BY COALESCE(ts, created_at) DESC, rowid DESC LIMIT ?"
     params.append(limit)
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         rows = conn.execute(sql, params).fetchall()
     return [_sqlite_event_row_to_record(row) for row in rows]
 
@@ -4365,8 +4380,6 @@ def _search_events_sqlite(
 ) -> list[dict[str, Any]]:
     tokens = tokenize(query)
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         use_fts = bool(tokens) and _sqlite_events_fts_flag()
         if use_fts:
             try:
@@ -4517,8 +4530,6 @@ def memory_salience_check(args: dict[str, Any]) -> dict[str, Any]:
         shingle_overlap_threshold = max(0.0, min(1.0, shingle_overlap_threshold))
         if store_backend() == "sqlite":
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
         else:
             resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, None)
@@ -4857,7 +4868,7 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
 
             near_duplicate_of: list[str] = []
             shingle_overlap_threshold = 0.30
-            similarity_threshold = float(os.environ.get("MNEMO_CONSOLIDATE_THRESHOLD", "0.7"))
+            similarity_threshold = consolidate_threshold()
 
             candidates = duplicate_candidates(memories, kind, supersedes_id)
 
@@ -4989,7 +5000,13 @@ def record_memory(args: dict[str, Any]) -> dict[str, Any]:
             memories.append(memory)
             if old is not None:
                 old["superseded_by"] = memory["id"]
-            save_store(store)
+            if store_backend() == "sqlite":
+                with _sqlite_session() as conn:
+                    _sqlite_upsert_memory(conn, memory)
+                    if old is not None:
+                        _sqlite_upsert_memory(conn, old)
+            else:
+                save_store(store)
             append_event_log("create", memory["id"], {"kind": kind, "supersedes": supersedes_id})
             if old is not None:
                 append_event_log("supersede", str(old.get("id")), {"superseded_by": memory["id"]})
@@ -5106,7 +5123,11 @@ def update_memory(args: dict[str, Any]) -> dict[str, Any]:
                 changed.append("metadata")
             merge_link_fields(memory)
             memory["updated_at"] = now_iso()
-            save_store(store)
+            if store_backend() == "sqlite":
+                with _sqlite_session() as conn:
+                    _sqlite_upsert_memory(conn, memory)
+            else:
+                save_store(store)
             if changed:
                 append_event_log("update", memory_id, {"changed": changed})
                 _refresh_idf_profiles_safely(trigger="write")
@@ -5130,7 +5151,11 @@ def delete_memory(args: dict[str, Any]) -> dict[str, Any]:
                 return tool_error(f"memory not found: {memory_id}")
             memory["deleted_at"] = memory.get("deleted_at") or now_iso()
             memory["deletion_reason"] = reason
-            save_store(store)
+            if store_backend() == "sqlite":
+                with _sqlite_session() as conn:
+                    _sqlite_upsert_memory(conn, memory)
+            else:
+                save_store(store)
             append_event_log("delete", memory_id, {"reason": reason})
             _refresh_idf_profiles_safely(trigger="write")
             return text_result(f"Deleted memory {memory_id}.", {"memory": memory})
@@ -5991,8 +6016,6 @@ def _import_json_maintenance(args: dict[str, Any], dry_run: bool) -> dict[str, A
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 imported, skipped, errors = _sqlite_import_memory_rows(conn, rows, dry_run=dry_run)
                 if imported and not dry_run:
                     _sqlite_set_meta(conn, "last_import_at", now_iso())
@@ -6305,8 +6328,6 @@ def _load_active_alias_terms(domain: str | None = None, language: str | None = N
         params.append(wanted_domain)
     sql += " ORDER BY c.canonical, t.term"
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         rows = conn.execute(sql, tuple(params)).fetchall()
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -6561,8 +6582,6 @@ def _load_recent_alias_source_events(
     if store_backend() == "sqlite":
         cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             miss_actions = sorted(MISS_EVENT_ACTIONS)
             placeholders = ",".join("?" for _ in miss_actions)
             miss_sql = (
@@ -6987,8 +7006,6 @@ def _persist_alias_proposals(proposals: list[dict[str, Any]]) -> tuple[int, int]
     links_written = 0
     now = now_iso()
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         for proposal in proposals:
             proposal_id = str(proposal.get("proposal_id") or "").strip()
             if not proposal_id:
@@ -7105,8 +7122,6 @@ def _list_alias_proposals_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     if store_backend() != "sqlite":
         return tool_error("list_alias_proposals requires sqlite backend")
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         clauses = ["status = ?"]
         params: list[Any] = [status]
         if domain is not None:
@@ -7152,8 +7167,6 @@ def _approve_alias_maintenance(args: dict[str, Any]) -> dict[str, Any]:
 
     proposal_row: sqlite3.Row | None = None
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         if proposal_id:
             proposal_row = conn.execute(
                 "SELECT * FROM alias_proposals WHERE proposal_id = ?",
@@ -7329,8 +7342,6 @@ def _reject_alias_proposal_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     reason = normalize_optional_string(args.get("reason"))
     now = now_iso()
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         exists = conn.execute(
             "SELECT proposal_id FROM alias_proposals WHERE proposal_id = ?",
             (proposal_id,),
@@ -7366,8 +7377,6 @@ def _list_aliases_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     concept_id = normalize_optional_string(args.get("concept_id"))
     limit = _safe_int(args.get("limit"), DEFAULT_ALIAS_LIST_LIMIT, minimum=1, maximum=2000)
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         clauses = ["v.status = ?", "c.status = 'active'"]
         params: list[Any] = [status]
         if domain is not None:
@@ -7419,8 +7428,6 @@ def _disable_alias_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     reason = normalize_optional_string(args.get("reason"))
     now = now_iso()
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         row: sqlite3.Row | None = None
         if alias_id:
             row = conn.execute("SELECT * FROM alias_terms WHERE alias_id = ?", (alias_id,)).fetchone()
@@ -7456,8 +7463,6 @@ def _disable_alias_concept_maintenance(args: dict[str, Any]) -> dict[str, Any]:
     reason = normalize_optional_string(args.get("reason"))
     now = now_iso()
     with _sqlite_session() as conn:
-        _sqlite_ensure_schema(conn)
-        _sqlite_bootstrap_if_needed(conn)
         row = _alias_concept_row(conn, concept_id)
         if row is None:
             return tool_error(f"alias concept not found: {concept_id}")
@@ -8188,8 +8193,6 @@ def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
     try:
         if store_backend() == "sqlite":
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, conn)
         else:
             resolved_namespaces, resolved_origins = resolve_namespace_origin_filters(args, None)
@@ -8356,8 +8359,6 @@ def topic_add(args: dict[str, Any]) -> dict[str, Any]:
     created_at = now_iso()
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             exists = conn.execute("SELECT 1 FROM memories WHERE id = ? LIMIT 1", (memory_id,)).fetchone()
             if exists is None:
                 return tool_error(f"memory not found: {memory_id}")
@@ -8396,8 +8397,6 @@ def topic_remove(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error(str(exc))
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             before = int(conn.total_changes)
             conn.execute("DELETE FROM memory_topics WHERE memory_id = ? AND topic = ?", (memory_id, topic))
             removed = int(conn.total_changes) - before
@@ -8425,8 +8424,6 @@ def topic_list(args: dict[str, Any]) -> dict[str, Any]:
         return tool_error("memory_id is required when scope=memory")
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             if scope == "all":
                 rows = conn.execute(
                     """
@@ -12591,6 +12588,7 @@ def iter_workspace_files(root: Path) -> tuple[list[Path], dict[str, Any]]:
     max_files = max_files_scanned()
     max_total = max_total_bytes()
     max_single = max_file_bytes()
+    root_real = root.resolve()
     if not root.exists():
         return files, {"warnings": warnings, "skipped_files": skipped_files, "scanned_bytes": scanned_bytes}
     for dirpath, dirnames, filenames in os.walk(root):
@@ -12611,7 +12609,12 @@ def iter_workspace_files(root: Path) -> tuple[list[Path], dict[str, Any]]:
                     "scanned_bytes": scanned_bytes,
                 }
             try:
-                size = path.stat().st_size
+                real_path = path.resolve()
+                if not _path_within_root(real_path, root_real):
+                    skipped_files += 1
+                    warnings.append(f"skipped {path.name}: symlink escapes workspace root")
+                    continue
+                size = real_path.stat().st_size
             except OSError:
                 skipped_files += 1
                 continue
@@ -12650,6 +12653,7 @@ def build_symbol_index(root: Path, files: list[Path]) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     unknown_lines: list[dict[str, Any]] = []
     indexed = 0
+    root_real = root.resolve()
     for path in files:
         ext = path.suffix.lower()
         if ext in DEFINITION_PATTERNS:
@@ -12665,7 +12669,10 @@ def build_symbol_index(root: Path, files: list[Path]) -> dict[str, Any]:
             except OSError:
                 continue
         try:
-            with path.open("r", encoding="utf-8", errors="ignore") as f:
+            real_path = path.resolve()
+            if not _path_within_root(real_path, root_real):
+                continue
+            with real_path.open("r", encoding="utf-8", errors="ignore") as f:
                 lines = list(f)
         except OSError:
             continue
@@ -12873,8 +12880,6 @@ def _sqlite_fts_flag() -> bool:
         return False
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             meta_value = _sqlite_get_meta(conn, "fts_available")
             if meta_value is not None:
                 return str(meta_value).strip() == "1"
@@ -12890,8 +12895,6 @@ def _sqlite_events_fts_flag() -> bool:
         return False
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             meta_value = _sqlite_get_meta(conn, "events_fts_available")
             if meta_value is not None:
                 return str(meta_value).strip() == "1"
@@ -12965,8 +12968,6 @@ def _idf_corpus_records(domain: str | None = None) -> list[dict[str, Any]]:
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 query = """
                     SELECT id, text, domain, token_count, unique_token_count, content_hash, normalized_hash,
                            signature_updated_at, updated_at, created_at
@@ -13073,8 +13074,6 @@ def _idf_quick_stats(domain: str | None = None) -> dict[str, int]:
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 query = """
                     SELECT COUNT(*) AS doc_count, COALESCE(SUM(token_count), 0) AS total_tokens
                     FROM memories
@@ -13112,8 +13111,6 @@ def _idf_domain_quick_stats() -> dict[str, dict[str, int]]:
     if store_backend() == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 rows = conn.execute(
                     """
                     SELECT domain, COUNT(*) AS doc_count, COALESCE(SUM(token_count), 0) AS total_tokens
@@ -13156,8 +13153,6 @@ def _load_cached_idf_profile(scope: str, name: str) -> dict[str, Any] | None:
         return None
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             row = conn.execute(
                 """
                 SELECT scope, name, profile_version, status, active, doc_count, unique_terms, total_tokens,
@@ -13210,8 +13205,6 @@ def _save_idf_profile(
     payload = _idf_profile_to_dict(profile)
     try:
         with _sqlite_session() as conn:
-            _sqlite_ensure_schema(conn)
-            _sqlite_bootstrap_if_needed(conn)
             conn.execute(
                 """
                 INSERT INTO idf_profiles(
@@ -13700,8 +13693,6 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     if backend == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 row = conn.execute("SELECT COUNT(*) FROM events").fetchone()
                 event_count = int(row[0]) if row else 0
                 row = conn.execute(
@@ -13803,8 +13794,6 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     if backend == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
                 aliases_payload["concept_count"] = int(conn.execute("SELECT COUNT(*) FROM alias_concepts").fetchone()[0])
                 aliases_payload["active_concept_count"] = int(
                     conn.execute("SELECT COUNT(*) FROM alias_concepts WHERE status = 'active'").fetchone()[0]
@@ -13855,8 +13844,6 @@ def mnemo_doctor(args: dict[str, Any]) -> dict[str, Any]:
     if backend == "sqlite":
         try:
             with _sqlite_session() as conn:
-                _sqlite_ensure_schema(conn)
-                _sqlite_bootstrap_if_needed(conn)
 
                 namespace_rows = conn.execute(
                     "SELECT namespace, COUNT(*) AS count FROM memories GROUP BY namespace ORDER BY count DESC, namespace ASC"
@@ -16245,62 +16232,67 @@ def handle_request(message: dict[str, Any]) -> None:
         # Notifications do not receive JSON-RPC responses.
         return
 
-    if method == "initialize":
-        requested = params.get("protocolVersion") if isinstance(params, dict) else None
-        ok(
-            request_id,
-            {
-                "protocolVersion": requested or PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {
-                    "name": SERVER_NAME,
-                    "title": SERVER_TITLE,
-                    "version": SERVER_VERSION,
+    try:
+        if method == "initialize":
+            requested = params.get("protocolVersion") if isinstance(params, dict) else None
+            ok(
+                request_id,
+                {
+                    "protocolVersion": requested or PROTOCOL_VERSION,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {
+                        "name": SERVER_NAME,
+                        "title": SERVER_TITLE,
+                        "version": SERVER_VERSION,
+                    },
+                    "instructions": (
+                        "Use the single mnemo gateway tool with action plus optional params. "
+                        "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, memory_group_discover, memory_group_preview, pack_landing_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, recall, get, link, export, "
+                        "recent_events, search_events, get_event, memory_events, compact_context, "
+                        "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
+                        "Do not look for individual mnemo_* tools; "
+                        "they are gateway actions now."
+                    ),
                 },
-                "instructions": (
-                    "Use the single mnemo gateway tool with action plus optional params. "
-                    "Common actions: doctor, search, record, alias_hint, topic_add, topic_remove, topic_list, memory_group_discover, memory_group_preview, pack_landing_list, pack_list_imports, pack_review_import, pack_promote_preview, pack_promote, pack_preview, pack_redaction_preview, pack_export, pack_inspect, pack_import, signer_add, signer_list, signer_disable, signer_enable, recall, get, link, export, "
-                    "recent_events, search_events, get_event, memory_events, compact_context, "
-                    "inspect, maintenance, salience_check, update, delete, recent, lookup_symbol. "
-                    "Do not look for individual mnemo_* tools; "
-                    "they are gateway actions now."
-                ),
-            },
-        )
-        return
-
-    if method == "shutdown":
-        ok(request_id, {})
-        _SHOULD_EXIT = True
-        return
-
-    if method == "tools/list":
-        ok(request_id, {"tools": copilot_safe_tools()})
-        return
-
-    if method == "tools/call":
-        if not isinstance(params, dict):
-            rpc_error(request_id, -32602, "Invalid tools/call params")
+            )
             return
-        name = str(params.get("name", ""))
-        args = params.get("arguments") or {}
-        if not isinstance(args, dict):
-            rpc_error(request_id, -32602, "Tool arguments must be an object")
-            return
-        handlers = {
-            GATEWAY_TOOL_NAME: mnemo_gateway,
-        }
-        handler = handlers.get(name)
-        if handler is None:
-            rpc_error(request_id, -32602, f"Unknown tool: {name}")
-            return
-        try:
-            ok(request_id, handler(args))
-        except Exception as exc:
-            ok(request_id, tool_error(f"{type(exc).__name__}: {exc}"))
-        return
 
-    rpc_error(request_id, -32601, f"Method not found: {method}")
+        if method == "shutdown":
+            ok(request_id, {})
+            _SHOULD_EXIT = True
+            return
+
+        if method == "tools/list":
+            ok(request_id, {"tools": copilot_safe_tools()})
+            return
+
+        if method == "tools/call":
+            if not isinstance(params, dict):
+                rpc_error(request_id, -32602, "Invalid tools/call params")
+                return
+            name = str(params.get("name", ""))
+            args = params.get("arguments") or {}
+            if not isinstance(args, dict):
+                rpc_error(request_id, -32602, "Tool arguments must be an object")
+                return
+            handlers = {
+                GATEWAY_TOOL_NAME: mnemo_gateway,
+            }
+            handler = handlers.get(name)
+            if handler is None:
+                rpc_error(request_id, -32602, f"Unknown tool: {name}")
+                return
+            try:
+                ok(request_id, handler(args))
+            except Exception as exc:
+                _log_internal_exception("tool call failed", exc)
+                ok(request_id, tool_error("internal error handling tool call"))
+            return
+
+        rpc_error(request_id, -32601, f"Method not found: {method}")
+    except Exception as exc:
+        _log_internal_exception(f"request handler failed for method {method}", exc)
+        rpc_error(request_id, -32603, "Internal error")
 
 
 def main() -> int:

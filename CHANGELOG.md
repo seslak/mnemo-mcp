@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.22.1
+
+### Fixed
+
+- Hardened `lookup_symbol` so symlinked files that resolve outside `MNEMO_WORKSPACE_ROOT` are skipped instead of being indexed.
+- Added SQLite `busy_timeout`, gated schema migration on `schema_version`, and memoized per-process schema readiness so read paths no longer rerun migration backfills on every session.
+- Switched SQLite `record`, `update`, and `delete` writes to row-scoped persistence instead of rewriting the full store on single-row mutations.
+- Defensive environment parsing now falls back cleanly for `MNEMO_CONSOLIDATE_THRESHOLD`, `MNEMO_MAX_MEMORIES`, and `MNEMO_SYMBOL_TTL_SECONDS`.
+- MCP dispatch now returns a generic client-facing internal tool-call error while logging full exception details to `stderr`.
+- Optional `agent_salience` load failures are memoized to avoid repeated import attempts in hot paths.
+
+### Changed
+
+- SQLite schema/bootstrap is now centralized in `_sqlite_session()` for all normal session call sites.
+- Local storage ignores now explicitly cover `state/`, SQLite files, and archive JSONL artifacts by default.
+- `SECURITY.md` supported-version text is updated to the current `0.22.x` line.
+
+### Compatibility / Scope
+
+- `0.22.1` is a review-fix and hardening patch.
+- SQLite schema version remains `7` (no schema bump).
+- No Mnemo action names, parameter shapes, or normal success payload shapes changed.
+- The only intentional client-visible error-text change is sanitized internal `tools/call` failure messaging.
+
 ## 0.22.0
 
 ### Fixed
